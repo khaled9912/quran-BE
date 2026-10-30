@@ -25,12 +25,12 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__Academy: Host=postgres;Port=5432;Database=academy;Username=academy;Password=${POSTGRES_PASSWORD:-change-this-db-password}
       DATABASE_URL: ${DATABASE_URL:-}
       DATABASE_URL_UNPOOLED: ${DATABASE_URL_UNPOOLED:-}
-      AllowedOrigins: http://localhost:3000
+      AllowedOrigins: ${ALLOWED_ORIGINS:-http://localhost:3000}
       BootstrapAdmin__Email: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rayanacademy.local}
       BootstrapAdmin__Password: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123}
       Database__EnsureCreated: "true"
