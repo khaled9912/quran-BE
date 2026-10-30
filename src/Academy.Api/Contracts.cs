@@ -4,7 +4,12 @@ namespace Academy.Api;
 
 public sealed record RegisterRequest(string FullName, string Email, string Password);
 public sealed record LoginRequest(string Email, string Password);
+public sealed record OtpRequest(string Phone);
+public sealed record OtpVerifyRequest(string Phone, string Code, string? FullName);
 public sealed record CreateUserRequest(string FullName, string Email, string Password, string Role);
+public sealed record CreateStudentRequest(string FullName, string Email, string Password, string? Grade);
+public sealed record UpdateUserRequest(string? FullName, string? Email, string? Password, bool? IsActive);
+public sealed record UpdateLessonRequest(DateTimeOffset? StartsAt, DateTimeOffset? EndsAt, string? Status);
 public sealed record AssignStudentRequest(Guid TeacherId, Guid StudentId);
 public sealed record PublishAvailabilityRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt);
 public sealed record CreateLessonRequest(Guid TeacherId, Guid StudentId, DateTimeOffset StartsAt, DateTimeOffset EndsAt);

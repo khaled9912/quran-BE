@@ -5,11 +5,10 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Identity;
 using System.Threading.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
-var connectionString = builder.Configuration.GetConnectionString("Academy")
-    ?? Environment.GetEnvironmentVariable("DATABASE_URL")
-    ?? "Host=localhost;Port=5432;Database=academy;Username=postgres;Password=postgres";
+var connectionString = DatabaseConnection.Resolve(builder.Configuration);
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
@@ -30,6 +29,9 @@ builder.Services.AddIdentityCore<AcademyUser>(options =>
 .AddEntityFrameworkStores<AcademyDbContext>()
 .AddSignInManager();
 
+builder.Services.RemoveAll<IUserValidator<AcademyUser>>();
+builder.Services.AddScoped<IUserValidator<AcademyUser>, AcademyUserValidator>();
+
 var sameSiteValue = builder.Configuration["Cookie:SameSite"] ?? "Lax";
 var sameSite = Enum.TryParse<SameSiteMode>(sameSiteValue, true, out var parsedSameSite) ? parsedSameSite : SameSiteMode.Lax;
 builder.Services.AddAuthentication(IdentityConstants.ApplicationScheme)
@@ -49,7 +51,7 @@ builder.Services.AddAuthentication(IdentityConstants.ApplicationScheme)
     });
 builder.Services.AddAuthorization(options =>
 {
-    options.AddPolicy("AdminOnly", p => p.RequireRole("admin"));
+    options.AddPolicy("AdminOnly", p => p.RequireRole("admin", "super_admin"));
     options.AddPolicy("TeacherOnly", p => p.RequireRole("teacher"));
     options.AddPolicy("StudentOnly", p => p.RequireRole("student"));
 });
@@ -64,7 +66,16 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("login", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(5), QueueLimit = 0, AutoReplenishment = true }));
+    options.AddPolicy("otp", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
 });
+builder.Services.AddSingleton<PhoneOtpStore>();
+builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
+if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
+    builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
+else
+    builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 

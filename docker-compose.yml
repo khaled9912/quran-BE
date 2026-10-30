@@ -28,12 +28,18 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__Academy: Host=postgres;Port=5432;Database=academy;Username=academy;Password=${POSTGRES_PASSWORD:-change-this-db-password}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_URL_UNPOOLED: ${DATABASE_URL_UNPOOLED:-}
       AllowedOrigins: http://localhost:3000
       BootstrapAdmin__Email: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rayanacademy.local}
       BootstrapAdmin__Password: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123}
       Database__EnsureCreated: "true"
+      Otp__DevMode: ${OTP_DEV_MODE:-true}
+      Otp__Sender: ${OTP_SENDER:-}
+      Otp__TextBee__ApiKey: ${TEXTBEE_API_KEY:-}
+      Otp__TextBee__DeviceId: ${TEXTBEE_DEVICE_ID:-}
     ports:
-      - "5000:8080"
+      - "5001:8080"
 
 volumes:
   academy-postgres:

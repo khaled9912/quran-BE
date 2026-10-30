@@ -11,6 +11,7 @@ public static class ApiEndpoints
 {
     private static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
     private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
+    private static bool IsAdmin(ClaimsPrincipal p) => p.IsInRole("admin") || p.IsInRole("super_admin");
     private static UserDto ToUser(AcademyUser u, string role) => new(u.Id, u.FullName, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, u.FullName, u.IsActive, u.FullName);
     private static async Task<string> RoleOf(UserManager<AcademyUser> users, AcademyUser user)
         => (await users.GetRolesAsync(user)).FirstOrDefault() ?? "student";
@@ -51,15 +52,84 @@ public static class ApiEndpoints
         auth.MapGet("/me", async (ClaimsPrincipal principal, UserManager<AcademyUser> users) =>
         {
             var user = await users.GetUserAsync(principal);
-            return user is null ? Results.Unauthorized() : Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
+            return user is null || !user.IsActive ? Results.Unauthorized() : Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         }).RequireAuthorization();
-        auth.MapPost("/logout", async (SignInManager<AcademyUser> signIn) => { await signIn.SignOutAsync(); return Results.NoContent(); }).RequireAuthorization();
+        // Allow anonymous so a stale/expired session cookie can still be cleared.
+        auth.MapPost("/logout", async (SignInManager<AcademyUser> signIn) => { await signIn.SignOutAsync(); return Results.NoContent(); });
+
+        auth.MapPost("/otp/request", async (OtpRequest input, PhoneOtpStore otp, IOtpSender sender, HttpContext http) =>
+        {
+            var phone = PhoneNumbers.Normalize(input.Phone);
+            if (phone is null) return Results.ValidationProblem(new Dictionary<string, string[]> { ["phone"] = ["Enter a valid phone number in international format, for example +96170123456."] });
+            if (!otp.DevMode && !sender.IsConfigured) return Results.Problem("Code delivery is not configured yet.", statusCode: 503);
+            var code = otp.TryIssue(phone);
+            if (code is null) return Results.Problem("Please wait a minute before requesting another code.", statusCode: 429);
+            if (!otp.DevMode)
+            {
+                try
+                {
+                    await sender.SendAsync(phone, code, http.RequestAborted);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+                {
+                    // Release the cooldown so a delivery failure does not lock the user out.
+                    otp.Consume(phone);
+                    return Results.Problem("Could not send the code. Please try again.", statusCode: 502);
+                }
+            }
+            return Results.Accepted(value: new
+            {
+                message = "If this number can receive messages, a code has been sent.",
+                devMode = otp.DevMode,
+                devCode = otp.DevMode ? otp.DevCode : null,
+            });
+        }).RequireRateLimiting("otp");
+
+        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        {
+            var phone = PhoneNumbers.Normalize(input.Phone);
+            if (phone is null || string.IsNullOrWhiteSpace(input.Code))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["otp"] = ["Enter the phone number and the code you received."] });
+            if (!otp.Check(phone, input.Code.Trim())) return Results.Problem("The code is invalid or has expired.", statusCode: 401);
+
+            var user = users.Users.FirstOrDefault(x => x.PhoneNumber == phone);
+            if (user is null)
+            {
+                var fullName = input.FullName?.Trim() ?? "";
+                if (fullName.Length == 0) return Results.Ok(new { requiresProfile = true });
+                if (fullName.Length is < 2 or > 160)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter your full name (2 to 160 characters)."] });
+                user = new AcademyUser
+                {
+                    Id = Guid.NewGuid(),
+                    UserName = phone,
+                    PhoneNumber = phone,
+                    PhoneNumberConfirmed = true,
+                    FullName = fullName,
+                    EmailConfirmed = true,
+                };
+                var created = await users.CreateAsync(user);
+                if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+                await users.AddToRoleAsync(user, "student");
+            }
+            if (!user.IsActive) return Results.Problem("This account is deactivated. Contact an administrator.", statusCode: 401);
+
+            otp.Consume(phone);
+            await signIn.SignInAsync(user, isPersistent: true);
+            return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
+        }).RequireRateLimiting("otp");
 
         api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db) =>
         {
-            if (string.IsNullOrWhiteSpace(input.Name) || input.Name.Length > 120 || !System.Net.Mail.MailAddress.TryCreate(input.Email, out _) || string.IsNullOrWhiteSpace(input.Message) || input.Message.Length is < 5 or > 3000)
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["contact"] = ["Please provide a name, valid email and a message between 5 and 3000 characters."] });
-            db.ContactSubmissions.Add(new ContactSubmission { Name = input.Name.Trim(), Email = input.Email.Trim(), Message = input.Message.Trim() });
+            var errors = new Dictionary<string, string[]>();
+            var name = input.Name?.Trim() ?? "";
+            var email = input.Email?.Trim() ?? "";
+            var message = input.Message?.Trim() ?? "";
+            if (name.Length is 0 or > 120) errors["name"] = ["Please provide a name of 120 characters or fewer."];
+            if (!System.Net.Mail.MailAddress.TryCreate(email, out _)) errors["email"] = ["Please provide a valid email address."];
+            if (message.Length is < 5 or > 3000) errors["message"] = ["Message must be between 5 and 3000 characters."];
+            if (errors.Count > 0) return Results.ValidationProblem(errors);
+            db.ContactSubmissions.Add(new ContactSubmission { Name = name, Email = email, Message = message });
             await db.SaveChangesAsync();
             return Results.Accepted();
         }).AllowAnonymous().RequireRateLimiting("contact");
@@ -75,6 +145,90 @@ public static class ApiEndpoints
             if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
             await users.AddToRoleAsync(user, role);
             return Results.Created($"/api/{role}s/{user.Id}", new { user = ToUser(user, role) });
+        });
+        admin.MapPatch("/users/{id:guid}", async (Guid id, UpdateUserRequest input, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        {
+            var user = await users.FindByIdAsync(id.ToString());
+            if (user is null) return Results.NotFound();
+            var role = await RoleOf(users, user);
+            if (role is not ("teacher" or "student")) return Results.BadRequest(new { message = "Only teacher and student accounts can be edited here." });
+            var errors = new Dictionary<string, string[]>();
+            var name = input.FullName?.Trim();
+            var email = input.Email?.Trim();
+            if (input.FullName is not null && name!.Length is 0 or > 160) errors["fullName"] = ["Please provide a name of 160 characters or fewer."];
+            if (input.Email is not null && !System.Net.Mail.MailAddress.TryCreate(email, out _)) errors["email"] = ["Please provide a valid email address."];
+            if (input.Password is not null && input.Password.Length < 8) errors["password"] = ["The password must be at least 8 characters."];
+            if (errors.Count > 0) return Results.ValidationProblem(errors);
+            if (email is not null && !string.Equals(email, user.Email, StringComparison.OrdinalIgnoreCase))
+            {
+                var existing = await users.FindByEmailAsync(email);
+                if (existing is not null && existing.Id != user.Id) return Results.Conflict(new { message = "An account with this email already exists." });
+                user.Email = email; user.UserName = email;
+            }
+            if (name is not null) user.FullName = name;
+            if (input.IsActive is not null) user.IsActive = input.IsActive.Value;
+            var updated = await users.UpdateAsync(user);
+            if (!updated.Succeeded) return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            if (input.Password is not null)
+            {
+                var token = await users.GeneratePasswordResetTokenAsync(user);
+                var reset = await users.ResetPasswordAsync(user, token, input.Password);
+                if (!reset.Succeeded) return Results.ValidationProblem(reset.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            }
+            if (input.IsActive == false) await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            return Results.Ok(ToUser(user, role));
+        });
+        // Deletes are soft: lessons keep their historical teacher/student owners.
+        admin.MapDelete("/users/{id:guid}", async (Guid id, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        {
+            var user = await users.FindByIdAsync(id.ToString());
+            if (user is null) return Results.NotFound();
+            var role = await RoleOf(users, user);
+            if (role is not ("teacher" or "student")) return Results.BadRequest(new { message = "Only teacher and student accounts can be deactivated here." });
+            var now = DateTimeOffset.UtcNow;
+            var upcoming = await db.Lessons.AnyAsync(x => x.Status != "cancelled" && x.EndsAt > now && (x.TeacherId == id || x.StudentId == id));
+            if (upcoming) return Results.Conflict(new { message = "This account still has lessons scheduled. Cancel those lessons before deactivating the account." });
+            var pending = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability)
+                .Where(x => (x.TeacherId == id || x.StudentId == id) && (x.Status == "pending_teacher" || x.Status == "pending_student" || x.Status == "pending_admin")).ToListAsync();
+            foreach (var request in pending)
+            {
+                request.Status = "rejected";
+                request.RejectionReason = "The account was deactivated by an administrator.";
+                if (request.AvailabilitySlot is not null) request.AvailabilitySlot.Status = "available";
+                if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
+            }
+            user.IsActive = false;
+            var updated = await users.UpdateAsync(user);
+            if (!updated.Succeeded) return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            await db.SaveChangesAsync();
+            await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            await db.AvailabilitySlots.Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > now).ExecuteDeleteAsync();
+            return Results.NoContent();
+        });
+        admin.MapGet("/teachers/{teacherId:guid}/availability", async (Guid teacherId, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        {
+            var teacher = await users.FindByIdAsync(teacherId.ToString());
+            if (teacher is null || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
+            return Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == teacherId && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync());
+        });
+        admin.MapPost("/teachers/{teacherId:guid}/availability", async (Guid teacherId, PublishAvailabilityRequest input, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        {
+            var teacher = await users.FindByIdAsync(teacherId.ToString());
+            if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future slot with a duration up to 4 hours." });
+            var conflict = await db.AvailabilitySlots.AnyAsync(x => x.TeacherId == teacherId && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
+                || await db.Lessons.AnyAsync(x => x.TeacherId == teacherId && x.Status == "scheduled" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt);
+            if (conflict) return Results.Conflict(new { message = "This time overlaps another published slot or lesson." });
+            var slot = new AvailabilitySlot { TeacherId = teacherId, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
+            db.AvailabilitySlots.Add(slot); await db.SaveChangesAsync();
+            return Results.Created($"/api/admin/teachers/{teacherId}/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
+        });
+        admin.MapDelete("/teachers/{teacherId:guid}/availability/{slotId:guid}", async (Guid teacherId, Guid slotId, AcademyDbContext db) =>
+        {
+            var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == teacherId);
+            if (slot is null) return Results.NotFound();
+            if (slot.Status != "available") return Results.Conflict(new { message = "A requested or booked slot cannot be deleted." });
+            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
         });
         admin.MapGet("/contact-submissions", async (AcademyDbContext db) => await db.ContactSubmissions.OrderByDescending(x => x.CreatedAt).ToListAsync());
         admin.MapGet("/lesson-requests", async (string? status, AcademyDbContext db) =>
@@ -93,8 +247,8 @@ public static class ApiEndpoints
             var teacher = await users.FindByIdAsync(input.TeacherId.ToString());
             var student = await users.FindByIdAsync(input.StudentId.ToString());
             if (teacher is null || student is null || !await users.IsInRoleAsync(teacher, "teacher") || !await users.IsInRoleAsync(student, "student")) return Results.BadRequest(new { message = "A valid teacher and student are required." });
-            var activeElsewhere = await db.Assignments.AnyAsync(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId);
-            if (activeElsewhere) return Results.Conflict(new { message = "This student already has an active teacher assignment. Deactivate it before assigning another teacher." });
+            var activeElsewhere = await db.Assignments.Where(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId).ToListAsync();
+            foreach (var previous in activeElsewhere) previous.IsActive = false;
             var existing = await db.Assignments.FirstOrDefaultAsync(x => x.TeacherId == input.TeacherId && x.StudentId == input.StudentId);
             if (existing is not null) { existing.IsActive = true; await db.SaveChangesAsync(); return Results.Ok(await AssignmentById(db, existing.Id)); }
             var assignment = new TeacherStudentAssignment { TeacherId = input.TeacherId, StudentId = input.StudentId };
@@ -107,28 +261,40 @@ public static class ApiEndpoints
             item.IsActive = false; await db.SaveChangesAsync(); return Results.NoContent();
         }).RequireAuthorization("AdminOnly");
 
-        api.MapGet("/teachers", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
+        api.MapGet("/teachers", async (bool? includeInactive, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
-            var list = await users.GetUsersInRoleAsync("teacher"); return Results.Ok(list.Where(x => x.IsActive).Select(x => ToUser(x, "teacher")));
+            var list = await users.GetUsersInRoleAsync("teacher"); return Results.Ok(list.Where(x => x.IsActive || includeInactive == true).Select(x => ToUser(x, "teacher")));
         }).RequireAuthorization("AdminOnly");
         api.MapGet("/teachers/{id:guid}", async (Guid id, UserManager<AcademyUser> users) =>
         {
             var user = await users.FindByIdAsync(id.ToString()); return user is null || !await users.IsInRoleAsync(user, "teacher") ? Results.NotFound() : Results.Ok(ToUser(user, "teacher"));
         }).RequireAuthorization("AdminOnly");
-        api.MapGet("/students", async (ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        api.MapGet("/students", async (bool? includeInactive, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
-            if (!HasRole(p, "admin") && !HasRole(p, "teacher")) return Results.Forbid();
-            var q = users.Users.Where(x => x.IsActive);
+            if (!IsAdmin(p) && !HasRole(p, "teacher")) return Results.Forbid();
+            var includeInactiveForAdmin = includeInactive == true && IsAdmin(p);
+            var q = users.Users.Where(x => x.IsActive || includeInactiveForAdmin);
             if (HasRole(p, "teacher")) { var id = UserId(p); var studentIds = db.Assignments.Where(a => a.TeacherId == id && a.IsActive).Select(a => a.StudentId); q = q.Where(u => studentIds.Contains(u.Id)); }
             var list = await q.ToListAsync(); var result = new List<UserDto>();
             foreach (var user in list) if (await users.IsInRoleAsync(user, "student")) result.Add(ToUser(user, "student"));
             return Results.Ok(result);
         }).RequireAuthorization();
+        api.MapPost("/students", async (CreateStudentRequest input, UserManager<AcademyUser> users) =>
+        {
+            if (string.IsNullOrWhiteSpace(input.FullName) || !System.Net.Mail.MailAddress.TryCreate(input.Email, out _) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["student"] = ["Full name, a valid email and a password of at least 8 characters are required."] });
+            if (await users.FindByEmailAsync(input.Email.Trim()) is not null) return Results.Conflict(new { message = "An account with this email already exists." });
+            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
+            var created = await users.CreateAsync(user, input.Password);
+            if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            await users.AddToRoleAsync(user, "student");
+            return Results.Created($"/api/students/{user.Id}", ToUser(user, "student"));
+        }).RequireAuthorization("AdminOnly");
         api.MapGet("/students/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
             var user = await users.FindByIdAsync(id.ToString()); if (user is null || !await users.IsInRoleAsync(user, "student")) return Results.NotFound();
             if (HasRole(p, "teacher") && !await db.Assignments.AnyAsync(a => a.TeacherId == UserId(p) && a.StudentId == id && a.IsActive)) return Results.Forbid();
-            if (!HasRole(p, "admin") && !HasRole(p, "teacher") && UserId(p) != id) return Results.Forbid();
+            if (!IsAdmin(p) && !HasRole(p, "teacher") && UserId(p) != id) return Results.Forbid();
             return Results.Ok(ToUser(user, "student"));
         }).RequireAuthorization();
 
@@ -256,6 +422,30 @@ public static class ApiEndpoints
             var l = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).FirstOrDefaultAsync(x => x.Id == id);
             if (l is null) return Results.NotFound(); if (HasRole(p, "student") && l.StudentId != UserId(p) || HasRole(p, "teacher") && l.TeacherId != UserId(p)) return Results.Forbid();
             return Results.Ok(ToLesson(l));
+        }).RequireAuthorization();
+        api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).FirstOrDefaultAsync(x => x.Id == id);
+            if (lesson is null) return Results.NotFound();
+            if (HasRole(p, "teacher") && lesson.TeacherId != UserId(p) || HasRole(p, "student") && lesson.StudentId != UserId(p)) return Results.Forbid();
+            var startsAt = input.StartsAt ?? lesson.StartsAt;
+            var endsAt = input.EndsAt ?? lesson.EndsAt;
+            if (endsAt <= startsAt) return Results.BadRequest(new { message = "The lesson must end after it starts." });
+            if (input.Status is not null && input.Status is not ("scheduled" or "in_progress" or "completed" or "cancelled")) return Results.BadRequest(new { message = "Unknown lesson status." });
+            var conflict = await db.Lessons.AnyAsync(x => x.Id != id && x.Status == "scheduled" && x.StartsAt < endsAt && x.EndsAt > startsAt && (x.TeacherId == lesson.TeacherId || x.StudentId == lesson.StudentId));
+            if (conflict) return Results.Conflict(new { message = "A teacher or student already has a lesson at this time." });
+            lesson.StartsAt = startsAt; lesson.EndsAt = endsAt;
+            if (input.Status is not null) lesson.Status = input.Status;
+            await db.SaveChangesAsync();
+            return Results.Ok(ToLesson(lesson));
+        }).RequireAuthorization();
+        api.MapDelete("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var lesson = await db.Lessons.FirstOrDefaultAsync(x => x.Id == id);
+            if (lesson is null) return Results.NotFound();
+            if (HasRole(p, "teacher") && lesson.TeacherId != UserId(p) || HasRole(p, "student") && lesson.StudentId != UserId(p)) return Results.Forbid();
+            if (lesson.Status != "cancelled") { lesson.Status = "cancelled"; await db.SaveChangesAsync(); }
+            return Results.NoContent();
         }).RequireAuthorization();
     }
 
