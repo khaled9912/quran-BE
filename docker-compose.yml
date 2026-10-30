@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: rayan-academy-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: academy
+      POSTGRES_USER: academy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-db-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - academy-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U academy -d academy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: rayan-academy-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__Academy: Host=postgres;Port=5432;Database=academy;Username=academy;Password=${POSTGRES_PASSWORD:-change-this-db-password}
+      AllowedOrigins: http://localhost:3000
+      BootstrapAdmin__Email: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rayanacademy.local}
+      BootstrapAdmin__Password: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123}
+      Database__EnsureCreated: "true"
+    ports:
+      - "5000:8080"
+
+volumes:
+  academy-postgres:

@@ -1,0 +1,317 @@
+using Microsoft.AspNetCore.RateLimiting;
+using System.Security.Claims;
+using System.Data;
+using Npgsql;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+
+namespace Academy.Api;
+
+public static class ApiEndpoints
+{
+    private static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
+    private static UserDto ToUser(AcademyUser u, string role) => new(u.Id, u.FullName, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, u.FullName, u.IsActive, u.FullName);
+    private static async Task<string> RoleOf(UserManager<AcademyUser> users, AcademyUser user)
+        => (await users.GetRolesAsync(user)).FirstOrDefault() ?? "student";
+    private static LessonRequestDto ToRequest(LessonRequest r)
+    {
+        var startsAt = r.AvailabilitySlot?.StartsAt ?? r.StudentAvailability!.StartsAt;
+        var endsAt = r.AvailabilitySlot?.EndsAt ?? r.StudentAvailability!.EndsAt;
+        return new(r.Id, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "", r.AvailabilitySlotId, r.StudentAvailabilityId, r.AvailabilitySlotId.HasValue ? "student" : "teacher", startsAt, endsAt, r.Status, r.CreatedAt, r.RejectionReason);
+    }
+    private static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt);
+
+    public static void MapAcademyApi(this WebApplication app)
+    {
+        var api = app.MapGroup("/api");
+
+        var auth = api.MapGroup("/auth").AllowAnonymous();
+        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        {
+            if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
+            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
+            var result = await users.CreateAsync(user, input.Password);
+            if (!result.Succeeded) return Results.ValidationProblem(result.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            await users.AddToRoleAsync(user, "student");
+            await signIn.SignInAsync(user, isPersistent: true);
+            return Results.Created("/api/auth/me", new { user = ToUser(user, "student") });
+        });
+        auth.MapPost("/login", async (LoginRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        {
+            if (string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password)) return Results.Problem("Invalid email or password.", statusCode: 401);
+            var user = await users.FindByEmailAsync(input.Email.Trim());
+            if (user is null || !user.IsActive) return Results.Problem("Invalid email or password.", statusCode: 401);
+            var check = await signIn.CheckPasswordSignInAsync(user, input.Password, lockoutOnFailure: true);
+            if (!check.Succeeded) return Results.Problem("Invalid email or password.", statusCode: 401);
+            await signIn.SignInAsync(user, isPersistent: true);
+            return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
+        }).RequireRateLimiting("login");
+        auth.MapGet("/me", async (ClaimsPrincipal principal, UserManager<AcademyUser> users) =>
+        {
+            var user = await users.GetUserAsync(principal);
+            return user is null ? Results.Unauthorized() : Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
+        }).RequireAuthorization();
+        auth.MapPost("/logout", async (SignInManager<AcademyUser> signIn) => { await signIn.SignOutAsync(); return Results.NoContent(); }).RequireAuthorization();
+
+        api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db) =>
+        {
+            if (string.IsNullOrWhiteSpace(input.Name) || input.Name.Length > 120 || !System.Net.Mail.MailAddress.TryCreate(input.Email, out _) || string.IsNullOrWhiteSpace(input.Message) || input.Message.Length is < 5 or > 3000)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["contact"] = ["Please provide a name, valid email and a message between 5 and 3000 characters."] });
+            db.ContactSubmissions.Add(new ContactSubmission { Name = input.Name.Trim(), Email = input.Email.Trim(), Message = input.Message.Trim() });
+            await db.SaveChangesAsync();
+            return Results.Accepted();
+        }).AllowAnonymous().RequireRateLimiting("contact");
+
+        var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
+        admin.MapPost("/users", async (CreateUserRequest input, UserManager<AcademyUser> users) =>
+        {
+            if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || string.IsNullOrWhiteSpace(input.Role)) return Results.BadRequest(new { message = "Full name, email, password and role are required." });
+            var role = input.Role.Trim().ToLowerInvariant();
+            if (role is not ("teacher" or "admin")) return Results.BadRequest(new { message = "Admin can create teacher or admin accounts only." });
+            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
+            var created = await users.CreateAsync(user, input.Password);
+            if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            await users.AddToRoleAsync(user, role);
+            return Results.Created($"/api/{role}s/{user.Id}", new { user = ToUser(user, role) });
+        });
+        admin.MapGet("/contact-submissions", async (AcademyDbContext db) => await db.ContactSubmissions.OrderByDescending(x => x.CreatedAt).ToListAsync());
+        admin.MapGet("/lesson-requests", async (string? status, AcademyDbContext db) =>
+        {
+            var q = db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).AsQueryable();
+            if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
+            return Results.Ok((await q.OrderBy(x => x.CreatedAt).ToListAsync()).Select(ToRequest));
+        });
+        admin.MapPost("/lesson-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveRequest(id, db));
+        admin.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, AcademyDbContext db, RejectRequest? input = null) => await RejectRequestByAdmin(id, input?.Reason, db));
+
+        admin.MapGet("/assignments", async (AcademyDbContext db) => await AssignmentList(db));
+        api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");
+        api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var teacher = await users.FindByIdAsync(input.TeacherId.ToString());
+            var student = await users.FindByIdAsync(input.StudentId.ToString());
+            if (teacher is null || student is null || !await users.IsInRoleAsync(teacher, "teacher") || !await users.IsInRoleAsync(student, "student")) return Results.BadRequest(new { message = "A valid teacher and student are required." });
+            var activeElsewhere = await db.Assignments.AnyAsync(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId);
+            if (activeElsewhere) return Results.Conflict(new { message = "This student already has an active teacher assignment. Deactivate it before assigning another teacher." });
+            var existing = await db.Assignments.FirstOrDefaultAsync(x => x.TeacherId == input.TeacherId && x.StudentId == input.StudentId);
+            if (existing is not null) { existing.IsActive = true; await db.SaveChangesAsync(); return Results.Ok(await AssignmentById(db, existing.Id)); }
+            var assignment = new TeacherStudentAssignment { TeacherId = input.TeacherId, StudentId = input.StudentId };
+            db.Assignments.Add(assignment); await db.SaveChangesAsync();
+            return Results.Created($"/api/teacher-student-assignments/{assignment.Id}", await AssignmentById(db, assignment.Id));
+        }).RequireAuthorization("AdminOnly");
+        api.MapDelete("/teacher-student-assignments/{id:guid}", async (Guid id, AcademyDbContext db) =>
+        {
+            var item = await db.Assignments.FindAsync(id); if (item is null) return Results.NotFound();
+            item.IsActive = false; await db.SaveChangesAsync(); return Results.NoContent();
+        }).RequireAuthorization("AdminOnly");
+
+        api.MapGet("/teachers", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var list = await users.GetUsersInRoleAsync("teacher"); return Results.Ok(list.Where(x => x.IsActive).Select(x => ToUser(x, "teacher")));
+        }).RequireAuthorization("AdminOnly");
+        api.MapGet("/teachers/{id:guid}", async (Guid id, UserManager<AcademyUser> users) =>
+        {
+            var user = await users.FindByIdAsync(id.ToString()); return user is null || !await users.IsInRoleAsync(user, "teacher") ? Results.NotFound() : Results.Ok(ToUser(user, "teacher"));
+        }).RequireAuthorization("AdminOnly");
+        api.MapGet("/students", async (ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            if (!HasRole(p, "admin") && !HasRole(p, "teacher")) return Results.Forbid();
+            var q = users.Users.Where(x => x.IsActive);
+            if (HasRole(p, "teacher")) { var id = UserId(p); var studentIds = db.Assignments.Where(a => a.TeacherId == id && a.IsActive).Select(a => a.StudentId); q = q.Where(u => studentIds.Contains(u.Id)); }
+            var list = await q.ToListAsync(); var result = new List<UserDto>();
+            foreach (var user in list) if (await users.IsInRoleAsync(user, "student")) result.Add(ToUser(user, "student"));
+            return Results.Ok(result);
+        }).RequireAuthorization();
+        api.MapGet("/students/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var user = await users.FindByIdAsync(id.ToString()); if (user is null || !await users.IsInRoleAsync(user, "student")) return Results.NotFound();
+            if (HasRole(p, "teacher") && !await db.Assignments.AnyAsync(a => a.TeacherId == UserId(p) && a.StudentId == id && a.IsActive)) return Results.Forbid();
+            if (!HasRole(p, "admin") && !HasRole(p, "teacher") && UserId(p) != id) return Results.Forbid();
+            return Results.Ok(ToUser(user, "student"));
+        }).RequireAuthorization();
+
+        var teacher = api.MapGroup("/teacher").RequireAuthorization("TeacherOnly");
+        teacher.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
+        teacher.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future slot with a duration up to 4 hours." });
+            var id = UserId(p);
+            var conflict = await db.AvailabilitySlots.AnyAsync(x => x.TeacherId == id && x.Status != "available" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
+                || await db.Lessons.AnyAsync(x => x.TeacherId == id && x.Status == "scheduled" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
+                || await db.AvailabilitySlots.AnyAsync(x => x.TeacherId == id && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt);
+            if (conflict) return Results.Conflict(new { message = "This time overlaps another published slot or lesson." });
+            var slot = new AvailabilitySlot { TeacherId = id, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
+            db.AvailabilitySlots.Add(slot); await db.SaveChangesAsync();
+            return Results.Created($"/api/teacher/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
+        });
+        teacher.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == UserId(p));
+            if (slot is null) return Results.NotFound(); if (slot.Status != "available") return Results.Conflict(new { message = "A requested or booked slot cannot be deleted." });
+            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
+        });
+        teacher.MapGet("/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.TeacherId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest)));
+        teacher.MapPost("/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
+            if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
+            request.Status = "pending_admin"; request.TeacherRespondedAt = DateTimeOffset.UtcNow; await db.SaveChangesAsync();
+            return Results.Ok(await RequestById(db, id));
+        });
+        teacher.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RejectRequest? input = null) =>
+        {
+            var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
+            if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
+            request.Status = "rejected"; request.RejectionReason = input?.Reason; request.TeacherRespondedAt = DateTimeOffset.UtcNow; request.AvailabilitySlot!.Status = "available";
+            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+        });
+
+        api.MapGet("/student/teacher/availability", async (ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var studentId = UserId(p);
+            var assignment = await db.Assignments.Include(x => x.Teacher).Where(x => x.StudentId == studentId && x.IsActive).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync();
+            if (assignment?.Teacher is null) return Results.Ok(new { teacher = (UserDto?)null, slots = Array.Empty<AvailabilityDto>() });
+            var slots = await db.AvailabilitySlots.Where(x => x.TeacherId == assignment.TeacherId && x.Status == "available" && x.StartsAt > DateTimeOffset.UtcNow).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync();
+            return Results.Ok(new TeacherAvailabilityDto(ToUser(assignment.Teacher, "teacher"), slots));
+        }).RequireAuthorization("StudentOnly");
+        api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            if (await db.LessonRequests.AnyAsync(x => x.StudentId == studentId && (x.Status == "pending_teacher" || x.Status == "pending_student" || x.Status == "pending_admin"))) return Results.Conflict(new { message = "You already have a lesson request awaiting approval." });
+            var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(x => x.Id == input.AvailabilitySlotId);
+            if (slot is null || slot.Status != "available" || slot.StartsAt <= DateTimeOffset.UtcNow) return Results.Conflict(new { message = "This slot is no longer available." });
+            var assigned = await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.TeacherId == slot.TeacherId && x.IsActive);
+            if (!assigned) return Results.Forbid();
+            await using var tx = await db.Database.BeginTransactionAsync();
+            var claimed = await db.AvailabilitySlots.Where(x => x.Id == slot.Id && x.Status == "available").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "requested"));
+            if (claimed == 0) return Results.Conflict(new { message = "This slot was just requested by someone else." });
+            var request = new LessonRequest { TeacherId = slot.TeacherId, StudentId = studentId, AvailabilitySlotId = slot.Id, Status = "pending_teacher" };
+            db.LessonRequests.Add(request);
+            try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
+            catch (DbUpdateException) { await tx.RollbackAsync(); await db.AvailabilitySlots.Where(x => x.Id == slot.Id && x.Status == "requested").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "available")); return Results.Conflict(new { message = "A request is already active or the slot was claimed." }); }
+            return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
+        }).RequireAuthorization("StudentOnly");
+        api.MapGet("/student/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.StudentId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest))).RequireAuthorization("StudentOnly");
+
+        var studentApi = api.MapGroup("/student").RequireAuthorization("StudentOnly");
+        studentApi.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.StudentAvailabilities.Where(x => x.StudentId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
+        studentApi.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future preferred time with a duration up to 4 hours." });
+            var assignment = await db.Assignments.Where(x => x.StudentId == studentId && x.IsActive).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync();
+            if (assignment is null) return Results.Conflict(new { message = "You do not have an assigned teacher yet." });
+            var overlaps = await db.StudentAvailabilities.AnyAsync(x => x.StudentId == studentId && x.Status != "rejected" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt);
+            if (overlaps) return Results.Conflict(new { message = "This overlaps another preferred time you have submitted." });
+            var slot = new StudentAvailability { StudentId = studentId, TeacherId = assignment.TeacherId, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
+            db.StudentAvailabilities.Add(slot); await db.SaveChangesAsync();
+            return Results.Created($"/api/student/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
+        });
+        studentApi.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var slot = await db.StudentAvailabilities.FirstOrDefaultAsync(x => x.Id == slotId && x.StudentId == UserId(p));
+            if (slot is null) return Results.NotFound(); if (slot.Status != "available") return Results.Conflict(new { message = "A selected or booked preference cannot be deleted." });
+            db.StudentAvailabilities.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
+        });
+        api.MapGet("/teacher/student-availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.StudentAvailabilities.Include(x => x.Student).Where(x => x.TeacherId == UserId(p) && x.Status == "available" && x.StartsAt > DateTimeOffset.UtcNow).OrderBy(x => x.StartsAt).Select(x => new { x.Id, x.StudentId, studentName = x.Student!.FullName, x.StartsAt, x.EndsAt, x.Status }).ToListAsync())).RequireAuthorization("TeacherOnly");
+        api.MapPost("/teacher/student-availability/{slotId:guid}/select", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var teacherId = UserId(p);
+            var slot = await db.StudentAvailabilities.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == teacherId);
+            if (slot is null || slot.Status != "available" || slot.StartsAt <= DateTimeOffset.UtcNow) return Results.Conflict(new { message = "This student preference is no longer available." });
+            if (await db.LessonRequests.AnyAsync(x => x.StudentId == slot.StudentId && (x.Status == "pending_teacher" || x.Status == "pending_student" || x.Status == "pending_admin"))) return Results.Conflict(new { message = "This student already has a lesson request awaiting approval." });
+            await using var tx = await db.Database.BeginTransactionAsync();
+            var claimed = await db.StudentAvailabilities.Where(x => x.Id == slot.Id && x.Status == "available").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "requested"));
+            if (claimed == 0) return Results.Conflict(new { message = "This preference was just selected by another action." });
+            var request = new LessonRequest { TeacherId = teacherId, StudentId = slot.StudentId, StudentAvailabilityId = slot.Id, Status = "pending_student" };
+            db.LessonRequests.Add(request);
+            try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
+            catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "An active request already exists for this student." }); }
+            return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
+        }).RequireAuthorization("TeacherOnly");
+        api.MapPost("/student/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
+            if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
+            request.Status = "pending_admin"; await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+        }).RequireAuthorization("StudentOnly");
+        api.MapPost("/student/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var request = await db.LessonRequests.Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
+            if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
+            request.Status = "rejected"; request.StudentAvailability!.Status = "available"; await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+        }).RequireAuthorization("StudentOnly");
+
+        api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var q = db.Lessons.Include(x => x.Teacher).Include(x => x.Student).AsQueryable();
+            if (HasRole(p, "student")) q = q.Where(x => x.StudentId == UserId(p));
+            else if (HasRole(p, "teacher")) q = q.Where(x => x.TeacherId == UserId(p));
+            return Results.Ok((await q.OrderBy(x => x.StartsAt).ToListAsync()).Select(ToLesson));
+        }).RequireAuthorization();
+        api.MapGet("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var l = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).FirstOrDefaultAsync(x => x.Id == id);
+            if (l is null) return Results.NotFound(); if (HasRole(p, "student") && l.StudentId != UserId(p) || HasRole(p, "teacher") && l.TeacherId != UserId(p)) return Results.Forbid();
+            return Results.Ok(ToLesson(l));
+        }).RequireAuthorization();
+    }
+
+    private static async Task<IResult> ApproveRequest(Guid id, AcademyDbContext db)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id);
+        if (request is null) return Results.NotFound();
+        if (request.Status != "pending_admin") return Results.Conflict(new { message = "This request is not awaiting admin approval." });
+        var slot = request.AvailabilitySlot;
+        var studentSlot = request.StudentAvailability;
+        var startsAt = slot?.StartsAt ?? studentSlot!.StartsAt;
+        var endsAt = slot?.EndsAt ?? studentSlot!.EndsAt;
+        var conflict = await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < endsAt && x.EndsAt > startsAt && (x.TeacherId == request.TeacherId || x.StudentId == request.StudentId));
+        if (conflict) return Results.Conflict(new { message = "A teacher or student already has a lesson at this time." });
+        var claimed = slot is not null
+            ? await db.AvailabilitySlots.Where(x => x.Id == slot.Id && x.Status == "requested").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "booked"))
+            : await db.StudentAvailabilities.Where(x => x.Id == studentSlot!.Id && x.Status == "requested").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "booked"));
+        if (claimed == 0) return Results.Conflict(new { message = "The availability slot is no longer held by this request." });
+        request.Status = "approved"; request.AdminRespondedAt = DateTimeOffset.UtcNow;
+        db.Lessons.Add(new Lesson { TeacherId = request.TeacherId, StudentId = request.StudentId, LessonRequestId = request.Id, StartsAt = startsAt, EndsAt = endsAt });
+        try
+        {
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+        }
+        catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.SerializationFailure or PostgresErrorCodes.UniqueViolation)
+        {
+            await tx.RollbackAsync();
+            return Results.Conflict(new { message = "This lesson conflicts with another booking or was approved by another admin action. Refresh and try again." });
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException pg && pg.SqlState is PostgresErrorCodes.SerializationFailure or PostgresErrorCodes.UniqueViolation)
+        {
+            await tx.RollbackAsync();
+            return Results.Conflict(new { message = "This lesson conflicts with another booking or was approved by another admin action. Refresh and try again." });
+        }
+        return Results.Ok(await RequestById(db, id));
+    }
+
+    private static async Task<IResult> RejectRequestByAdmin(Guid id, string? reason, AcademyDbContext db)
+    {
+        var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id);
+        if (request is null) return Results.NotFound(); if (request.Status != "pending_admin") return Results.Conflict(new { message = "This request is not awaiting admin approval." });
+        request.Status = "rejected"; request.RejectionReason = reason; request.AdminRespondedAt = DateTimeOffset.UtcNow;
+        if (request.AvailabilitySlot is not null) request.AvailabilitySlot.Status = "available";
+        if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
+        await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+    }
+
+    private static async Task<LessonRequestDto?> RequestById(AcademyDbContext db, Guid id)
+    {
+        var r = await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id);
+        return r is null ? null : ToRequest(r);
+    }
+    private static async Task<IReadOnlyList<AssignmentDto>> AssignmentList(AcademyDbContext db)
+        => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.IsActive).OrderBy(x => x.CreatedAt).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).ToListAsync();
+    private static async Task<AssignmentDto?> AssignmentById(AcademyDbContext db, Guid id)
+        => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.Id == id).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).FirstOrDefaultAsync();
+}
