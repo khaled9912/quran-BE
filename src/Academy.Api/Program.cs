@@ -250,6 +250,7 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
             "Email" character varying(254) NOT NULL,
             "PhoneNumber" character varying(30) NOT NULL,
             "Subjects" character varying(200) NOT NULL,
+            "EnglishLevel" character varying(20) NOT NULL DEFAULT '',
             "ExperienceYears" integer NOT NULL,
             "Bio" character varying(2000) NOT NULL,
             "AvailabilityNote" character varying(500) NOT NULL,
@@ -263,6 +264,7 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
         );
         CREATE INDEX IF NOT EXISTS "IX_TeacherApplications_Status_CreatedAt" ON "TeacherApplications" ("Status", "CreatedAt");
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherApplications_Email" ON "TeacherApplications" ("Email") WHERE "Status" = 'pending';
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "EnglishLevel" character varying(20) NOT NULL DEFAULT '';
 
         CREATE TABLE IF NOT EXISTS "TeacherApplicationCvs" (
             "ApplicationId" uuid NOT NULL,
@@ -272,6 +274,16 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
             "UpdatedAt" timestamp with time zone NOT NULL,
             CONSTRAINT "PK_TeacherApplicationCvs" PRIMARY KEY ("ApplicationId"),
             CONSTRAINT "FK_TeacherApplicationCvs_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS "TeacherApplicationIntros" (
+            "ApplicationId" uuid NOT NULL,
+            "FileName" character varying(200) NOT NULL,
+            "ContentType" character varying(100) NOT NULL,
+            "Data" bytea NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherApplicationIntros" PRIMARY KEY ("ApplicationId"),
+            CONSTRAINT "FK_TeacherApplicationIntros_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
         );
         """);
     var roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();

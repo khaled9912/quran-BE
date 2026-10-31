@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using System.Security.Cryptography;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -8,15 +9,23 @@ using Npgsql;
 namespace Academy.Api;
 
 /// <summary>
-/// Public teacher applications: anonymous submission with a CV upload, plus an
-/// admin queue that can approve (create the teacher account and send a
-/// set-password code) or reject with a reason.
+/// Public teacher applications: anonymous submission with a CV and a short
+/// self-introduction recording, plus an admin queue that can approve (create the
+/// teacher account and send a set-password code) or reject with a reason.
 /// </summary>
 public static class TeacherApplicationEndpoints
 {
     private const long MaxCvBytes = 2 * 1024 * 1024;
+    private const long MaxIntroBytes = 20 * 1024 * 1024;
+    private const long MaxFormBytes = MaxCvBytes + MaxIntroBytes + 1024 * 1024;
 
     private static readonly string[] AllowedSubjects = ["quran", "tajweed", "islamic_studies", "arabic"];
+    private static readonly string[] AllowedEnglishLevels = ["beginner", "intermediate", "advanced", "fluent"];
+    private static readonly string[] AllowedIntroContentTypes =
+    [
+        "audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/wav", "audio/x-wav",
+        "audio/ogg", "audio/webm", "video/mp4", "video/webm", "video/quicktime",
+    ];
 
     public static void MapTeacherApplications(this WebApplication app)
     {
@@ -29,6 +38,7 @@ public static class TeacherApplicationEndpoints
         var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
         admin.MapGet("/teacher-applications", ListApplicationsAsync);
         admin.MapGet("/teacher-applications/{id:guid}/cv", DownloadCvAsync);
+        admin.MapGet("/teacher-applications/{id:guid}/intro", DownloadIntroAsync);
         admin.MapPatch("/teacher-applications/{id:guid}", ReviewApplicationAsync);
     }
 
@@ -43,17 +53,20 @@ public static class TeacherApplicationEndpoints
         IFormCollection form;
         try
         {
-            form = await http.Request.ReadFormAsync(http.RequestAborted);
+            form = await http.Request.ReadFormAsync(
+                new FormOptions { MultipartBodyLengthLimit = MaxFormBytes },
+                http.RequestAborted);
         }
         catch (Exception ex) when (ex is InvalidDataException or BadHttpRequestException)
         {
-            return Results.Problem("The uploaded file is too large. Choose a CV under 2 MB.", statusCode: StatusCodes.Status413PayloadTooLarge);
+            return Results.Problem("The uploaded files are too large. Keep the CV under 2 MB and the recording under 20 MB.", statusCode: StatusCodes.Status413PayloadTooLarge);
         }
 
         var errors = new Dictionary<string, string[]>();
         var fullName = form["fullName"].ToString().Trim();
         var email = form["email"].ToString().Trim();
         var phone = PhoneNumbers.Normalize(form["phoneNumber"].ToString());
+        var englishLevel = form["englishLevel"].ToString().Trim().ToLowerInvariant();
         var bio = form["bio"].ToString().Trim();
         var availabilityNote = form["availabilityNote"].ToString().Trim();
 
@@ -71,6 +84,9 @@ public static class TeacherApplicationEndpoints
             .ToList();
         if (subjects.Count == 0 || subjects.Any(subject => !AllowedSubjects.Contains(subject)))
             errors["subjects"] = ["Choose at least one subject: Quran, Tajweed, Islamic studies, or Arabic."];
+
+        if (!AllowedEnglishLevels.Contains(englishLevel))
+            errors["englishLevel"] = ["Choose your English level: Beginner, Intermediate, Advanced, or Fluent."];
 
         if (!int.TryParse(form["experienceYears"].ToString(), out var experienceYears) || experienceYears is < 0 or > 70)
             errors["experienceYears"] = ["Enter your years of teaching experience (0 to 70)."];
@@ -109,6 +125,36 @@ public static class TeacherApplicationEndpoints
             }
         }
 
+        var intro = form.Files.GetFile("intro");
+        string? introName = null;
+        string? introType = null;
+        byte[]? introData = null;
+        if (intro is null || intro.Length == 0)
+        {
+            errors["intro"] = ["Attach a short recording introducing yourself (audio or video, up to 20 MB)."];
+        }
+        else if (intro.Length > MaxIntroBytes)
+        {
+            errors["intro"] = ["The recording must be 20 MB or smaller."];
+        }
+        else
+        {
+            introName = SafeFileName(intro.FileName, "self-introduction.webm");
+            introType = IntroMediaType(intro.ContentType, introName);
+            if (introType is null)
+            {
+                errors["intro"] = ["Upload your recording as MP3, M4A, WAV, OGG, WebM, MP4, or MOV."];
+            }
+            else
+            {
+                await using var buffer = new MemoryStream();
+                await intro.CopyToAsync(buffer, http.RequestAborted);
+                introData = buffer.ToArray();
+                if (!LooksLikeMedia(introData, introType))
+                    errors["intro"] = ["That file does not look like a valid audio or video recording."];
+            }
+        }
+
         if (errors.Count > 0) return Results.ValidationProblem(errors);
 
         if (await db.TeacherApplications.AnyAsync(x => x.Email == email && x.Status == "pending", http.RequestAborted))
@@ -122,6 +168,7 @@ public static class TeacherApplicationEndpoints
             Email = email,
             PhoneNumber = phone!,
             Subjects = string.Join(',', subjects),
+            EnglishLevel = englishLevel,
             ExperienceYears = experienceYears,
             Bio = bio,
             AvailabilityNote = availabilityNote,
@@ -130,6 +177,12 @@ public static class TeacherApplicationEndpoints
                 FileName = fileName!,
                 ContentType = contentType!,
                 Data = fileData!,
+            },
+            Intro = new TeacherApplicationIntro
+            {
+                FileName = introName!,
+                ContentType = introType!,
+                Data = introData!,
             },
         };
         db.TeacherApplications.Add(application);
@@ -168,6 +221,7 @@ public static class TeacherApplicationEndpoints
                 x.Email,
                 x.PhoneNumber,
                 x.Subjects,
+                x.EnglishLevel,
                 x.ExperienceYears,
                 x.Bio,
                 x.AvailabilityNote,
@@ -177,14 +231,15 @@ public static class TeacherApplicationEndpoints
                 x.ReviewedAt,
                 x.TeacherId,
                 CvFileName = x.Cv == null ? null : x.Cv.FileName,
+                IntroFileName = x.Intro == null ? null : x.Intro.FileName,
             })
             .ToListAsync();
 
         return Results.Ok(rows.Select(x => new TeacherApplicationDto(
             x.Id, x.FullName, x.Email, x.PhoneNumber,
             x.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
-            x.ExperienceYears, x.Bio, x.AvailabilityNote, x.Status, x.RejectionReason,
-            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName)).ToList());
+            x.EnglishLevel, x.ExperienceYears, x.Bio, x.AvailabilityNote, x.Status, x.RejectionReason,
+            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName)).ToList());
     }
 
     private static async Task<IResult> DownloadCvAsync(Guid id, [FromServices] AcademyDbContext db)
@@ -193,6 +248,14 @@ public static class TeacherApplicationEndpoints
             .FirstOrDefaultAsync(x => x.ApplicationId == id);
         if (cv is null) return Results.NotFound();
         return Results.File(cv.Data, cv.ContentType, SafeFileName(cv.FileName));
+    }
+
+    private static async Task<IResult> DownloadIntroAsync(Guid id, [FromServices] AcademyDbContext db)
+    {
+        var intro = await db.TeacherApplicationIntros.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.ApplicationId == id);
+        if (intro is null) return Results.NotFound();
+        return Results.File(intro.Data, intro.ContentType, SafeFileName(intro.FileName, "self-introduction.webm"));
     }
 
     private static async Task<IResult> ReviewApplicationAsync(
@@ -276,16 +339,20 @@ public static class TeacherApplicationEndpoints
         if (inviteCode is not null)
             inviteEmailed = await email.SendTeacherInviteCodeAsync(application.Email, application.FullName, inviteCode, 15, http.RequestAborted);
 
-        var cvFileName = await db.TeacherApplicationCvs.AsNoTracking()
-            .Where(x => x.ApplicationId == application.Id)
-            .Select(x => x.FileName)
-            .FirstOrDefaultAsync(http.RequestAborted);
+        var files = await db.TeacherApplications.AsNoTracking()
+            .Where(x => x.Id == application.Id)
+            .Select(x => new
+            {
+                CvFileName = x.Cv == null ? null : x.Cv.FileName,
+                IntroFileName = x.Intro == null ? null : x.Intro.FileName,
+            })
+            .FirstAsync(http.RequestAborted);
         var dto = new TeacherApplicationDto(
             application.Id, application.FullName, application.Email, application.PhoneNumber,
             application.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
-            application.ExperienceYears, application.Bio, application.AvailabilityNote,
+            application.EnglishLevel, application.ExperienceYears, application.Bio, application.AvailabilityNote,
             application.Status, application.RejectionReason, application.CreatedAt,
-            application.ReviewedAt, application.TeacherId, cvFileName);
+            application.ReviewedAt, application.TeacherId, files.CvFileName, files.IntroFileName);
 
         return Results.Ok(new
         {
@@ -306,11 +373,11 @@ public static class TeacherApplicationEndpoints
         return new string(chars);
     }
 
-    private static string SafeFileName(string name)
+    private static string SafeFileName(string name, string fallback = "application-cv.pdf")
     {
         var trimmed = Path.GetFileName(name);
         var cleaned = new string(trimmed.Where(c => !char.IsControl(c) && c is not ('"' or '\\' or '/')).ToArray()).Trim();
-        if (cleaned.Length == 0) return "application-cv.pdf";
+        if (cleaned.Length == 0) return fallback;
         return cleaned.Length > 200 ? cleaned[..200] : cleaned;
     }
 
@@ -339,4 +406,41 @@ public static class TeacherApplicationEndpoints
             && data[0] == (byte)'P' && data[1] == (byte)'K' && data[2] == 3 && data[3] == 4,
         _ => false,
     };
+
+    private static string? IntroMediaType(string? rawContentType, string fileName)
+    {
+        var contentType = (rawContentType ?? "").Split(';')[0].Trim().ToLowerInvariant();
+        if (AllowedIntroContentTypes.Contains(contentType)) return contentType;
+        return Path.GetExtension(fileName).ToLowerInvariant() switch
+        {
+            ".mp3" => "audio/mpeg",
+            ".m4a" => "audio/mp4",
+            ".wav" => "audio/wav",
+            ".ogg" => "audio/ogg",
+            ".webm" => "audio/webm",
+            ".mp4" => "video/mp4",
+            ".mov" => "video/quicktime",
+            _ => null,
+        };
+    }
+
+    private static bool LooksLikeMedia(byte[] data, string contentType)
+    {
+        if (data.Length < 12) return false;
+        var ftyp = data[4] == (byte)'f' && data[5] == (byte)'t' && data[6] == (byte)'y' && data[7] == (byte)'p';
+        var riffWave = data[0] == (byte)'R' && data[1] == (byte)'I' && data[2] == (byte)'F' && data[3] == (byte)'F'
+            && data[8] == (byte)'W' && data[9] == (byte)'A' && data[10] == (byte)'V' && data[11] == (byte)'E';
+        var ebml = data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3;
+        var ogg = data[0] == (byte)'O' && data[1] == (byte)'g' && data[2] == (byte)'g' && data[3] == (byte)'S';
+        return contentType switch
+        {
+            "audio/mpeg" => (data[0] == (byte)'I' && data[1] == (byte)'D' && data[2] == (byte)'3')
+                || (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0),
+            "audio/mp4" or "audio/x-m4a" or "video/mp4" or "video/quicktime" => ftyp,
+            "audio/wav" or "audio/x-wav" => riffWave,
+            "audio/ogg" => ogg,
+            "audio/webm" or "video/webm" => ebml,
+            _ => false,
+        };
+    }
 }

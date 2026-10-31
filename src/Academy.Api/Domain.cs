@@ -136,6 +136,8 @@ public sealed class TeacherApplication
     [MaxLength(30)] public string PhoneNumber { get; set; } = "";
     // Comma-separated canonical values: quran,tajweed,islamic_studies,arabic
     [MaxLength(200)] public string Subjects { get; set; } = "";
+    // beginner | intermediate | advanced | fluent
+    [MaxLength(20)] public string EnglishLevel { get; set; } = "";
     public int ExperienceYears { get; set; }
     [MaxLength(2000)] public string Bio { get; set; } = "";
     [MaxLength(500)] public string AvailabilityNote { get; set; } = "";
@@ -147,6 +149,7 @@ public sealed class TeacherApplication
     public Guid? TeacherId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public TeacherApplicationCv? Cv { get; set; }
+    public TeacherApplicationIntro? Intro { get; set; }
 }
 
 /// <summary>CV stored separately so application lists never load file bytes.</summary>
@@ -156,6 +159,17 @@ public sealed class TeacherApplicationCv
     public TeacherApplication? Application { get; set; }
     [MaxLength(200)] public string FileName { get; set; } = "";
     [MaxLength(100)] public string ContentType { get; set; } = "application/pdf";
+    public byte[] Data { get; set; } = [];
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Self-introduction recording, also kept out of application list queries.</summary>
+public sealed class TeacherApplicationIntro
+{
+    public Guid ApplicationId { get; set; }
+    public TeacherApplication? Application { get; set; }
+    [MaxLength(200)] public string FileName { get; set; } = "";
+    [MaxLength(100)] public string ContentType { get; set; } = "audio/webm";
     public byte[] Data { get; set; } = [];
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
