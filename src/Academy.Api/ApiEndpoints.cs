@@ -772,6 +772,23 @@ public static class ApiEndpoints
             if (l is null) return Results.NotFound(); if (HasRole(p, "student") && l.StudentId != UserId(p) || HasRole(p, "teacher") && l.TeacherId != UserId(p)) return Results.Forbid();
             return Results.Ok(ToLesson(l));
         }).RequireAuthorization();
+
+        // A lesson room counts as open only while the owning teacher is inside it.
+        api.MapPost("/lessons/{id:guid}/presence", async (Guid id, ClaimsPrincipal p, LessonPresenceStore presence, AcademyDbContext db) =>
+        {
+            var ownsLesson = await db.Lessons.AsNoTracking().AnyAsync(x => x.Id == id && x.TeacherId == UserId(p));
+            if (!ownsLesson) return Results.NotFound();
+            presence.MarkTeacherPresent(id);
+            return Results.NoContent();
+        }).RequireAuthorization("TeacherOnly");
+
+        api.MapGet("/lessons/{id:guid}/presence", async (Guid id, ClaimsPrincipal p, LessonPresenceStore presence, AcademyDbContext db) =>
+        {
+            var lesson = await db.Lessons.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id);
+            if (lesson is null) return Results.NotFound();
+            if (!IsAdmin(p) && !(HasRole(p, "teacher") && lesson.TeacherId == UserId(p)) && !(HasRole(p, "student") && lesson.StudentId == UserId(p))) return Results.Forbid();
+            return Results.Ok(new { teacherPresent = presence.IsTeacherPresent(id) });
+        }).RequireAuthorization();
         api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);

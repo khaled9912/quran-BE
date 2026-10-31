@@ -130,6 +130,7 @@ builder.Services.AddRateLimiter(options =>
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
+builder.Services.AddSingleton<LessonPresenceStore>();
 builder.Services.AddSingleton<AcademyEmailSender>();
 builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
