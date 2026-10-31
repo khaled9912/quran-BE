@@ -144,7 +144,8 @@ Netlify and Vercel cannot run this project: it is a .NET 10 process behind IIS, 
    - `DATABASE_URL` accepts the Neon Postgres URI (the resolver also accepts `ConnectionStrings__Academy`).
    - `AllowedOrigins` is a comma-separated list of exact frontend origins: scheme + host, no trailing slash.
    - Use `Cookie__SameSite=None` only for cross-site cookies. With the same-origin frontend proxy (see the frontend README), keep `Lax`.
-   - Optional: `BootstrapAdmin__Email` / `BootstrapAdmin__Password`, `Email__*` for the contact form, `Otp__*`, and `SENTRY_DSN`.
+   - Optional: `BootstrapAdmin__Email` / `BootstrapAdmin__Password`, `Email__*` for the contact form, and `SENTRY_DSN`.
+   - Phone OTP: the fixed development code (`8888`) is **ignored outside Development** — even if `Otp__DevMode=true` is left behind, production refuses it. To keep phone sign-in working in production, configure a real sender: `Otp__Sender=textbee`, `Otp__TextBee__ApiKey`, and `Otp__TextBee__DeviceId`. Without a sender, `/api/auth/otp/*` returns `503` and students should use email signup instead.
 
 5. Verify the deployment:
 

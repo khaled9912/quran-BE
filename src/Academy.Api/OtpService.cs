@@ -27,7 +27,9 @@ public sealed class PhoneOtpStore
 
     public PhoneOtpStore(IConfiguration configuration, IHostEnvironment environment)
     {
-        _devMode = configuration.GetValue("Otp:DevMode", environment.IsDevelopment());
+        // A fixed code is only ever acceptable on a developer machine. Even if a
+        // hosted environment accidentally sets Otp:DevMode=true, it is ignored.
+        _devMode = environment.IsDevelopment() && configuration.GetValue("Otp:DevMode", true);
         _devCode = configuration["Otp:DevCode"] is { Length: > 0 } code ? code : "8888";
     }
 
