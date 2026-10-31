@@ -9,7 +9,7 @@ namespace Academy.Api;
 
 public static class ApiEndpoints
 {
-    private static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    internal static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
     private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
     private static bool IsAdmin(ClaimsPrincipal p) => p.IsInRole("admin") || p.IsInRole("super_admin");
     private static UserDto ToUser(AcademyUser u, string role) => new(u.Id, u.FullName, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, u.FullName, u.IsActive, u.FullName, u.PhoneNumber, $"/api/users/{u.Id}/avatar");
@@ -26,7 +26,7 @@ public static class ApiEndpoints
     /// separate errors. Here both are the same value, so they would surface twice;
     /// collapse them into one message.
     /// </summary>
-    private static Dictionary<string, string[]> IdentityErrors(IdentityResult result)
+    internal static Dictionary<string, string[]> IdentityErrors(IdentityResult result)
     {
         if (result.Errors.Any(e => e.Code is nameof(IdentityErrorDescriber.DuplicateEmail) or nameof(IdentityErrorDescriber.DuplicateUserName)))
             return new() { ["email"] = ["An account with this email already exists."] };

@@ -127,6 +127,39 @@ public sealed class ContactSubmission
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>A public application from a prospective teacher, reviewed by an admin.</summary>
+public sealed class TeacherApplication
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    [MaxLength(160)] public string FullName { get; set; } = "";
+    [MaxLength(254)] public string Email { get; set; } = "";
+    [MaxLength(30)] public string PhoneNumber { get; set; } = "";
+    // Comma-separated canonical values: quran,tajweed,islamic_studies,arabic
+    [MaxLength(200)] public string Subjects { get; set; } = "";
+    public int ExperienceYears { get; set; }
+    [MaxLength(2000)] public string Bio { get; set; } = "";
+    [MaxLength(500)] public string AvailabilityNote { get; set; } = "";
+    // pending | approved | rejected
+    [MaxLength(20)] public string Status { get; set; } = "pending";
+    [MaxLength(500)] public string? RejectionReason { get; set; }
+    public Guid? ReviewedBy { get; set; }
+    public DateTimeOffset? ReviewedAt { get; set; }
+    public Guid? TeacherId { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public TeacherApplicationCv? Cv { get; set; }
+}
+
+/// <summary>CV stored separately so application lists never load file bytes.</summary>
+public sealed class TeacherApplicationCv
+{
+    public Guid ApplicationId { get; set; }
+    public TeacherApplication? Application { get; set; }
+    [MaxLength(200)] public string FileName { get; set; } = "";
+    [MaxLength(100)] public string ContentType { get; set; } = "application/pdf";
+    public byte[] Data { get; set; } = [];
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 /// <summary>Profile image stored separately so user queries never load image bytes.</summary>
 public sealed class UserAvatar
 {

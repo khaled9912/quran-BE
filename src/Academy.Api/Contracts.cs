@@ -22,6 +22,7 @@ public sealed record RejectRequest(string? Reason);
 public sealed record RequestSlotInput(Guid AvailabilitySlotId);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);
+public sealed record ReviewTeacherApplicationRequest(string Status, string? Reason);
 
 public sealed record UserDto(Guid Id, string FullName, string Email, string Role, bool IsActive, [property: JsonPropertyName("full_name")] string FullNameSnake, [property: JsonPropertyName("is_active")] bool IsActiveSnake, string Name, string? PhoneNumber, string? AvatarUrl);
 public sealed record AssignmentDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset CreatedAt, bool IsActive, string Status);
@@ -32,3 +33,4 @@ public sealed record LessonReportDto(Guid Id, Guid LessonId, DateTimeOffset Star
 public sealed record TeacherReviewDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int Rating, string? Comment, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record PublicTeacherDto(Guid Id, string FullName, string? AvatarUrl, double? AverageRating, int ReviewCount, IReadOnlyList<TeacherReviewDto> Reviews);
 public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review);
+public sealed record TeacherApplicationDto(Guid Id, string FullName, string Email, string PhoneNumber, IReadOnlyList<string> Subjects, int ExperienceYears, string Bio, string AvailabilityNote, string Status, string? RejectionReason, DateTimeOffset CreatedAt, DateTimeOffset? ReviewedAt, Guid? TeacherId, string? CvFileName);

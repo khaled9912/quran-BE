@@ -16,6 +16,8 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<UserAvatar> UserAvatars => Set<UserAvatar>();
     public DbSet<LessonReport> LessonReports => Set<LessonReport>();
     public DbSet<TeacherReview> TeacherReviews => Set<TeacherReview>();
+    public DbSet<TeacherApplication> TeacherApplications => Set<TeacherApplication>();
+    public DbSet<TeacherApplicationCv> TeacherApplicationCvs => Set<TeacherApplicationCv>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -58,5 +60,13 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<TeacherReview>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<TeacherReview>().HasIndex(x => x.LessonId).IsUnique();
         b.Entity<TeacherReview>().HasIndex(x => x.TeacherId);
+        b.Entity<TeacherApplication>().HasIndex(x => new { x.Status, x.CreatedAt });
+        b.Entity<TeacherApplication>().HasIndex(x => x.Email).IsUnique().HasFilter("\"Status\" = 'pending'");
+        b.Entity<TeacherApplicationCv>().ToTable("TeacherApplicationCvs");
+        b.Entity<TeacherApplicationCv>().HasKey(x => x.ApplicationId);
+        b.Entity<TeacherApplicationCv>().HasOne(x => x.Application).WithOne(x => x.Cv).HasForeignKey<TeacherApplicationCv>(x => x.ApplicationId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TeacherApplicationCv>().Property(x => x.FileName).HasMaxLength(200).IsRequired();
+        b.Entity<TeacherApplicationCv>().Property(x => x.ContentType).HasMaxLength(100).IsRequired();
+        b.Entity<TeacherApplicationCv>().Property(x => x.Data).IsRequired();
     }
 }

@@ -127,6 +127,9 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("otp", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
+    options.AddPolicy("applications", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
@@ -181,6 +184,7 @@ if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "rayan-academy-api" }));
 app.MapHealthChecks("/health/ready");
 app.MapAcademyApi();
+app.MapTeacherApplications();
 
 // First-run convenience for a fresh MVP database. Set Database:EnsureCreated=false after
 // adopting EF migrations in a deployed environment.
@@ -239,6 +243,36 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherReviews_LessonId" ON "TeacherReviews" ("LessonId");
         CREATE INDEX IF NOT EXISTS "IX_TeacherReviews_TeacherId" ON "TeacherReviews" ("TeacherId");
         CREATE INDEX IF NOT EXISTS "IX_TeacherReviews_StudentId" ON "TeacherReviews" ("StudentId");
+
+        CREATE TABLE IF NOT EXISTS "TeacherApplications" (
+            "Id" uuid NOT NULL,
+            "FullName" character varying(160) NOT NULL,
+            "Email" character varying(254) NOT NULL,
+            "PhoneNumber" character varying(30) NOT NULL,
+            "Subjects" character varying(200) NOT NULL,
+            "ExperienceYears" integer NOT NULL,
+            "Bio" character varying(2000) NOT NULL,
+            "AvailabilityNote" character varying(500) NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "RejectionReason" character varying(500),
+            "ReviewedBy" uuid,
+            "ReviewedAt" timestamp with time zone,
+            "TeacherId" uuid,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherApplications" PRIMARY KEY ("Id")
+        );
+        CREATE INDEX IF NOT EXISTS "IX_TeacherApplications_Status_CreatedAt" ON "TeacherApplications" ("Status", "CreatedAt");
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherApplications_Email" ON "TeacherApplications" ("Email") WHERE "Status" = 'pending';
+
+        CREATE TABLE IF NOT EXISTS "TeacherApplicationCvs" (
+            "ApplicationId" uuid NOT NULL,
+            "FileName" character varying(200) NOT NULL,
+            "ContentType" character varying(100) NOT NULL,
+            "Data" bytea NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherApplicationCvs" PRIMARY KEY ("ApplicationId"),
+            CONSTRAINT "FK_TeacherApplicationCvs_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
+        );
         """);
     var roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
     foreach (var role in new[] { "admin", "teacher", "student" })
