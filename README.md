@@ -7,7 +7,8 @@ A lean .NET 10 Web API for the Next.js App Router frontend. It uses ASP.NET Core
 ## Included
 
 - Student-only public registration; admins create teacher/admin accounts.
-- Cookie-based login/logout/current-user endpoints.
+- Cookie-based login/logout/current-user endpoints, plus self-service password change from the profile page (admins can still reset teacher/student passwords).
+- Email password reset with a one-time code (requires the `Email__*` SMTP settings; uses the dev code `8888` only in Development).
 - Admin management of teachers, student/teacher assignments, and booking approvals.
 - Teacher-published availability for students to select.
 - Student-facing teacher directory with self-service slot booking; choosing a teacher assigns them.
@@ -62,6 +63,8 @@ CONTACT_RECEIVER_EMAIL=academy-inbox@example.com
 
 `CONTACT_RECEIVER_EMAIL` is the fixed destination; the browser cannot choose it. If delivery fails, the submission remains in the admin inbox and the failure is logged.
 
+The same SMTP settings power **forgot password**. It needs `EMAIL_ENABLED=true` and a valid host, username, password, and from address; the contact receiver is not required. Without SMTP, `POST /api/auth/password/request` returns `503`. In Development the flow works without SMTP and returns the fixed code `8888`.
+
 ## Run without Docker
 
 Install the .NET 10 SDK and PostgreSQL. Set:
@@ -96,7 +99,7 @@ Each request represents one lesson. Students repeat the process for every lesson
 - Keep `Cookie:SameSite=Lax` for same-site deployments. For truly cross-site deployments, use `SameSite=None` with HTTPS and `Secure` cookies.
 - Use secrets management for database and bootstrap admin credentials. Do not commit `.env`.
 - `EnsureCreated` is intended for a fresh MVP database. Before deploying schema changes to production, introduce and apply EF Core migrations. The `UserAvatars` table is currently added by an idempotent startup SQL statement as a temporary bridge for existing databases.
-- Email verification, password reset, invitation emails, audit history, automated request expiry, and LiveKit are not included yet.
+- Email verification, invitation emails, audit history, automated request expiry, and LiveKit are not included yet.
 
 ## Deploy to MonsterASP.NET (IIS)
 

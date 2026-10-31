@@ -21,6 +21,19 @@ public static class ApiEndpoints
         var endsAt = r.AvailabilitySlot?.EndsAt ?? r.StudentAvailability!.EndsAt;
         return new(r.Id, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "", r.AvailabilitySlotId, r.StudentAvailabilityId, r.AvailabilitySlotId.HasValue ? "student" : "teacher", startsAt, endsAt, r.Status, r.CreatedAt, r.RejectionReason);
     }
+    /// <summary>
+    /// Identity reports a duplicate sign-in name and a duplicate email as two
+    /// separate errors. Here both are the same value, so they would surface twice;
+    /// collapse them into one message.
+    /// </summary>
+    private static Dictionary<string, string[]> IdentityErrors(IdentityResult result)
+    {
+        if (result.Errors.Any(e => e.Code is nameof(IdentityErrorDescriber.DuplicateEmail) or nameof(IdentityErrorDescriber.DuplicateUserName)))
+            return new() { ["email"] = ["An account with this email already exists."] };
+        return result.Errors
+            .GroupBy(e => e.Code)
+            .ToDictionary(g => g.Key, g => g.Select(e => e.Description).Distinct().ToArray());
+    }
     private static string PublicStudentName(string? fullName)
     {
         var parts = (fullName ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -55,7 +68,7 @@ public static class ApiEndpoints
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var result = await users.CreateAsync(user, input.Password);
-            if (!result.Succeeded) return Results.ValidationProblem(result.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
             await users.AddToRoleAsync(user, "student");
             await signIn.SignInAsync(user, isPersistent: true);
             return Results.Created("/api/auth/me", new { user = ToUser(user, "student") });
@@ -77,6 +90,89 @@ public static class ApiEndpoints
         }).RequireAuthorization();
         // Allow anonymous so a stale/expired session cookie can still be cleared.
         auth.MapPost("/logout", async (SignInManager<AcademyUser> signIn) => { await signIn.SignOutAsync(); return Results.NoContent(); });
+
+        // Self-service password change. Mapped on the root group so the auth
+        // group's AllowAnonymous flag cannot bypass authorization.
+        api.MapPost("/auth/change-password", async (ChangePasswordRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        {
+            var user = await users.GetUserAsync(principal);
+            if (user is null || !user.IsActive) return Results.Unauthorized();
+            if (!await users.HasPasswordAsync(user))
+                return Results.Problem("This account signs in with a phone code, so there is no password to change.", statusCode: 409);
+            if (string.IsNullOrWhiteSpace(input.CurrentPassword) || string.IsNullOrWhiteSpace(input.NewPassword))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["password"] = ["Enter your current and new password."] });
+            if (input.NewPassword.Length < 8)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["The new password must be at least 8 characters."] });
+            if (input.CurrentPassword == input.NewPassword)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["Choose a password different from your current one."] });
+            var result = await users.ChangePasswordAsync(user, input.CurrentPassword, input.NewPassword);
+            if (!result.Succeeded)
+            {
+                if (result.Errors.Any(e => e.Code == nameof(IdentityErrorDescriber.PasswordMismatch)))
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["currentPassword"] = ["Your current password is incorrect."] });
+                return Results.ValidationProblem(IdentityErrors(result));
+            }
+            // Rotate the cookie for this device; other devices are signed out by the
+            // security stamp change inside ChangePasswordAsync.
+            await signIn.RefreshSignInAsync(user);
+            return Results.NoContent();
+        }).RequireAuthorization().RequireRateLimiting("login");
+
+        auth.MapPost("/password/request", async (PasswordResetRequestInput input, PasswordResetStore resets, AcademyEmailSender email, UserManager<AcademyUser> users, HttpContext http) =>
+        {
+            var address = input.Email?.Trim() ?? "";
+            if (!System.Net.Mail.MailAddress.TryCreate(address, out _))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["email"] = ["Enter a valid email address."] });
+            if (!resets.DevMode && !email.IsConfigured)
+                return Results.Problem("Password reset email is not available right now. Please contact the academy.", statusCode: 503);
+
+            var key = address.ToLowerInvariant();
+            var user = await users.FindByEmailAsync(address);
+            // The response is identical whether or not the account exists.
+            if (user is null || !user.IsActive)
+                return Results.Accepted(value: new { message = "If an account uses this email, a reset code has been sent." });
+
+            var code = resets.TryIssue(key);
+            if (code is null) return Results.Problem("Please wait a minute before requesting another code.", statusCode: 429);
+            if (!resets.DevMode)
+            {
+                var sent = await email.SendPasswordResetCodeAsync(user.Email!, code, 15, http.RequestAborted);
+                if (!sent)
+                {
+                    resets.Consume(key);
+                    return Results.Problem("Could not send the reset email. Please try again.", statusCode: 502);
+                }
+            }
+            return Results.Accepted(value: new
+            {
+                message = "If an account uses this email, a reset code has been sent.",
+                devCode = resets.DevMode ? code : null,
+            });
+        }).RequireRateLimiting("otp");
+
+        auth.MapPost("/password/reset", async (PasswordResetInput input, PasswordResetStore resets, UserManager<AcademyUser> users) =>
+        {
+            var address = input.Email?.Trim() ?? "";
+            var code = input.Code?.Trim() ?? "";
+            if (!System.Net.Mail.MailAddress.TryCreate(address, out _))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["email"] = ["Enter a valid email address."] });
+            if (code.Length is < 4 or > 8 || !code.All(char.IsAsciiDigit))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["code"] = ["Enter the numeric code from the email."] });
+            if (string.IsNullOrWhiteSpace(input.NewPassword) || input.NewPassword.Length < 8)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["newPassword"] = ["The new password must be at least 8 characters."] });
+
+            var key = address.ToLowerInvariant();
+            if (!resets.Check(key, code)) return Results.Problem("The code is invalid or has expired.", statusCode: 401);
+
+            var user = await users.FindByEmailAsync(address);
+            if (user is null || !user.IsActive) return Results.Problem("The code is invalid or has expired.", statusCode: 401);
+
+            var token = await users.GeneratePasswordResetTokenAsync(user);
+            var result = await users.ResetPasswordAsync(user, token, input.NewPassword);
+            if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
+            resets.Consume(key);
+            return Results.NoContent();
+        }).RequireRateLimiting("otp");
 
         var profile = api.MapGroup("/profile").RequireAuthorization();
         profile.MapGet("", async (ClaimsPrincipal principal, UserManager<AcademyUser> users) =>
@@ -270,7 +366,7 @@ public static class ApiEndpoints
             return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         }).RequireRateLimiting("otp");
 
-        api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db, ContactEmailSender notifier, HttpContext http) =>
+        api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db, AcademyEmailSender notifier, HttpContext http) =>
         {
             var errors = new Dictionary<string, string[]>();
             var name = input.Name?.Trim() ?? "";
@@ -296,7 +392,7 @@ public static class ApiEndpoints
             if (role is not ("teacher" or "admin")) return Results.BadRequest(new { message = "Admin can create teacher or admin accounts only." });
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var created = await users.CreateAsync(user, input.Password);
-            if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, role);
             return Results.Created($"/api/{role}s/{user.Id}", new { user = ToUser(user, role) });
         });
@@ -530,7 +626,7 @@ public static class ApiEndpoints
             if (await users.FindByEmailAsync(input.Email.Trim()) is not null) return Results.Conflict(new { message = "An account with this email already exists." });
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var created = await users.CreateAsync(user, input.Password);
-            if (!created.Succeeded) return Results.ValidationProblem(created.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, "student");
             return Results.Created($"/api/students/{user.Id}", ToUser(user, "student"));
         }).RequireAuthorization("AdminOnly");

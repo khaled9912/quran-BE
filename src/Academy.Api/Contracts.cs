@@ -4,6 +4,9 @@ namespace Academy.Api;
 
 public sealed record RegisterRequest(string FullName, string Email, string Password);
 public sealed record LoginRequest(string Email, string Password);
+public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
+public sealed record PasswordResetRequestInput(string Email);
+public sealed record PasswordResetInput(string Email, string Code, string NewPassword);
 public sealed record OtpRequest(string Phone);
 public sealed record OtpVerifyRequest(string Phone, string Code, string? FullName);
 public sealed record CreateUserRequest(string FullName, string Email, string Password, string Role);

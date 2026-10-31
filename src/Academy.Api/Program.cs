@@ -129,7 +129,8 @@ builder.Services.AddRateLimiter(options =>
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
-builder.Services.AddSingleton<ContactEmailSender>();
+builder.Services.AddSingleton<PasswordResetStore>();
+builder.Services.AddSingleton<AcademyEmailSender>();
 builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
 if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
