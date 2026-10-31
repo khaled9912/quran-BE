@@ -9,7 +9,7 @@ using Npgsql;
 namespace Academy.Api;
 
 /// <summary>
-/// Public teacher applications: anonymous submission with a CV and a short
+/// Public teacher applications: anonymous submission with a CV and an optional
 /// self-introduction recording, plus an admin queue that can approve (create the
 /// teacher account and send a set-password code) or reject with a reason.
 /// </summary>
@@ -129,29 +129,28 @@ public static class TeacherApplicationEndpoints
         string? introName = null;
         string? introType = null;
         byte[]? introData = null;
-        if (intro is null || intro.Length == 0)
+        if (intro is not null && intro.Length > 0)
         {
-            errors["intro"] = ["Attach a short recording introducing yourself (audio or video, up to 20 MB)."];
-        }
-        else if (intro.Length > MaxIntroBytes)
-        {
-            errors["intro"] = ["The recording must be 20 MB or smaller."];
-        }
-        else
-        {
-            introName = SafeFileName(intro.FileName, "self-introduction.webm");
-            introType = IntroMediaType(intro.ContentType, introName);
-            if (introType is null)
+            if (intro.Length > MaxIntroBytes)
             {
-                errors["intro"] = ["Upload your recording as MP3, M4A, WAV, OGG, WebM, MP4, or MOV."];
+                errors["intro"] = ["The recording must be 20 MB or smaller."];
             }
             else
             {
-                await using var buffer = new MemoryStream();
-                await intro.CopyToAsync(buffer, http.RequestAborted);
-                introData = buffer.ToArray();
-                if (!LooksLikeMedia(introData, introType))
-                    errors["intro"] = ["That file does not look like a valid audio or video recording."];
+                introName = SafeFileName(intro.FileName, "self-introduction.webm");
+                introType = IntroMediaType(intro.ContentType, introName);
+                if (introType is null)
+                {
+                    errors["intro"] = ["Upload your recording as MP3, M4A, WAV, OGG, WebM, MP4, or MOV."];
+                }
+                else
+                {
+                    await using var buffer = new MemoryStream();
+                    await intro.CopyToAsync(buffer, http.RequestAborted);
+                    introData = buffer.ToArray();
+                    if (!LooksLikeMedia(introData, introType))
+                        errors["intro"] = ["That file does not look like a valid audio or video recording."];
+                }
             }
         }
 
@@ -178,12 +177,14 @@ public static class TeacherApplicationEndpoints
                 ContentType = contentType!,
                 Data = fileData!,
             },
-            Intro = new TeacherApplicationIntro
-            {
-                FileName = introName!,
-                ContentType = introType!,
-                Data = introData!,
-            },
+            Intro = introData is null
+                ? null
+                : new TeacherApplicationIntro
+                {
+                    FileName = introName!,
+                    ContentType = introType!,
+                    Data = introData,
+                },
         };
         db.TeacherApplications.Add(application);
         try
