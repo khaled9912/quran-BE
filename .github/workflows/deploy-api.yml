@@ -1,0 +1,56 @@
+name: Deploy API to MonsterASP
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - ".github/workflows/deploy-api.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Publish
+        run: >
+          dotnet publish src/Academy.Api/Academy.Api.csproj
+          -c Release -o publish /p:UseAppHost=false
+
+      - name: Trim build-only files
+        run: |
+          rm -rf publish/BuildHost-net472 publish/BuildHost-netcore
+          rm -f publish/*.pdb publish/Academy.Api
+          # The server owns web.config: it holds the production environment
+          # variables (DATABASE_URL, AllowedOrigins, ...). Never upload it.
+          rm -f publish/web.config
+
+      - name: Deploy over SFTP
+        env:
+          SFTP_HOST: ${{ secrets.MONSTER_SFTP_HOST }}
+          SFTP_USER: ${{ secrets.MONSTER_SFTP_USER }}
+          SFTP_PASSWORD: ${{ secrets.MONSTER_SFTP_PASSWORD }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lftp
+          lftp -c "
+            set sftp:auto-confirm yes;
+            set net:timeout 30;
+            set net:max-retries 3;
+            open -u \"$SFTP_USER\",\"$SFTP_PASSWORD\" sftp://$SFTP_HOST:22;
+            mirror -R --delete --parallel=4 \
+              -x 'web.config' \
+              -x 'logs' \
+              -x 'logs/*' \
+              ./publish /wwwroot;
+          "

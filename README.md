@@ -97,3 +97,74 @@ Each request represents one lesson. Students repeat the process for every lesson
 - Use secrets management for database and bootstrap admin credentials. Do not commit `.env`.
 - `EnsureCreated` is intended for a fresh MVP database. Before deploying schema changes to production, introduce and apply EF Core migrations. The `UserAvatars` table is currently added by an idempotent startup SQL statement as a temporary bridge for existing databases.
 - Email verification, password reset, invitation emails, audit history, automated request expiry, and LiveKit are not included yet.
+
+## Deploy to MonsterASP.NET (IIS)
+
+Netlify and Vercel cannot run this project: it is a .NET 10 process behind IIS, not a static site or Node function. MonsterASP.NET (or any host with the .NET 10 runtime) runs the published output.
+
+1. Publish from the repo root:
+
+   ```bash
+   dotnet publish src/Academy.Api/Academy.Api.csproj -c Release -o ./publish
+   ```
+
+2. Upload **the contents of `publish/`** to the site's `\wwwroot` over FTP/SFTP. Do not upload the `publish/` folder itself, and do not upload `src/`, `bin/`, or `obj/`.
+
+   The publish folder has 31 entries (~15 MB). Skip these, which are not used by IIS:
+
+   - `Academy.Api` (extension-less launcher built for the publishing OS)
+   - `Academy.Api.pdb`
+   - `BuildHost-net472/` and `BuildHost-netcore/` (build-time tooling)
+
+   That leaves 27 files (~10 MB). The deployment is complete when `\wwwroot` contains:
+
+   - `web.config` — IIS handler for `AspNetCoreModuleV2`
+   - `Academy.Api.dll`, `Academy.Api.deps.json`, `Academy.Api.runtimeconfig.json`
+   - `appsettings.json`
+   - every dependency `.dll` (`Npgsql.dll`, `Microsoft.EntityFrameworkCore*.dll`, `Sentry*.dll`, ...)
+   - `Academy.Api.staticwebassets.endpoints.json`
+
+3. In the hosting panel, set the website's .NET version to **10.x**.
+
+4. Set the runtime configuration as environment variables in the deployed `web.config` (preferred over committing secrets to `appsettings.Production.json`):
+
+   ```xml
+   <aspNetCore processPath="dotnet" arguments=".\Academy.Api.dll"
+               stdoutLogEnabled="true" stdoutLogFile=".\logs\stdout"
+               hostingModel="inprocess">
+     <environmentVariables>
+       <environmentVariable name="ASPNETCORE_ENVIRONMENT" value="Production" />
+       <environmentVariable name="DATABASE_URL" value="postgresql://USER:PASSWORD@HOST/DB?sslmode=require" />
+       <environmentVariable name="AllowedOrigins" value="https://your-frontend.example" />
+       <environmentVariable name="Cookie__SameSite" value="None" />
+     </environmentVariables>
+   </aspNetCore>
+   ```
+
+   - `DATABASE_URL` accepts the Neon Postgres URI (the resolver also accepts `ConnectionStrings__Academy`).
+   - `AllowedOrigins` is a comma-separated list of exact frontend origins: scheme + host, no trailing slash.
+   - Use `Cookie__SameSite=None` only for cross-site cookies. With the same-origin frontend proxy (see the frontend README), keep `Lax`.
+   - Optional: `BootstrapAdmin__Email` / `BootstrapAdmin__Password`, `Email__*` for the contact form, `Otp__*`, and `SENTRY_DSN`.
+
+5. Verify the deployment:
+
+   ```bash
+   curl -i https://your-site.runasp.net/health
+   curl -i https://your-site.runasp.net/health/ready
+   ```
+
+   `/health` confirms the process is up; `/health/ready` also opens a database connection. Swagger is disabled outside Development. If both fail, read the hosting **Logs** — `EnsureCreated` runs at startup, so an unreachable database aborts boot. The free plan (256 MB RAM) also has slow cold starts after idle.
+
+### Push-to-deploy (GitHub Actions)
+
+`.github/workflows/deploy-api.yml` publishes the API and mirrors the output to the site over SFTP on every push to `master` that touches `src/**`, or manually via **Actions → Deploy API to MonsterASP → Run workflow**.
+
+Add these repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `MONSTER_SFTP_HOST` | `site103604.siteasp.net` |
+| `MONSTER_SFTP_USER` | `site103604` |
+| `MONSTER_SFTP_PASSWORD` | the FTP/SFTP password from the hosting panel |
+
+The workflow deliberately **does not upload `web.config`**, because the copy on the server carries the production environment variables. Keep configuring `DATABASE_URL`, `AllowedOrigins`, and the rest there (or in the hosting panel), never in the repo. `--delete` is enabled, so files removed from `src/` also disappear from `\wwwroot`; `web.config` and `logs/` are excluded from deletion.

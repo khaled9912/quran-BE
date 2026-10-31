@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Claims;
 using Academy.Api;
@@ -7,8 +8,64 @@ using Microsoft.AspNetCore.Identity;
 using System.Threading.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+using Sentry;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Container-friendly logs: single-line console locally, JSON in hosted environments
+// so collectors can parse levels, scopes, and request metadata.
+builder.Logging.ClearProviders();
+if (builder.Environment.IsDevelopment())
+{
+    builder.Logging.AddSimpleConsole(options =>
+    {
+        options.SingleLine = true;
+        options.TimestampFormat = "HH:mm:ss ";
+    });
+}
+else
+{
+    builder.Logging.AddJsonConsole(options =>
+    {
+        options.IncludeScopes = true;
+        options.UseUtcTimestamp = true;
+        options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ";
+    });
+}
+
+// Error reporting is production-only: a DSN in a dev environment is ignored.
+var sentryDsn = Environment.GetEnvironmentVariable("SENTRY_DSN") ?? builder.Configuration["Sentry:Dsn"];
+if (builder.Environment.IsProduction() && !string.IsNullOrWhiteSpace(sentryDsn))
+{
+    builder.WebHost.UseSentry(options =>
+    {
+        options.Dsn = sentryDsn;
+        options.Environment = builder.Environment.EnvironmentName;
+        options.TracesSampleRate = 0.1;
+        options.SendDefaultPii = false;
+    });
+}
+
+// Traces and metrics are exported only when an OTLP endpoint is configured.
+var otlpEndpoint = builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"];
+if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+{
+    var serviceName = builder.Configuration["OTEL_SERVICE_NAME"] ?? "academy-api";
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(resource => resource.AddService(serviceName))
+        .WithTracing(tracing => tracing
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddOtlpExporter())
+        .WithMetrics(metrics => metrics
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddOtlpExporter());
+}
+
 var connectionString = DatabaseConnection.Resolve(builder.Configuration);
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -79,12 +136,19 @@ if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparis
     builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
 else
     builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
+builder.Services.AddHealthChecks().AddDbContextCheck<AcademyDbContext>("database");
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 app.UseExceptionHandler(handler => handler.Run(async context =>
 {
+    var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+    app.Logger.LogError(
+        exception,
+        "Unhandled exception for {Method} {Path}",
+        context.Request.Method,
+        context.Request.Path.Value);
     context.Response.StatusCode = StatusCodes.Status500InternalServerError;
     context.Response.ContentType = "application/problem+json";
     await context.Response.WriteAsJsonAsync(new { title = "An unexpected server error occurred.", status = 500 });
@@ -109,6 +173,7 @@ app.UseAuthentication();
 app.UseAuthorization();
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "rayan-academy-api" }));
+app.MapHealthChecks("/health/ready");
 app.MapAcademyApi();
 
 // First-run convenience for a fresh MVP database. Set Database:EnsureCreated=false after

@@ -45,8 +45,17 @@ services:
       Email__Password: ${EMAIL_PASSWORD:-}
       Email__From: ${EMAIL_FROM:-}
       Email__To: ${CONTACT_RECEIVER_EMAIL:-}
+      # Observability: both are inert unless set (Sentry is also production-only).
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-academy-api}
     ports:
       - "5001:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   academy-postgres:
