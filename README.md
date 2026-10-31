@@ -146,6 +146,9 @@ Netlify and Vercel cannot run this project: it is a .NET 10 process behind IIS, 
    - Use `Cookie__SameSite=None` only for cross-site cookies. With the same-origin frontend proxy (see the frontend README), keep `Lax`.
    - Optional: `BootstrapAdmin__Email` / `BootstrapAdmin__Password`, `Email__*` for the contact form, and `SENTRY_DSN`.
    - Phone OTP: the fixed development code (`8888`) is **ignored outside Development** — even if `Otp__DevMode=true` is left behind, production refuses it. To keep phone sign-in working in production, configure a real sender: `Otp__Sender=textbee`, `Otp__TextBee__ApiKey`, and `Otp__TextBee__DeviceId`. Without a sender, `/api/auth/otp/*` returns `503` and students should use email signup instead.
+   - `BootstrapAdmin__Email` / `BootstrapAdmin__Password` only **seed a missing admin**. They never update an account that already exists, so changing them and restarting appears to do nothing. To rotate the password of an existing admin, add `BootstrapAdmin__ResetPassword=true`, restart once, sign in with the new password, then remove the flag. The startup log states whether the admin was created, already existed, or skipped because the variables were missing.
+   - Naming: use the double-underscore form (`Section__Key`) for every setting. The API also accepts `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` through an explicit fallback, but no other setting supports the underscore-only form.
+   - Secrets belong in the server-side `web.config` or the hosting panel, never in `appsettings.json` in git. GitHub Actions secrets are only available to the deploy job, not to the running site.
 
 5. Verify the deployment:
 
