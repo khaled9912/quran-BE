@@ -38,6 +38,13 @@ services:
       Otp__Sender: ${OTP_SENDER:-}
       Otp__TextBee__ApiKey: ${TEXTBEE_API_KEY:-}
       Otp__TextBee__DeviceId: ${TEXTBEE_DEVICE_ID:-}
+      Email__Enabled: ${EMAIL_ENABLED:-false}
+      Email__SmtpHost: ${EMAIL_SMTP_HOST:-}
+      Email__SmtpPort: ${EMAIL_SMTP_PORT:-587}
+      Email__Username: ${EMAIL_USERNAME:-}
+      Email__Password: ${EMAIL_PASSWORD:-}
+      Email__From: ${EMAIL_FROM:-}
+      Email__To: ${CONTACT_RECEIVER_EMAIL:-}
     ports:
       - "5001:8080"
 

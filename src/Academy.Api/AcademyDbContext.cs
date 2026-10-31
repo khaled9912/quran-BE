@@ -13,6 +13,9 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<LessonRequest> LessonRequests => Set<LessonRequest>();
     public DbSet<Lesson> Lessons => Set<Lesson>();
     public DbSet<ContactSubmission> ContactSubmissions => Set<ContactSubmission>();
+    public DbSet<UserAvatar> UserAvatars => Set<UserAvatar>();
+    public DbSet<LessonReport> LessonReports => Set<LessonReport>();
+    public DbSet<TeacherReview> TeacherReviews => Set<TeacherReview>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -39,5 +42,21 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<Lesson>().HasIndex(x => x.LessonRequestId).IsUnique();
         b.Entity<Lesson>().HasIndex(x => new { x.TeacherId, x.StartsAt, x.EndsAt });
         b.Entity<Lesson>().HasIndex(x => new { x.StudentId, x.StartsAt, x.EndsAt });
+        b.Entity<UserAvatar>().ToTable("UserAvatars");
+        b.Entity<UserAvatar>().HasKey(x => x.UserId);
+        b.Entity<UserAvatar>().HasOne(x => x.User).WithOne().HasForeignKey<UserAvatar>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<UserAvatar>().Property(x => x.ContentType).HasMaxLength(100).IsRequired();
+        b.Entity<UserAvatar>().Property(x => x.Data).IsRequired();
+        b.Entity<LessonReport>().HasOne(x => x.Lesson).WithOne(x => x.Report).HasForeignKey<LessonReport>(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonReport>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonReport>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonReport>().HasIndex(x => x.LessonId).IsUnique();
+        b.Entity<LessonReport>().HasIndex(x => x.TeacherId);
+        b.Entity<LessonReport>().HasIndex(x => x.StudentId);
+        b.Entity<TeacherReview>().HasOne(x => x.Lesson).WithOne(x => x.Review).HasForeignKey<TeacherReview>(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TeacherReview>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<TeacherReview>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<TeacherReview>().HasIndex(x => x.LessonId).IsUnique();
+        b.Entity<TeacherReview>().HasIndex(x => x.TeacherId);
     }
 }

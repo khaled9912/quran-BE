@@ -15,7 +15,24 @@ Registration body: `{ "fullName": "Student Name", "email": "student@example.com"
 
 Login body: `{ "email": "student@example.com", "password": "StrongPassword1" }`
 
-The returned user has `id`, `fullName`, `full_name`, `email`, `role`, `isActive`, and `is_active` to support the existing frontend profile type.
+The returned user has `id`, `fullName`, `full_name`, `email`, `role`, `isActive`, `is_active`, `phoneNumber`, `name`, and `avatarUrl` to support the existing frontend profile type.
+
+## Profile and avatars
+
+| Method | Route | Access |
+|---|---|---|
+| GET | `/profile` | Authenticated |
+| PATCH | `/profile` | Authenticated |
+| POST | `/profile/avatar` | Authenticated; multipart `file` |
+| DELETE | `/profile/avatar` | Authenticated |
+| GET | `/profile/reports` | Authenticated; role-scoped |
+| GET | `/users/{id}/avatar` | Anonymous; 404 when absent |
+
+`GET /profile/reports` returns students the reports their teachers wrote, teachers the reports they authored, and admins every report (latest 100 lessons). Each item is a `LessonReport` with the lesson time, teacher and student names, `classSummary`, `studentFeedback`, `progress` (`excellent`, `good`, or `needs_attention`), and timestamps.
+
+Update body: `{ "fullName"?: "New Name", "email"?: "new@example.com", "phoneNumber"?: "+96170123456" }`. All fields are optional. Email changes also update the Identity username and mark the email confirmed. Phone changes clear the confirmed flag so the next phone sign-in re-verifies it. Duplicate values return `409`.
+
+Avatar uploads accept PNG, JPEG, or WebP up to 2 MB. Files are checked by content type and magic bytes and stored in the separate `UserAvatars` table. The response is `{ "avatarUrl": "/api/users/{id}/avatar" }`.
 
 ## Admin and accounts
 
@@ -44,10 +61,16 @@ Assign body: `{ "teacherId": "uuid", "studentId": "uuid" }`.
 | POST | `/teacher/availability` | Teacher |
 | DELETE | `/teacher/availability/{slotId}` | Teacher |
 | GET | `/student/teacher/availability` | Student |
+| GET | `/teachers/directory` | Authenticated; active teachers + open slots |
+| GET | `/teachers/{id}/profile` | Authenticated; one active teacher + open slots |
+| GET | `/teachers/public` | Public; active teachers + latest reviews |
+| GET | `/teachers/public/{id}` | Public; one active teacher + all reviews (latest 50) |
+
+Directory, profile, and assigned-teacher responses include `averageRating`, `reviewCount`, and (except the directory) recent `reviews`. The public responses expose only the teacher's name, avatar URL, rating summary, and reviews — never email or phone.
 
 Publish body: `{ "startsAt": "2026-11-02T15:00:00Z", "endsAt": "2026-11-02T16:00:00Z" }`.
 
-Student request body: `{ "availabilitySlotId": "uuid" }` at `POST /lesson-requests`.
+Student request body: `{ "availabilitySlotId": "uuid" }` at `POST /lesson-requests`. A student may choose any teacher from the directory: the API claims the slot and makes that teacher the student's active assignment in the same transaction. The request then continues through teacher confirmation and admin approval.
 
 ## Student-preferred availability (reverse workflow)
 
@@ -85,9 +108,21 @@ Statuses: `pending_teacher`, `pending_student`, `pending_admin`, `approved`, `re
 |---|---|---|
 | GET | `/lessons` | Authenticated; role-scoped |
 | GET | `/lessons/{id}` | Admin or lesson participant |
+| GET | `/lessons/{id}/report` | Admin or lesson participant; 404 when absent |
+| POST | `/lessons/{id}/report` | Assigned teacher; after the lesson ends |
+| GET | `/lessons/{id}/review` | Admin or lesson participant; 404 when absent |
+| POST | `/lessons/{id}/review` | Enrolled student; after the lesson ends |
 | POST | `/contact` | Public; rate limited |
 
+Lesson responses embed `report` and `review` objects when they exist.
+
+Report body: `{ "classSummary": "…", "studentFeedback": "…", "progress": "good" }`. Summary and feedback are each 10–2000 characters; progress is `excellent`, `good`, or `needs_attention`. The first successful report marks the lesson `completed` and stamps `actualEndedAt`; later posts update the same report.
+
+Review body: `{ "rating": 5, "comment": "…" }`. Rating is 1–5; the comment is optional and capped at 2000 characters. A student has one review per lesson and may update it. Cancelled lessons cannot receive reports or reviews, and both are rejected until the lesson's `endsAt` has passed.
+
 The MVP creates lessons only when an admin approves a lesson request. It does not expose arbitrary client-side lesson creation.
+
+Contact submissions are stored and then emailed to the single receiver configured in `Email:To` (`CONTACT_RECEIVER_EMAIL`). The recipient is never taken from the request body; the submitter's address becomes `Reply-To`. Email is best effort and a delivery failure does not remove the stored submission.
 
 ## Errors
 

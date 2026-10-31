@@ -79,6 +79,42 @@ public sealed class Lesson
     public DateTimeOffset? ActualStartedAt { get; set; }
     public DateTimeOffset? ActualEndedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public LessonReport? Report { get; set; }
+    public TeacherReview? Review { get; set; }
+}
+
+/// <summary>Teacher's post-class report about the student and the lesson.</summary>
+public sealed class LessonReport
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    [MaxLength(2000)] public string ClassSummary { get; set; } = "";
+    [MaxLength(2000)] public string StudentFeedback { get; set; } = "";
+    // excellent | good | needs_attention
+    [MaxLength(30)] public string Progress { get; set; } = "good";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Student's rating of a teacher after a completed lesson.</summary>
+public sealed class TeacherReview
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    public int Rating { get; set; }
+    [MaxLength(2000)] public string? Comment { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public sealed class ContactSubmission
@@ -89,4 +125,14 @@ public sealed class ContactSubmission
     [MaxLength(3000)] public string Message { get; set; } = "";
     [MaxLength(20)] public string Status { get; set; } = "new";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Profile image stored separately so user queries never load image bytes.</summary>
+public sealed class UserAvatar
+{
+    public Guid UserId { get; set; }
+    public AcademyUser? User { get; set; }
+    [MaxLength(100)] public string ContentType { get; set; } = "image/png";
+    public byte[] Data { get; set; } = [];
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }

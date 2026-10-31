@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Claims;
 using Academy.Api;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using System.Threading.RateLimiting;
 using Microsoft.EntityFrameworkCore;
@@ -71,7 +72,9 @@ builder.Services.AddRateLimiter(options =>
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
+builder.Services.AddSingleton<ContactEmailSender>();
 builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
+builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
 if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
 else
@@ -115,6 +118,57 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
     await using var scope = app.Services.CreateAsyncScope();
     var db = scope.ServiceProvider.GetRequiredService<AcademyDbContext>();
     await db.Database.EnsureCreatedAsync();
+    // EnsureCreated only builds a fresh database. Existing databases need the new
+    // profile-image, lesson-report and teacher-review tables explicitly until EF
+    // migrations replace this bootstrap.
+    await db.Database.ExecuteSqlRawAsync(
+        """
+        CREATE TABLE IF NOT EXISTS "UserAvatars" (
+            "UserId" uuid NOT NULL,
+            "ContentType" character varying(100) NOT NULL,
+            "Data" bytea NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_UserAvatars" PRIMARY KEY ("UserId"),
+            CONSTRAINT "FK_UserAvatars_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS "LessonReports" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "ClassSummary" character varying(2000) NOT NULL,
+            "StudentFeedback" character varying(2000) NOT NULL,
+            "Progress" character varying(30) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonReports" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonReports_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE,
+            CONSTRAINT "FK_LessonReports_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonReports_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonReports_LessonId" ON "LessonReports" ("LessonId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonReports_TeacherId" ON "LessonReports" ("TeacherId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonReports_StudentId" ON "LessonReports" ("StudentId");
+
+        CREATE TABLE IF NOT EXISTS "TeacherReviews" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "Rating" integer NOT NULL,
+            "Comment" character varying(2000),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherReviews" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_TeacherReviews_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE,
+            CONSTRAINT "FK_TeacherReviews_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_TeacherReviews_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherReviews_LessonId" ON "TeacherReviews" ("LessonId");
+        CREATE INDEX IF NOT EXISTS "IX_TeacherReviews_TeacherId" ON "TeacherReviews" ("TeacherId");
+        CREATE INDEX IF NOT EXISTS "IX_TeacherReviews_StudentId" ON "TeacherReviews" ("StudentId");
+        """);
     var roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
     foreach (var role in new[] { "admin", "teacher", "student" })
         if (!await roles.RoleExistsAsync(role)) await roles.CreateAsync(new IdentityRole<Guid>(role));
