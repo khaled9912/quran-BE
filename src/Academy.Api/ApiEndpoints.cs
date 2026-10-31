@@ -875,7 +875,7 @@ public static class ApiEndpoints
             return Results.Ok(ToReview(review, lesson));
         }).RequireAuthorization("StudentOnly");
 
-        api.MapGet("/profile/reports", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapGet("/profile/reports", async (int? skip, int? take, ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var q = db.Lessons.AsNoTracking()
                 .Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report)
@@ -883,8 +883,18 @@ public static class ApiEndpoints
             if (HasRole(p, "student")) q = q.Where(x => x.StudentId == UserId(p));
             else if (HasRole(p, "teacher")) q = q.Where(x => x.TeacherId == UserId(p));
             else if (!IsAdmin(p)) return Results.Forbid();
-            var lessons = await q.OrderByDescending(x => x.StartsAt).Take(100).ToListAsync();
-            return Results.Ok(lessons.Select(x => ToReport(x.Report!, x)));
+
+            var offset = Math.Max(skip ?? 0, 0);
+            var pageSize = Math.Clamp(take ?? 20, 1, 50);
+            // Fetch one extra row so the client learns about the next page
+            // without a second COUNT query.
+            var lessons = await q
+                .OrderByDescending(x => x.StartsAt).ThenByDescending(x => x.Id)
+                .Skip(offset).Take(pageSize + 1)
+                .ToListAsync();
+            var hasMore = lessons.Count > pageSize;
+            if (hasMore) lessons.RemoveAt(pageSize);
+            return Results.Ok(new { items = lessons.Select(x => ToReport(x.Report!, x)).ToList(), hasMore });
         }).RequireAuthorization();
     }
 
