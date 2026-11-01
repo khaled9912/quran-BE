@@ -23,6 +23,8 @@ public sealed record RequestSlotInput(Guid AvailabilitySlotId);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);
 public sealed record ReviewTeacherApplicationRequest(string Status, string? Reason);
+public sealed record TranscriptSegmentInput(string? Speaker, string? Text, double? AtSeconds);
+public sealed record TranscriptUploadRequest(List<TranscriptSegmentInput>? Segments);
 
 public sealed record UserDto(Guid Id, string FullName, string Email, string Role, bool IsActive, [property: JsonPropertyName("full_name")] string FullNameSnake, [property: JsonPropertyName("is_active")] bool IsActiveSnake, string Name, string? PhoneNumber, string? AvatarUrl);
 public sealed record AssignmentDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset CreatedAt, bool IsActive, string Status);

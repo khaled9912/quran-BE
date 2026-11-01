@@ -15,6 +15,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<LessonRequest> LessonRequests => Set<LessonRequest>();
     public DbSet<Lesson> Lessons => Set<Lesson>();
     public DbSet<ContactSubmission> ContactSubmissions => Set<ContactSubmission>();
+    public DbSet<LessonTranscriptSegment> LessonTranscriptSegments => Set<LessonTranscriptSegment>();
     public DbSet<UserAvatar> UserAvatars => Set<UserAvatar>();
     public DbSet<LessonReport> LessonReports => Set<LessonReport>();
     public DbSet<TeacherReview> TeacherReviews => Set<TeacherReview>();
@@ -25,6 +26,9 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     protected override void OnModelCreating(ModelBuilder b)
     {
         base.OnModelCreating(b);
+        b.Entity<LessonTranscriptSegment>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonTranscriptSegment>().HasIndex(x => new { x.LessonId, x.CreatedAt });
+        b.Entity<LessonTranscriptSegment>().HasIndex(x => x.Flags).HasFilter("\"Flags\" <> ''");
         b.Entity<TeacherStudentAssignment>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<TeacherStudentAssignment>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<TeacherStudentAssignment>().HasIndex(x => new { x.TeacherId, x.StudentId }).IsUnique().HasFilter("\"IsActive\" = TRUE");

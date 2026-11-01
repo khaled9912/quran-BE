@@ -490,6 +490,71 @@ public static class ApiEndpoints
         admin.MapPost("/lesson-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveRequest(id, db));
         admin.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, AcademyDbContext db, RejectRequest? input = null) => await RejectRequestByAdmin(id, input?.Reason, db));
 
+        // Transcript review: flag any lesson where a participant tried to move
+        // the lesson off-platform (numbers, email, chat apps, "call me").
+        admin.MapGet("/transcripts", async (AcademyDbContext db) =>
+        {
+            var grouped = await db.LessonTranscriptSegments
+                .Where(x => x.Flags != "")
+                .GroupBy(x => x.LessonId)
+                .Select(g => new { LessonId = g.Key, Flagged = g.Count(), LastFlaggedAt = g.Max(x => x.CreatedAt) })
+                .OrderByDescending(x => x.LastFlaggedAt)
+                .Take(200)
+                .ToListAsync();
+            if (grouped.Count == 0) return Results.Ok(Array.Empty<object>());
+            var ids = grouped.Select(x => x.LessonId).ToList();
+            var lessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student)
+                .Where(x => ids.Contains(x.Id)).ToListAsync();
+            var rawFlags = await db.LessonTranscriptSegments
+                .Where(x => ids.Contains(x.LessonId) && x.Flags != "")
+                .Select(x => new { x.LessonId, x.Flags })
+                .ToListAsync();
+            return Results.Ok(grouped.Select(g =>
+            {
+                var lesson = lessons.FirstOrDefault(l => l.Id == g.LessonId);
+                var reasons = rawFlags.Where(f => f.LessonId == g.LessonId)
+                    .SelectMany(f => f.Flags.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    .Distinct().OrderBy(x => x).ToArray();
+                return new
+                {
+                    lessonId = g.LessonId,
+                    startsAt = lesson?.StartsAt,
+                    status = lesson?.Status,
+                    teacherName = lesson?.Teacher?.FullName,
+                    studentName = lesson?.Student?.FullName,
+                    flaggedSegments = g.Flagged,
+                    lastFlaggedAt = g.LastFlaggedAt,
+                    reasons
+                };
+            }));
+        });
+
+        admin.MapGet("/lessons/{id:guid}/transcript", async (Guid id, AcademyDbContext db) =>
+        {
+            var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == id);
+            if (lesson is null) return Results.NotFound();
+            var segments = await db.LessonTranscriptSegments.AsNoTracking()
+                .Where(x => x.LessonId == id)
+                .OrderBy(x => x.CreatedAt).ThenBy(x => x.AtSeconds)
+                .Select(x => new { x.Id, x.Speaker, x.Text, x.AtSeconds, x.Flags, x.CreatedAt })
+                .ToListAsync();
+            return Results.Ok(new
+            {
+                lesson = new
+                {
+                    lesson.Id, lesson.StartsAt, lesson.EndsAt, lesson.Status,
+                    teacherName = lesson.Teacher!.FullName,
+                    studentName = lesson.Student!.FullName
+                },
+                segments = segments.Select(x => new
+                {
+                    x.Id, x.Speaker, x.Text, x.AtSeconds, x.CreatedAt,
+                    flags = x.Flags.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                })
+            });
+        });
+
         admin.MapGet("/assignments", async (AcademyDbContext db) => await AssignmentList(db));
         api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");
         api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users) =>
@@ -773,6 +838,45 @@ public static class ApiEndpoints
             return Results.Ok(ToLesson(l));
         }).RequireAuthorization();
 
+        // Capture is server-side (Jigasi + Whisper); the bot authenticates with a
+        // shared key because it has no user session. Disabled until the key is set.
+        api.MapPost("/lessons/{id:guid}/transcript", async (Guid id, HttpContext http, TranscriptUploadRequest input, AcademyDbContext db, IConfiguration config) =>
+        {
+            var key = config["Transcripts:IngestKey"];
+            if (string.IsNullOrWhiteSpace(key)) return Results.NotFound();
+            if (!SecretsMatch(http.Request.Headers["X-Transcript-Key"].ToString(), key)) return Results.Unauthorized();
+            var incoming = input.Segments ?? [];
+            if (incoming.Count == 0) return Results.BadRequest(new { message = "No segments supplied." });
+            if (incoming.Count > 200) return Results.BadRequest(new { message = "Send at most 200 segments per request." });
+            if (!await db.Lessons.AsNoTracking().AnyAsync(x => x.Id == id)) return Results.NotFound();
+
+            var now = DateTimeOffset.UtcNow;
+            var accepted = 0;
+            var flagged = 0;
+            foreach (var segment in incoming)
+            {
+                var text = segment.Text?.Trim();
+                if (string.IsNullOrWhiteSpace(text)) continue;
+                if (text.Length > 4000) text = text[..4000];
+                var speaker = string.IsNullOrWhiteSpace(segment.Speaker) ? "Unknown" : segment.Speaker.Trim();
+                if (speaker.Length > 120) speaker = speaker[..120];
+                var flags = TranscriptFlags.Scan(text);
+                if (flags.Count > 0) flagged++;
+                db.LessonTranscriptSegments.Add(new LessonTranscriptSegment
+                {
+                    LessonId = id,
+                    Speaker = speaker,
+                    Text = text,
+                    AtSeconds = segment.AtSeconds is >= 0 ? segment.AtSeconds : null,
+                    Flags = string.Join(",", flags),
+                    CreatedAt = now
+                });
+                accepted++;
+            }
+            await db.SaveChangesAsync();
+            return Results.Ok(new { accepted, flagged });
+        }).AllowAnonymous();
+
         api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);
@@ -956,6 +1060,13 @@ public static class ApiEndpoints
         => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.Id == id).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).FirstOrDefaultAsync();
 
     private const long MaxAvatarBytes = 2 * 1024 * 1024;
+
+    private static bool SecretsMatch(string provided, string expected)
+    {
+        var a = System.Text.Encoding.UTF8.GetBytes(provided);
+        var b = System.Text.Encoding.UTF8.GetBytes(expected);
+        return a.Length == b.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(a, b);
+    }
 
     private static bool LooksLikeImage(byte[] data, string contentType) => contentType switch
     {

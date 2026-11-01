@@ -117,6 +117,23 @@ public sealed class TeacherReview
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// One transcribed utterance, posted by the Jitsi-side capture bot. Segments are
+/// append-only; flags mark attempts to move a lesson off-platform for admin review.
+/// </summary>
+public sealed class LessonTranscriptSegment
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    [MaxLength(120)] public string Speaker { get; set; } = "";
+    [MaxLength(4000)] public string Text { get; set; } = "";
+    public double? AtSeconds { get; set; }
+    // Comma-separated categories: phone, email, platform, offplatform
+    [MaxLength(120)] public string Flags { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class ContactSubmission
 {
     public Guid Id { get; set; } = Guid.NewGuid();
