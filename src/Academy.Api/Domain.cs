@@ -167,6 +167,7 @@ public sealed class TeacherApplication
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public TeacherApplicationCv? Cv { get; set; }
     public TeacherApplicationIntro? Intro { get; set; }
+    public TeacherApplicationQuranRecording? QuranRecording { get; set; }
 }
 
 /// <summary>CV stored separately so application lists never load file bytes.</summary>
@@ -182,6 +183,17 @@ public sealed class TeacherApplicationCv
 
 /// <summary>Self-introduction recording, also kept out of application list queries.</summary>
 public sealed class TeacherApplicationIntro
+{
+    public Guid ApplicationId { get; set; }
+    public TeacherApplication? Application { get; set; }
+    [MaxLength(200)] public string FileName { get; set; } = "";
+    [MaxLength(100)] public string ContentType { get; set; } = "audio/webm";
+    public byte[] Data { get; set; } = [];
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Quran recitation sample, kept out of application list queries.</summary>
+public sealed class TeacherApplicationQuranRecording
 {
     public Guid ApplicationId { get; set; }
     public TeacherApplication? Application { get; set; }

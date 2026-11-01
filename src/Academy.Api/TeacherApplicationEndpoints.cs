@@ -9,15 +9,16 @@ using Npgsql;
 namespace Academy.Api;
 
 /// <summary>
-/// Public teacher applications: anonymous submission with a CV and an optional
-/// self-introduction recording, plus an admin queue that can approve (create the
-/// teacher account and send a set-password code) or reject with a reason.
+/// Public teacher applications: anonymous submission with a CV, an optional
+/// self-introduction recording, and a required Quran recitation, plus an admin
+/// queue that can approve (create the teacher account and send a set-password
+/// code) or reject with a reason.
 /// </summary>
 public static class TeacherApplicationEndpoints
 {
     private const long MaxCvBytes = 2 * 1024 * 1024;
-    private const long MaxIntroBytes = 20 * 1024 * 1024;
-    private const long MaxFormBytes = MaxCvBytes + MaxIntroBytes + 1024 * 1024;
+    private const long MaxRecordingBytes = 20 * 1024 * 1024;
+    private const long MaxFormBytes = MaxCvBytes + MaxRecordingBytes * 2 + 1024 * 1024;
 
     private static readonly string[] AllowedSubjects = ["quran", "tajweed", "islamic_studies", "arabic"];
     private static readonly string[] AllowedEnglishLevels = ["beginner", "intermediate", "advanced", "fluent"];
@@ -39,6 +40,7 @@ public static class TeacherApplicationEndpoints
         admin.MapGet("/teacher-applications", ListApplicationsAsync);
         admin.MapGet("/teacher-applications/{id:guid}/cv", DownloadCvAsync);
         admin.MapGet("/teacher-applications/{id:guid}/intro", DownloadIntroAsync);
+        admin.MapGet("/teacher-applications/{id:guid}/quran", DownloadQuranRecordingAsync);
         admin.MapPatch("/teacher-applications/{id:guid}", ReviewApplicationAsync);
     }
 
@@ -59,7 +61,7 @@ public static class TeacherApplicationEndpoints
         }
         catch (Exception ex) when (ex is InvalidDataException or BadHttpRequestException)
         {
-            return Results.Problem("The uploaded files are too large. Keep the CV under 2 MB and the recording under 20 MB.", statusCode: StatusCodes.Status413PayloadTooLarge);
+            return Results.Problem("The uploaded files are too large. Keep the CV under 2 MB and each recording under 20 MB.", statusCode: StatusCodes.Status413PayloadTooLarge);
         }
 
         var errors = new Dictionary<string, string[]>();
@@ -131,14 +133,14 @@ public static class TeacherApplicationEndpoints
         byte[]? introData = null;
         if (intro is not null && intro.Length > 0)
         {
-            if (intro.Length > MaxIntroBytes)
+            if (intro.Length > MaxRecordingBytes)
             {
                 errors["intro"] = ["The recording must be 20 MB or smaller."];
             }
             else
             {
                 introName = SafeFileName(intro.FileName, "self-introduction.webm");
-                introType = IntroMediaType(intro.ContentType, introName);
+                introType = RecordingMediaType(intro.ContentType, introName);
                 if (introType is null)
                 {
                     errors["intro"] = ["Upload your recording as MP3, M4A, WAV, OGG, WebM, MP4, or MOV."];
@@ -151,6 +153,36 @@ public static class TeacherApplicationEndpoints
                     if (!LooksLikeMedia(introData, introType))
                         errors["intro"] = ["That file does not look like a valid audio or video recording."];
                 }
+            }
+        }
+
+        var quran = form.Files.GetFile("quran");
+        string? quranName = null;
+        string? quranType = null;
+        byte[]? quranData = null;
+        if (quran is null || quran.Length == 0)
+        {
+            errors["quran"] = ["Attach a Quran recitation (MP3, M4A, WAV, OGG, WebM, MP4, or MOV, up to 20 MB)."];
+        }
+        else if (quran.Length > MaxRecordingBytes)
+        {
+            errors["quran"] = ["The Quran recording must be 20 MB or smaller."];
+        }
+        else
+        {
+            quranName = SafeFileName(quran.FileName, "quran-recitation.webm");
+            quranType = RecordingMediaType(quran.ContentType, quranName);
+            if (quranType is null)
+            {
+                errors["quran"] = ["Upload your Quran recording as MP3, M4A, WAV, OGG, WebM, MP4, or MOV."];
+            }
+            else
+            {
+                await using var buffer = new MemoryStream();
+                await quran.CopyToAsync(buffer, http.RequestAborted);
+                quranData = buffer.ToArray();
+                if (!LooksLikeMedia(quranData, quranType))
+                    errors["quran"] = ["That file does not look like a valid audio or video recording."];
             }
         }
 
@@ -185,6 +217,12 @@ public static class TeacherApplicationEndpoints
                     ContentType = introType!,
                     Data = introData,
                 },
+            QuranRecording = new TeacherApplicationQuranRecording
+            {
+                FileName = quranName!,
+                ContentType = quranType!,
+                Data = quranData!,
+            },
         };
         db.TeacherApplications.Add(application);
         try
@@ -233,6 +271,7 @@ public static class TeacherApplicationEndpoints
                 x.TeacherId,
                 CvFileName = x.Cv == null ? null : x.Cv.FileName,
                 IntroFileName = x.Intro == null ? null : x.Intro.FileName,
+                QuranRecordingFileName = x.QuranRecording == null ? null : x.QuranRecording.FileName,
             })
             .ToListAsync();
 
@@ -240,7 +279,7 @@ public static class TeacherApplicationEndpoints
             x.Id, x.FullName, x.Email, x.PhoneNumber,
             x.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
             x.EnglishLevel, x.ExperienceYears, x.Bio, x.AvailabilityNote, x.Status, x.RejectionReason,
-            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName)).ToList());
+            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName, x.QuranRecordingFileName)).ToList());
     }
 
     private static async Task<IResult> DownloadCvAsync(Guid id, [FromServices] AcademyDbContext db)
@@ -257,6 +296,14 @@ public static class TeacherApplicationEndpoints
             .FirstOrDefaultAsync(x => x.ApplicationId == id);
         if (intro is null) return Results.NotFound();
         return Results.File(intro.Data, intro.ContentType, SafeFileName(intro.FileName, "self-introduction.webm"));
+    }
+
+    private static async Task<IResult> DownloadQuranRecordingAsync(Guid id, [FromServices] AcademyDbContext db)
+    {
+        var recording = await db.TeacherApplicationQuranRecordings.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.ApplicationId == id);
+        if (recording is null) return Results.NotFound();
+        return Results.File(recording.Data, recording.ContentType, SafeFileName(recording.FileName, "quran-recitation.webm"));
     }
 
     private static async Task<IResult> ReviewApplicationAsync(
@@ -346,6 +393,7 @@ public static class TeacherApplicationEndpoints
             {
                 CvFileName = x.Cv == null ? null : x.Cv.FileName,
                 IntroFileName = x.Intro == null ? null : x.Intro.FileName,
+                QuranRecordingFileName = x.QuranRecording == null ? null : x.QuranRecording.FileName,
             })
             .FirstAsync(http.RequestAborted);
         var dto = new TeacherApplicationDto(
@@ -353,7 +401,8 @@ public static class TeacherApplicationEndpoints
             application.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
             application.EnglishLevel, application.ExperienceYears, application.Bio, application.AvailabilityNote,
             application.Status, application.RejectionReason, application.CreatedAt,
-            application.ReviewedAt, application.TeacherId, files.CvFileName, files.IntroFileName);
+            application.ReviewedAt, application.TeacherId, files.CvFileName, files.IntroFileName,
+            files.QuranRecordingFileName);
 
         return Results.Ok(new
         {
@@ -408,7 +457,7 @@ public static class TeacherApplicationEndpoints
         _ => false,
     };
 
-    private static string? IntroMediaType(string? rawContentType, string fileName)
+    private static string? RecordingMediaType(string? rawContentType, string fileName)
     {
         var contentType = (rawContentType ?? "").Split(';')[0].Trim().ToLowerInvariant();
         if (AllowedIntroContentTypes.Contains(contentType)) return contentType;

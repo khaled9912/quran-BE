@@ -22,6 +22,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<TeacherApplication> TeacherApplications => Set<TeacherApplication>();
     public DbSet<TeacherApplicationCv> TeacherApplicationCvs => Set<TeacherApplicationCv>();
     public DbSet<TeacherApplicationIntro> TeacherApplicationIntros => Set<TeacherApplicationIntro>();
+    public DbSet<TeacherApplicationQuranRecording> TeacherApplicationQuranRecordings => Set<TeacherApplicationQuranRecording>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -81,5 +82,11 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<TeacherApplicationIntro>().Property(x => x.FileName).HasMaxLength(200).IsRequired();
         b.Entity<TeacherApplicationIntro>().Property(x => x.ContentType).HasMaxLength(100).IsRequired();
         b.Entity<TeacherApplicationIntro>().Property(x => x.Data).IsRequired();
+        b.Entity<TeacherApplicationQuranRecording>().ToTable("TeacherApplicationQuranRecordings");
+        b.Entity<TeacherApplicationQuranRecording>().HasKey(x => x.ApplicationId);
+        b.Entity<TeacherApplicationQuranRecording>().HasOne(x => x.Application).WithOne(x => x.QuranRecording).HasForeignKey<TeacherApplicationQuranRecording>(x => x.ApplicationId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TeacherApplicationQuranRecording>().Property(x => x.FileName).HasMaxLength(200).IsRequired();
+        b.Entity<TeacherApplicationQuranRecording>().Property(x => x.ContentType).HasMaxLength(100).IsRequired();
+        b.Entity<TeacherApplicationQuranRecording>().Property(x => x.Data).IsRequired();
     }
 }

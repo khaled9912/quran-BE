@@ -293,6 +293,16 @@ await using (var scope = app.Services.CreateAsyncScope())
             CONSTRAINT "FK_TeacherApplicationIntros_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS "TeacherApplicationQuranRecordings" (
+            "ApplicationId" uuid NOT NULL,
+            "FileName" character varying(200) NOT NULL,
+            "ContentType" character varying(100) NOT NULL,
+            "Data" bytea NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherApplicationQuranRecordings" PRIMARY KEY ("ApplicationId"),
+            CONSTRAINT "FK_TeacherApplicationQuranRecordings_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS "LessonTranscriptSegments" (
             "Id" uuid NOT NULL,
             "LessonId" uuid NOT NULL,
