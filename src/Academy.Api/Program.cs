@@ -186,16 +186,15 @@ app.MapHealthChecks("/health/ready");
 app.MapAcademyApi();
 app.MapTeacherApplications();
 
-// First-run convenience for a fresh MVP database. Set Database:EnsureCreated=false after
-// adopting EF migrations in a deployed environment.
-if (builder.Configuration.GetValue("Database:EnsureCreated", true))
+// EnsureCreated only builds an empty database from scratch, so the idempotent
+// statements below run even when a deployed environment sets that flag false.
+var ensureCreated = builder.Configuration.GetValue("Database:EnsureCreated", true);
+await using (var scope = app.Services.CreateAsyncScope())
 {
-    await using var scope = app.Services.CreateAsyncScope();
     var db = scope.ServiceProvider.GetRequiredService<AcademyDbContext>();
-    await db.Database.EnsureCreatedAsync();
-    // EnsureCreated only builds a fresh database. Existing databases need the new
-    // profile-image, lesson-report and teacher-review tables explicitly until EF
-    // migrations replace this bootstrap.
+    if (ensureCreated) await db.Database.EnsureCreatedAsync();
+    // Additive, idempotent DDL for existing databases: EnsureCreated never alters a
+    // database that already has tables. Everything here must stay IF NOT EXISTS.
     await db.Database.ExecuteSqlRawAsync(
         """
         CREATE TABLE IF NOT EXISTS "UserAvatars" (
@@ -286,47 +285,50 @@ if (builder.Configuration.GetValue("Database:EnsureCreated", true))
             CONSTRAINT "FK_TeacherApplicationIntros_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
         );
         """);
-    var roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
-    foreach (var role in new[] { "admin", "teacher", "student" })
-        if (!await roles.RoleExistsAsync(role)) await roles.CreateAsync(new IdentityRole<Guid>(role));
+    if (ensureCreated)
+    {
+        var roles = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
+        foreach (var role in new[] { "admin", "teacher", "student" })
+            if (!await roles.RoleExistsAsync(role)) await roles.CreateAsync(new IdentityRole<Guid>(role));
 
-    var adminEmail = builder.Configuration["BootstrapAdmin:Email"] ?? Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_EMAIL");
-    var adminPassword = builder.Configuration["BootstrapAdmin:Password"] ?? Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PASSWORD");
-    if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
-    {
-        app.Logger.LogInformation("Bootstrap admin is not configured; skipping first-run admin provisioning.");
-    }
-    else
-    {
-        var users = scope.ServiceProvider.GetRequiredService<UserManager<AcademyUser>>();
-        var existingAdmin = await users.FindByEmailAsync(adminEmail);
-        if (existingAdmin is null)
+        var adminEmail = builder.Configuration["BootstrapAdmin:Email"] ?? Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_EMAIL");
+        var adminPassword = builder.Configuration["BootstrapAdmin:Password"] ?? Environment.GetEnvironmentVariable("BOOTSTRAP_ADMIN_PASSWORD");
+        if (string.IsNullOrWhiteSpace(adminEmail) || string.IsNullOrWhiteSpace(adminPassword))
         {
-            var adminUser = new AcademyUser { Id = Guid.NewGuid(), UserName = adminEmail, Email = adminEmail, FullName = "Academy Administrator", EmailConfirmed = true };
-            var created = await users.CreateAsync(adminUser, adminPassword);
-            if (created.Succeeded)
-            {
-                await users.AddToRoleAsync(adminUser, "admin");
-                app.Logger.LogInformation("Bootstrap admin was created.");
-            }
-            else
-            {
-                app.Logger.LogError("Bootstrap admin was not created: {Errors}", string.Join("; ", created.Errors.Select(e => e.Description)));
-            }
+            app.Logger.LogInformation("Bootstrap admin is not configured; skipping first-run admin provisioning.");
         }
         else
         {
-            // The seed values never update an existing account. Rotating the password
-            // requires the explicit one-shot flag; remove it after the reset.
-            app.Logger.LogInformation("Bootstrap admin already exists; BootstrapAdmin values are seed-only.");
-            if (builder.Configuration.GetValue("BootstrapAdmin:ResetPassword", false))
+            var users = scope.ServiceProvider.GetRequiredService<UserManager<AcademyUser>>();
+            var existingAdmin = await users.FindByEmailAsync(adminEmail);
+            if (existingAdmin is null)
             {
-                var token = await users.GeneratePasswordResetTokenAsync(existingAdmin);
-                var reset = await users.ResetPasswordAsync(existingAdmin, token, adminPassword);
-                if (reset.Succeeded)
-                    app.Logger.LogWarning("Bootstrap admin password was reset from configuration. Remove BootstrapAdmin__ResetPassword now.");
+                var adminUser = new AcademyUser { Id = Guid.NewGuid(), UserName = adminEmail, Email = adminEmail, FullName = "Academy Administrator", EmailConfirmed = true };
+                var created = await users.CreateAsync(adminUser, adminPassword);
+                if (created.Succeeded)
+                {
+                    await users.AddToRoleAsync(adminUser, "admin");
+                    app.Logger.LogInformation("Bootstrap admin was created.");
+                }
                 else
-                    app.Logger.LogError("Bootstrap admin password reset failed: {Errors}", string.Join("; ", reset.Errors.Select(e => e.Description)));
+                {
+                    app.Logger.LogError("Bootstrap admin was not created: {Errors}", string.Join("; ", created.Errors.Select(e => e.Description)));
+                }
+            }
+            else
+            {
+                // The seed values never update an existing account. Rotating the password
+                // requires the explicit one-shot flag; remove it after the reset.
+                app.Logger.LogInformation("Bootstrap admin already exists; BootstrapAdmin values are seed-only.");
+                if (builder.Configuration.GetValue("BootstrapAdmin:ResetPassword", false))
+                {
+                    var token = await users.GeneratePasswordResetTokenAsync(existingAdmin);
+                    var reset = await users.ResetPasswordAsync(existingAdmin, token, adminPassword);
+                    if (reset.Succeeded)
+                        app.Logger.LogWarning("Bootstrap admin password was reset from configuration. Remove BootstrapAdmin__ResetPassword now.");
+                    else
+                        app.Logger.LogError("Bootstrap admin password reset failed: {Errors}", string.Join("; ", reset.Errors.Select(e => e.Description)));
+                }
             }
         }
     }
