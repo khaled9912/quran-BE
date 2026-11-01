@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
@@ -5,8 +6,9 @@ using Microsoft.EntityFrameworkCore;
 namespace Academy.Api;
 
 public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
-    : IdentityDbContext<AcademyUser, IdentityRole<Guid>, Guid>(options)
+    : IdentityDbContext<AcademyUser, IdentityRole<Guid>, Guid>(options), IDataProtectionKeyContext
 {
+    public DbSet<DataProtectionKey> DataProtectionKeys => Set<DataProtectionKey>();
     public DbSet<TeacherStudentAssignment> Assignments => Set<TeacherStudentAssignment>();
     public DbSet<AvailabilitySlot> AvailabilitySlots => Set<AvailabilitySlot>();
     public DbSet<StudentAvailability> StudentAvailabilities => Set<StudentAvailability>();
