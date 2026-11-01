@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Claims;
 using System.Data;
+using System.Globalization;
 using Npgsql;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
@@ -49,7 +50,7 @@ public static class ApiEndpoints
     private static TeacherReviewDto ToReview(TeacherReview r) => r.Lesson is null
         ? new(r.Id, r.LessonId, default, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, PublicStudentName(r.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt)
         : ToReview(r, r.Lesson);
-    private static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l));
+    private static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l), l.SeriesId, l.IsTrial);
     private static async Task<(double? Average, int Count)> TeacherRatingAsync(AcademyDbContext db, Guid teacherId)
     {
         var count = await db.TeacherReviews.CountAsync(x => x.TeacherId == teacherId);
@@ -489,6 +490,27 @@ public static class ApiEndpoints
         });
         admin.MapPost("/lesson-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveRequest(id, db));
         admin.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, AcademyDbContext db, RejectRequest? input = null) => await RejectRequestByAdmin(id, input?.Reason, db));
+        admin.MapGet("/change-requests", async (string? status, AcademyDbContext db) =>
+        {
+            var q = ChangeRequestsWithDetails(db);
+            if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
+            return Results.Ok((await q.OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToChangeRequest));
+        });
+        admin.MapPost("/change-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveChangeRequestAsync(id, db));
+        admin.MapPost("/change-requests/{id:guid}/reject", async (Guid id, RejectChangeRequestInput? input, AcademyDbContext db) => await RejectChangeRequestAsync(id, input?.Note, db));
+        admin.MapGet("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, AcademyDbContext db) =>
+            await db.Users.AnyAsync(x => x.Id == teacherId)
+                ? Results.Ok(await WeeklyRulesAsync(db, teacherId, null))
+                : Results.NotFound());
+        admin.MapPost("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, CreateAvailabilityRulesRequest input, AcademyDbContext db) =>
+        {
+            if (!await db.Users.AnyAsync(x => x.Id == teacherId)) return Results.NotFound();
+            var (created, error) = await CreateAvailabilityRulesAsync(teacherId, input, db);
+            if (error is not null) return Results.BadRequest(new { message = error });
+            return Results.Created($"/api/admin/teachers/{teacherId}/availability-rules", created!.Select(x => ToRule(x, "available")).ToList());
+        });
+        admin.MapDelete("/teachers/{teacherId:guid}/availability-rules/{ruleId:guid}", async (Guid teacherId, Guid ruleId, AcademyDbContext db) =>
+            await DeleteAvailabilityRuleAsync(teacherId, ruleId, db));
 
         // Transcript review: flag any lesson where a participant tried to move
         // the lesson off-platform (numbers, email, chat apps, "call me").
@@ -616,6 +638,29 @@ public static class ApiEndpoints
             return Results.Ok(result);
         }).RequireAuthorization();
 
+        // Student-facing directory of teachers and their announced weekly times.
+        api.MapGet("/teachers/weekly-directory", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var teachers = (await users.GetUsersInRoleAsync("teacher")).Where(x => x.IsActive).OrderBy(x => x.FullName).ToList();
+            var teacherIds = teachers.Select(x => x.Id).ToList();
+            var ratings = await db.TeacherReviews.AsNoTracking()
+                .Where(x => teacherIds.Contains(x.TeacherId))
+                .GroupBy(x => x.TeacherId)
+                .Select(g => new { TeacherId = g.Key, Average = (double?)g.Average(x => (double)x.Rating), Count = g.Count() })
+                .ToDictionaryAsync(x => x.TeacherId);
+            var result = new List<WeeklyTeacherDto>();
+            foreach (var teacher in teachers)
+            {
+                ratings.TryGetValue(teacher.Id, out var rating);
+                result.Add(new WeeklyTeacherDto(
+                    ToUser(teacher, "teacher"),
+                    await WeeklyRulesAsync(db, teacher.Id, null),
+                    rating?.Average,
+                    rating?.Count ?? 0));
+            }
+            return Results.Ok(result);
+        }).RequireAuthorization();
+
         api.MapGet("/teachers/{id:guid}/profile", async (Guid id, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
             var teacher = await users.FindByIdAsync(id.ToString());
@@ -723,6 +768,18 @@ public static class ApiEndpoints
             if (slot is null) return Results.NotFound(); if (slot.Status != "available") return Results.Conflict(new { message = "A requested or booked slot cannot be deleted." });
             db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
         });
+
+        // Weekly availability announcement: one row per bookable weekly slot.
+        teacher.MapGet("/availability-rules", async (ClaimsPrincipal p, AcademyDbContext db) =>
+            Results.Ok(await WeeklyRulesAsync(db, UserId(p), null)));
+        teacher.MapPost("/availability-rules", async (CreateAvailabilityRulesRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var (created, error) = await CreateAvailabilityRulesAsync(UserId(p), input, db);
+            if (error is not null) return Results.BadRequest(new { message = error });
+            return Results.Created("/api/teacher/availability-rules", created!.Select(x => ToRule(x, "available")).ToList());
+        });
+        teacher.MapDelete("/availability-rules/{ruleId:guid}", async (Guid ruleId, ClaimsPrincipal p, AcademyDbContext db) =>
+            await DeleteAvailabilityRuleAsync(UserId(p), ruleId, db));
         teacher.MapGet("/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.TeacherId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest)));
         teacher.MapPost("/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
         {
@@ -750,6 +807,129 @@ public static class ApiEndpoints
                 .Where(x => x.TeacherId == assignment.TeacherId)
                 .OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
             return Results.Ok(new TeacherAvailabilityDto(ToUser(assignment.Teacher, "teacher"), slots, rating.Average, rating.Count, reviews.Select(x => ToReview(x)).ToList()));
+        }).RequireAuthorization("StudentOnly");
+
+        // Weekly availability: the teacher announces recurring slots once and
+        // students book them directly. No teacher or admin confirmation step.
+        api.MapGet("/student/teacher/weekly-availability", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var assignment = await db.Assignments.Include(x => x.Teacher).Where(x => x.StudentId == studentId && x.IsActive).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync();
+            if (assignment?.Teacher is null) return Results.Ok(new WeeklyAvailabilityDto(null, [], []));
+            return Results.Ok(await WeeklyAvailabilityAsync(db, assignment.Teacher, studentId));
+        }).RequireAuthorization("StudentOnly");
+        api.MapGet("/teachers/{id:guid}/weekly-availability", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var teacher = await users.FindByIdAsync(id.ToString());
+            if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
+            return Results.Ok(await WeeklyAvailabilityAsync(db, teacher, UserId(p)));
+        }).RequireAuthorization("StudentOnly");
+        api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var ruleIds = (input.RuleIds ?? []).Distinct().ToList();
+            if (ruleIds.Count < 1)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["ruleIds"] = ["Choose at least one weekly slot."] });
+            var rules = await db.TeacherAvailabilityRules.Where(x => ruleIds.Contains(x.Id))
+                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+            if (rules.Count != ruleIds.Count) return Results.Conflict(new { message = "One of the chosen slots no longer exists." });
+            if (rules.Select(x => x.TeacherId).Distinct().Count() != 1)
+                return Results.Conflict(new { message = "Choose slots from a single teacher." });
+            var teacherId = rules[0].TeacherId;
+            if (!await db.Users.AnyAsync(x => x.Id == teacherId && x.IsActive))
+                return Results.Conflict(new { message = "This teacher is not accepting lessons right now." });
+            var taken = await db.LessonSeries.Where(x => x.IsActive && ruleIds.Contains(x.AvailabilityRuleId))
+                .Select(x => x.AvailabilityRuleId).ToListAsync();
+            if (taken.Count > 0)
+                return Results.Conflict(new { message = "One of the chosen slots was just booked. Refresh and pick another time." });
+            var mySeries = await db.LessonSeries.Where(x => x.StudentId == studentId && x.IsActive).ToListAsync();
+            if (rules.Any(r => mySeries.Any(s => Overlaps(s.DayOfWeek, s.StartsAtTime, s.EndsAtTime, r.DayOfWeek, r.StartsAtTime, r.EndsAtTime))))
+                return Results.Conflict(new { message = "One of the chosen slots overlaps a lesson you already have." });
+            var now = DateTimeOffset.UtcNow;
+            foreach (var rule in rules)
+                foreach (var (start, end) in NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 8))
+                    if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < end && x.EndsAt > start && (x.TeacherId == teacherId || x.StudentId == studentId)))
+                        return Results.Conflict(new { message = "This time conflicts with an existing lesson." });
+
+            await using var tx = await db.Database.BeginTransactionAsync();
+            await db.Assignments.Where(x => x.StudentId == studentId && x.IsActive && x.TeacherId != teacherId)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            var assignment = await db.Assignments.FirstOrDefaultAsync(x => x.StudentId == studentId && x.TeacherId == teacherId);
+            if (assignment is null) db.Assignments.Add(new TeacherStudentAssignment { TeacherId = teacherId, StudentId = studentId });
+            else if (!assignment.IsActive) assignment.IsActive = true;
+
+            var firstEverLesson = !await db.Lessons.AnyAsync(x => x.StudentId == studentId);
+            var series = rules.Select(rule => new LessonSeries
+            {
+                TeacherId = teacherId,
+                StudentId = studentId,
+                AvailabilityRuleId = rule.Id,
+                DayOfWeek = rule.DayOfWeek,
+                StartsAtTime = rule.StartsAtTime,
+                EndsAtTime = rule.EndsAtTime,
+                TimeZoneId = rule.TimeZoneId,
+            }).ToList();
+            db.LessonSeries.AddRange(series);
+            try { await db.SaveChangesAsync(); }
+            catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "One of the chosen slots was just booked. Refresh and pick another time." }); }
+
+            var created = new List<Lesson>();
+            foreach (var s in series) created.AddRange(await BuildSeriesLessonsAsync(db, s, now));
+            if (firstEverLesson && created.Count > 0) created.OrderBy(x => x.StartsAt).First().IsTrial = true;
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+
+            var seriesIds = series.Select(x => x.Id).ToList();
+            var lessonIds = created.Select(x => x.Id).ToList();
+            var savedSeries = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
+                .Where(x => seriesIds.Contains(x.Id)).ToListAsync();
+            var savedLessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review)
+                .Where(x => lessonIds.Contains(x.Id)).OrderBy(x => x.StartsAt).ToListAsync();
+            return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
+        }).RequireAuthorization("StudentOnly");
+        api.MapGet("/student/series", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var list = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
+                .Where(x => x.StudentId == studentId && x.IsActive)
+                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+            return Results.Ok(list.Select(ToSeries));
+        }).RequireAuthorization("StudentOnly");
+        api.MapGet("/student/change-requests", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var list = await ChangeRequestsWithDetails(db).Where(x => x.StudentId == studentId)
+                .OrderByDescending(x => x.CreatedAt).ToListAsync();
+            return Results.Ok(list.Select(ToChangeRequest));
+        }).RequireAuthorization("StudentOnly");
+        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var series = await db.LessonSeries.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId && x.IsActive);
+            if (series is null) return Results.NotFound();
+            if (await db.LessonChangeRequests.AnyAsync(x => x.SeriesId == id && x.Status == "pending"))
+                return Results.Conflict(new { message = "You already have a pending time-change request for this slot." });
+            var rule = await db.TeacherAvailabilityRules.FirstOrDefaultAsync(x => x.Id == input.RequestedRuleId && x.TeacherId == series.TeacherId);
+            if (rule is null) return Results.NotFound();
+            if (rule.Id == series.AvailabilityRuleId) return Results.Conflict(new { message = "That is already your booked time." });
+            if (await db.LessonSeries.AnyAsync(x => x.IsActive && x.AvailabilityRuleId == rule.Id))
+                return Results.Conflict(new { message = "That time is no longer available." });
+            var otherSeries = await db.LessonSeries.Where(x => x.StudentId == studentId && x.IsActive && x.Id != series.Id).ToListAsync();
+            if (otherSeries.Any(x => Overlaps(x.DayOfWeek, x.StartsAtTime, x.EndsAtTime, rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime)))
+                return Results.Conflict(new { message = "That time overlaps another lesson you have." });
+            var request = new LessonChangeRequest
+            {
+                SeriesId = series.Id,
+                StudentId = studentId,
+                TeacherId = series.TeacherId,
+                RequestedRuleId = rule.Id,
+                StudentNote = input.Note?.Trim(),
+            };
+            db.LessonChangeRequests.Add(request);
+            try { await db.SaveChangesAsync(); }
+            catch (DbUpdateException) { return Results.Conflict(new { message = "You already have a pending time-change request for this slot." }); }
+            var saved = await ChangeRequestsWithDetails(db).FirstAsync(x => x.Id == request.Id);
+            return Results.Created($"/api/student/change-requests/{request.Id}", ToChangeRequest(saved));
         }).RequireAuthorization("StudentOnly");
         api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db) =>
         {
@@ -826,6 +1006,8 @@ public static class ApiEndpoints
 
         api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db) =>
         {
+            if (HasRole(p, "student")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.StudentId == UserId(p)));
+            else if (HasRole(p, "teacher")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.TeacherId == UserId(p)));
             var q = db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).AsQueryable();
             if (HasRole(p, "student")) q = q.Where(x => x.StudentId == UserId(p));
             else if (HasRole(p, "teacher")) q = q.Where(x => x.TeacherId == UserId(p));
@@ -1047,6 +1229,212 @@ public static class ApiEndpoints
         if (request.AvailabilitySlot is not null) request.AvailabilitySlot.Status = "available";
         if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
         await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+    }
+
+    private static WeeklyRuleDto ToRule(TeacherAvailabilityRule r, string status) => new(r.Id, r.TeacherId, r.DayOfWeek, FormatTime(r.StartsAtTime), FormatTime(r.EndsAtTime), r.TimeZoneId, status);
+    private static LessonSeriesDto ToSeries(LessonSeries s) => new(s.Id, s.TeacherId, s.Teacher?.FullName ?? "", s.StudentId, s.Student?.FullName ?? "", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt);
+    private static LessonChangeRequestDto ToChangeRequest(LessonChangeRequest r) => new(
+        r.Id, r.SeriesId, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "",
+        r.Series?.DayOfWeek ?? 0, FormatTime(r.Series?.StartsAtTime ?? TimeOnly.MinValue), FormatTime(r.Series?.EndsAtTime ?? TimeOnly.MinValue),
+        r.RequestedRule?.DayOfWeek ?? 0, FormatTime(r.RequestedRule?.StartsAtTime ?? TimeOnly.MinValue), FormatTime(r.RequestedRule?.EndsAtTime ?? TimeOnly.MinValue),
+        r.RequestedRule?.TimeZoneId ?? "UTC", r.Status, r.StudentNote, r.AdminNote, r.CreatedAt, r.AdminRespondedAt);
+    private static IQueryable<LessonChangeRequest> ChangeRequestsWithDetails(AcademyDbContext db)
+        => db.LessonChangeRequests.Include(x => x.Series).Include(x => x.RequestedRule).Include(x => x.Teacher).Include(x => x.Student);
+
+    private static string FormatTime(TimeOnly time) => time.ToString("HH:mm", CultureInfo.InvariantCulture);
+    private static bool Overlaps(int dayA, TimeOnly startA, TimeOnly endA, int dayB, TimeOnly startB, TimeOnly endB)
+        => dayA == dayB && startA < endB && endA > startB;
+    private static TimeZoneInfo ResolveTimeZone(string timeZoneId)
+        => TimeZoneInfo.TryFindSystemTimeZoneById(timeZoneId, out var zone) ? zone : TimeZoneInfo.Utc;
+    private static DateTimeOffset InstantFor(DateOnly date, TimeOnly time, TimeZoneInfo zone)
+    {
+        var local = date.ToDateTime(time, DateTimeKind.Unspecified);
+        return new DateTimeOffset(local, zone.GetUtcOffset(local)).ToUniversalTime();
+    }
+    private static IEnumerable<(DateTimeOffset StartsAt, DateTimeOffset EndsAt)> NextOccurrences(
+        int dayOfWeek, TimeOnly startsAtTime, TimeOnly endsAtTime, TimeZoneInfo zone, DateTimeOffset now, int weeks)
+    {
+        var localToday = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, zone).DateTime);
+        for (var i = 0; i <= weeks * 7; i++)
+        {
+            var date = localToday.AddDays(i);
+            if ((int)date.DayOfWeek != dayOfWeek) continue;
+            var start = InstantFor(date, startsAtTime, zone);
+            if (start <= now) continue;
+            yield return (start, InstantFor(date, endsAtTime, zone));
+        }
+    }
+
+    private static async Task<List<WeeklyRuleDto>> WeeklyRulesAsync(AcademyDbContext db, Guid teacherId, Guid? studentId)
+    {
+        var rules = await db.TeacherAvailabilityRules.Where(x => x.TeacherId == teacherId)
+            .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+        var bookings = await db.LessonSeries.Where(x => x.IsActive && x.TeacherId == teacherId)
+            .Select(x => new { x.AvailabilityRuleId, x.StudentId }).ToListAsync();
+        return rules.Select(rule =>
+        {
+            var booking = bookings.FirstOrDefault(x => x.AvailabilityRuleId == rule.Id);
+            var status = booking is null ? "available" : booking.StudentId == studentId ? "yours" : "booked";
+            return ToRule(rule, status);
+        }).ToList();
+    }
+
+    private static async Task<WeeklyAvailabilityDto> WeeklyAvailabilityAsync(AcademyDbContext db, AcademyUser teacher, Guid studentId)
+    {
+        var rules = await WeeklyRulesAsync(db, teacher.Id, studentId);
+        var series = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
+            .Where(x => x.StudentId == studentId && x.TeacherId == teacher.Id && x.IsActive)
+            .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+        var rating = await TeacherRatingAsync(db, teacher.Id);
+        var reviews = await db.TeacherReviews.AsNoTracking().Include(x => x.Lesson).Include(x => x.Teacher).Include(x => x.Student)
+            .Where(x => x.TeacherId == teacher.Id).OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
+        var hasLessons = await db.Lessons.AnyAsync(x => x.StudentId == studentId);
+        return new WeeklyAvailabilityDto(ToUser(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons);
+    }
+
+    private static async Task<(List<TeacherAvailabilityRule>? Created, string? Error)> CreateAvailabilityRulesAsync(
+        Guid teacherId, CreateAvailabilityRulesRequest input, AcademyDbContext db)
+    {
+        var days = (input.DaysOfWeek ?? []).Distinct().OrderBy(x => x).ToList();
+        if (days.Count == 0 || days.Any(x => x is < 0 or > 6)) return (null, "Choose at least one weekday.");
+        if (!TimeOnly.TryParse(input.StartsAtTime, CultureInfo.InvariantCulture, out var starts)) return (null, "Enter a valid start time.");
+        if (!TimeOnly.TryParse(input.EndsAtTime, CultureInfo.InvariantCulture, out var ends)) return (null, "Enter a valid end time.");
+        starts = new TimeOnly(starts.Hour, starts.Minute);
+        ends = new TimeOnly(ends.Hour, ends.Minute);
+        if (ends <= starts) return (null, "The end time must be after the start time.");
+        if (ends - starts > TimeSpan.FromHours(4)) return (null, "A weekly slot can last up to 4 hours.");
+        var timeZoneId = string.IsNullOrWhiteSpace(input.TimeZoneId) ? "UTC" : input.TimeZoneId.Trim();
+        if (!TimeZoneInfo.TryFindSystemTimeZoneById(timeZoneId, out _)) return (null, "Unknown time zone.");
+
+        var existing = await db.TeacherAvailabilityRules.Where(x => x.TeacherId == teacherId).ToListAsync();
+        var created = new List<TeacherAvailabilityRule>();
+        foreach (var day in days)
+        {
+            if (existing.Concat(created).Any(x => x.DayOfWeek == day && starts < x.EndsAtTime && ends > x.StartsAtTime))
+                return (null, "Those hours overlap availability you already announced.");
+            created.Add(new TeacherAvailabilityRule
+            {
+                TeacherId = teacherId,
+                DayOfWeek = day,
+                StartsAtTime = starts,
+                EndsAtTime = ends,
+                TimeZoneId = timeZoneId,
+            });
+        }
+        db.TeacherAvailabilityRules.AddRange(created);
+        try { await db.SaveChangesAsync(); }
+        catch (DbUpdateException) { return (null, "Those hours overlap availability you already announced."); }
+        return (created, null);
+    }
+
+    private static async Task<IResult> DeleteAvailabilityRuleAsync(Guid teacherId, Guid ruleId, AcademyDbContext db)
+    {
+        var rule = await db.TeacherAvailabilityRules.FirstOrDefaultAsync(x => x.Id == ruleId && x.TeacherId == teacherId);
+        if (rule is null) return Results.NotFound();
+        if (await db.LessonSeries.AnyAsync(x => x.AvailabilityRuleId == ruleId))
+            return Results.Conflict(new { message = "A slot that a student has booked cannot be removed." });
+        if (await db.LessonChangeRequests.AnyAsync(x => x.RequestedRuleId == ruleId))
+            return Results.Conflict(new { message = "This slot is part of a pending time-change request." });
+        db.TeacherAvailabilityRules.Remove(rule);
+        await db.SaveChangesAsync();
+        return Results.NoContent();
+    }
+
+    private static async Task<List<Lesson>> BuildSeriesLessonsAsync(AcademyDbContext db, LessonSeries series, DateTimeOffset now)
+    {
+        var zone = ResolveTimeZone(series.TimeZoneId);
+        var existing = await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt >= now.AddDays(-1))
+            .Select(x => x.StartsAt).ToListAsync();
+        var lessons = new List<Lesson>();
+        foreach (var (start, end) in NextOccurrences(series.DayOfWeek, series.StartsAtTime, series.EndsAtTime, zone, now, 8))
+        {
+            if (existing.Any(x => Math.Abs((x - start).TotalMinutes) < 1)) continue;
+            if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < end && x.EndsAt > start
+                && (x.TeacherId == series.TeacherId || x.StudentId == series.StudentId))) continue;
+            lessons.Add(new Lesson
+            {
+                TeacherId = series.TeacherId,
+                StudentId = series.StudentId,
+                SeriesId = series.Id,
+                StartsAt = start,
+                EndsAt = end,
+            });
+        }
+        db.Lessons.AddRange(lessons);
+        return lessons;
+    }
+
+    /// <summary>
+    /// A series has no end date, so lessons are materialized on a rolling
+    /// window. Extend when fewer than four weeks of lessons remain.
+    /// </summary>
+    private static async Task EnsureRollingLessonsAsync(AcademyDbContext db, IQueryable<LessonSeries> query)
+    {
+        var series = await query.Where(x => x.IsActive).ToListAsync();
+        if (series.Count == 0) return;
+        var ids = series.Select(x => x.Id).ToList();
+        var latest = await db.Lessons.Where(x => x.SeriesId != null && ids.Contains(x.SeriesId.Value))
+            .GroupBy(x => x.SeriesId!.Value)
+            .Select(g => new { Id = g.Key, Max = g.Max(x => x.StartsAt) })
+            .ToDictionaryAsync(x => x.Id, x => x.Max);
+        var now = DateTimeOffset.UtcNow;
+        var toExtend = series.Where(s => !latest.TryGetValue(s.Id, out var max) || max < now.AddDays(28)).ToList();
+        if (toExtend.Count == 0) return;
+        foreach (var s in toExtend) await BuildSeriesLessonsAsync(db, s, now);
+        try { await db.SaveChangesAsync(); }
+        catch (DbUpdateException) { db.ChangeTracker.Clear(); }
+    }
+
+    private static async Task<IResult> ApproveChangeRequestAsync(Guid id, AcademyDbContext db)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
+        if (request is null) return Results.NotFound();
+        if (request.Status != "pending") return Results.Conflict(new { message = "This change request has already been handled." });
+        var series = request.Series!;
+        var rule = request.RequestedRule!;
+        if (!series.IsActive) return Results.Conflict(new { message = "This booking is no longer active." });
+        if (await db.LessonSeries.AnyAsync(x => x.IsActive && x.AvailabilityRuleId == rule.Id && x.Id != series.Id))
+            return Results.Conflict(new { message = "The requested slot is no longer available." });
+        var now = DateTimeOffset.UtcNow;
+        foreach (var (start, end) in NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 8))
+            if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.SeriesId != series.Id && x.StartsAt < end && x.EndsAt > start
+                && (x.TeacherId == series.TeacherId || x.StudentId == series.StudentId)))
+                return Results.Conflict(new { message = "The requested time conflicts with an existing lesson." });
+
+        try
+        {
+            await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt > now).ExecuteDeleteAsync();
+            series.AvailabilityRuleId = rule.Id;
+            series.DayOfWeek = rule.DayOfWeek;
+            series.StartsAtTime = rule.StartsAtTime;
+            series.EndsAtTime = rule.EndsAtTime;
+            series.TimeZoneId = rule.TimeZoneId;
+            request.Status = "approved";
+            request.AdminRespondedAt = now;
+            await db.SaveChangesAsync();
+            await BuildSeriesLessonsAsync(db, series, now);
+            await db.SaveChangesAsync();
+            await tx.CommitAsync();
+        }
+        catch (Exception ex) when (ex is DbUpdateException or PostgresException)
+        {
+            await tx.RollbackAsync();
+            return Results.Conflict(new { message = "This change could not be applied. Refresh and try again." });
+        }
+        return Results.Ok(ToChangeRequest(request));
+    }
+
+    private static async Task<IResult> RejectChangeRequestAsync(Guid id, string? note, AcademyDbContext db)
+    {
+        var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
+        if (request is null) return Results.NotFound();
+        if (request.Status != "pending") return Results.Conflict(new { message = "This change request has already been handled." });
+        request.Status = "rejected";
+        request.AdminNote = note?.Trim();
+        request.AdminRespondedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        return Results.Ok(ToChangeRequest(request));
     }
 
     private static async Task<LessonRequestDto?> RequestById(AcademyDbContext db, Guid id)

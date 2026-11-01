@@ -33,6 +33,67 @@ public sealed class AvailabilitySlot
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// A teacher's announced weekly availability. One row is one bookable weekly
+/// slot (day + local time window). Booking a rule creates a LessonSeries.
+/// </summary>
+public sealed class TeacherAvailabilityRule
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    // 0 = Sunday ... 6 = Saturday
+    public int DayOfWeek { get; set; }
+    public TimeOnly StartsAtTime { get; set; }
+    public TimeOnly EndsAtTime { get; set; }
+    [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// A student's permanent weekly booking. Lessons are materialized ahead of time
+/// and extended lazily, so a series has no end date.
+/// </summary>
+public sealed class LessonSeries
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    public Guid AvailabilityRuleId { get; set; }
+    public TeacherAvailabilityRule? AvailabilityRule { get; set; }
+    public int DayOfWeek { get; set; }
+    public TimeOnly StartsAtTime { get; set; }
+    public TimeOnly EndsAtTime { get; set; }
+    [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
+    public bool IsActive { get; set; } = true;
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// A student's request to move their recurring series to another weekly slot.
+/// Only admins see these; the teacher learns the new time after approval, so
+/// the admin can coordinate with them directly first.
+/// </summary>
+public sealed class LessonChangeRequest
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid SeriesId { get; set; }
+    public LessonSeries? Series { get; set; }
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    public Guid RequestedRuleId { get; set; }
+    public TeacherAvailabilityRule? RequestedRule { get; set; }
+    [MaxLength(20)] public string Status { get; set; } = "pending";
+    [MaxLength(500)] public string? StudentNote { get; set; }
+    [MaxLength(500)] public string? AdminNote { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? AdminRespondedAt { get; set; }
+}
+
 public sealed class StudentAvailability
 {
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -71,8 +132,12 @@ public sealed class Lesson
     public AcademyUser? Teacher { get; set; }
     public Guid StudentId { get; set; }
     public AcademyUser? Student { get; set; }
-    public Guid LessonRequestId { get; set; }
+    public Guid? LessonRequestId { get; set; }
     public LessonRequest? LessonRequest { get; set; }
+    public Guid? SeriesId { get; set; }
+    public LessonSeries? Series { get; set; }
+    /// <summary>True for a student's very first lesson, which is a trial.</summary>
+    public bool IsTrial { get; set; }
     public DateTimeOffset StartsAt { get; set; }
     public DateTimeOffset EndsAt { get; set; }
     [MaxLength(20)] public string Status { get; set; } = "scheduled";

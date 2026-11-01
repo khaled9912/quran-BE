@@ -20,6 +20,10 @@ public sealed record CreateLessonRequest(Guid TeacherId, Guid StudentId, DateTim
 public sealed record ContactRequest(string Name, string Email, string Message);
 public sealed record RejectRequest(string? Reason);
 public sealed record RequestSlotInput(Guid AvailabilitySlotId);
+public sealed record CreateAvailabilityRulesRequest(List<int>? DaysOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
+public sealed record BookWeeklySlotsRequest(List<Guid>? RuleIds);
+public sealed record CreateLessonChangeRequestInput(Guid RequestedRuleId, string? Note);
+public sealed record RejectChangeRequestInput(string? Note);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);
 public sealed record ReviewTeacherApplicationRequest(string Status, string? Reason);
@@ -30,9 +34,14 @@ public sealed record UserDto(Guid Id, string FullName, string Email, string Role
 public sealed record AssignmentDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset CreatedAt, bool IsActive, string Status);
 public sealed record AvailabilityDto(Guid Id, Guid TeacherId, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status);
 public sealed record TeacherAvailabilityDto(UserDto Teacher, IReadOnlyList<AvailabilityDto> Slots, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null);
+public sealed record WeeklyTeacherDto(UserDto Teacher, IReadOnlyList<WeeklyRuleDto> Slots, double? AverageRating = null, int ReviewCount = 0);
 public sealed record LessonRequestDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, Guid? AvailabilitySlotId, Guid? StudentAvailabilityId, string InitiatedBy, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset CreatedAt, string? RejectionReason);
 public sealed record LessonReportDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, DateTimeOffset EndsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, string ClassSummary, string StudentFeedback, string Progress, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record TeacherReviewDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int Rating, string? Comment, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record PublicTeacherDto(Guid Id, string FullName, string? AvatarUrl, double? AverageRating, int ReviewCount, IReadOnlyList<TeacherReviewDto> Reviews);
-public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review);
+public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review, Guid? SeriesId = null, bool IsTrial = false);
+public sealed record WeeklyRuleDto(Guid Id, Guid TeacherId, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, string Status);
+public sealed record LessonSeriesDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, bool IsActive, DateTimeOffset CreatedAt);
+public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<WeeklyRuleDto> Slots, IReadOnlyList<LessonSeriesDto> Series, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null, bool HasLessons = false);
+public sealed record LessonChangeRequestDto(Guid Id, Guid SeriesId, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int CurrentDayOfWeek, string CurrentStartsAtTime, string CurrentEndsAtTime, int RequestedDayOfWeek, string RequestedStartsAtTime, string RequestedEndsAtTime, string TimeZoneId, string Status, string? StudentNote, string? AdminNote, DateTimeOffset CreatedAt, DateTimeOffset? AdminRespondedAt);
 public sealed record TeacherApplicationDto(Guid Id, string FullName, string Email, string PhoneNumber, IReadOnlyList<string> Subjects, string EnglishLevel, int ExperienceYears, string Bio, string AvailabilityNote, string Status, string? RejectionReason, DateTimeOffset CreatedAt, DateTimeOffset? ReviewedAt, Guid? TeacherId, string? CvFileName, string? IntroFileName, string? QuranRecordingFileName);

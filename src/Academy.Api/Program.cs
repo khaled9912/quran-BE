@@ -303,6 +303,71 @@ await using (var scope = app.Services.CreateAsyncScope())
             CONSTRAINT "FK_TeacherApplicationQuranRecordings_TeacherApplications_ApplicationId" FOREIGN KEY ("ApplicationId") REFERENCES "TeacherApplications" ("Id") ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS "TeacherAvailabilityRules" (
+            "Id" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "DayOfWeek" integer NOT NULL,
+            "StartsAtTime" time without time zone NOT NULL,
+            "EndsAtTime" time without time zone NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherAvailabilityRules" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_TeacherAvailabilityRules_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherAvailabilityRules_TeacherId_DayOfWeek_StartsAtTime_EndsAtTime" ON "TeacherAvailabilityRules" ("TeacherId", "DayOfWeek", "StartsAtTime", "EndsAtTime");
+
+        CREATE TABLE IF NOT EXISTS "LessonSeries" (
+            "Id" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "AvailabilityRuleId" uuid NOT NULL,
+            "DayOfWeek" integer NOT NULL,
+            "StartsAtTime" time without time zone NOT NULL,
+            "EndsAtTime" time without time zone NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "IsActive" boolean NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonSeries" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonSeries_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonSeries_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonSeries_TeacherAvailabilityRules_AvailabilityRuleId" FOREIGN KEY ("AvailabilityRuleId") REFERENCES "TeacherAvailabilityRules" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonSeries_AvailabilityRuleId" ON "LessonSeries" ("AvailabilityRuleId") WHERE "IsActive" = TRUE;
+        CREATE INDEX IF NOT EXISTS "IX_LessonSeries_TeacherId_DayOfWeek_StartsAtTime" ON "LessonSeries" ("TeacherId", "DayOfWeek", "StartsAtTime");
+        CREATE INDEX IF NOT EXISTS "IX_LessonSeries_StudentId_IsActive" ON "LessonSeries" ("StudentId", "IsActive");
+
+        CREATE TABLE IF NOT EXISTS "LessonChangeRequests" (
+            "Id" uuid NOT NULL,
+            "SeriesId" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "RequestedRuleId" uuid NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "StudentNote" character varying(500),
+            "AdminNote" character varying(500),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "AdminRespondedAt" timestamp with time zone,
+            CONSTRAINT "PK_LessonChangeRequests" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonChangeRequests_LessonSeries_SeriesId" FOREIGN KEY ("SeriesId") REFERENCES "LessonSeries" ("Id") ON DELETE CASCADE,
+            CONSTRAINT "FK_LessonChangeRequests_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonChangeRequests_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonChangeRequests_TeacherAvailabilityRules_RequestedRuleId" FOREIGN KEY ("RequestedRuleId") REFERENCES "TeacherAvailabilityRules" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonChangeRequests_SeriesId" ON "LessonChangeRequests" ("SeriesId") WHERE "Status" = 'pending';
+        CREATE INDEX IF NOT EXISTS "IX_LessonChangeRequests_Status" ON "LessonChangeRequests" ("Status");
+
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "SeriesId" uuid;
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "IsTrial" boolean NOT NULL DEFAULT FALSE;
+        ALTER TABLE "Lessons" ALTER COLUMN "LessonRequestId" DROP NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_Lessons_SeriesId_StartsAt" ON "Lessons" ("SeriesId", "StartsAt") WHERE "SeriesId" IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS "IX_Lessons_SeriesId" ON "Lessons" ("SeriesId");
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'FK_Lessons_LessonSeries_SeriesId') THEN
+                ALTER TABLE "Lessons" ADD CONSTRAINT "FK_Lessons_LessonSeries_SeriesId" FOREIGN KEY ("SeriesId") REFERENCES "LessonSeries" ("Id") ON DELETE SET NULL;
+            END IF;
+        END $$;
+
         CREATE TABLE IF NOT EXISTS "LessonTranscriptSegments" (
             "Id" uuid NOT NULL,
             "LessonId" uuid NOT NULL,
