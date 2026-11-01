@@ -43,14 +43,41 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq lftp
-          lftp -c "
-            set sftp:auto-confirm yes;
-            set net:timeout 30;
-            set net:max-retries 3;
-            open -u \"$SFTP_USER\",\"$SFTP_PASSWORD\" sftp://$SFTP_HOST:22;
-            mirror -R --delete --parallel=4 \
-              -x 'web.config' \
-              -x 'logs' \
-              -x 'logs/*' \
-              ./publish /wwwroot;
-          "
+
+          # IIS keeps the running app's dlls locked, which makes the mirror fail
+          # with "file is being used by another process". app_offline.htm makes
+          # the ASP.NET Core Module unload the app so the files can be replaced.
+          cat > app_offline.htm <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>Ana Quran API update</title>
+          <p style="font-family:sans-serif;text-align:center;padding:4rem">Updating the API. Please refresh in a minute.</p>
+          HTML
+
+          lftp_cmd() {
+            lftp -c "set sftp:auto-confirm yes; set net:timeout 30; set net:max-retries 3; open -u \"$SFTP_USER\",\"$SFTP_PASSWORD\" sftp://$SFTP_HOST:22; $1"
+          }
+
+          # Never leave the site showing the offline page, even when a step fails.
+          trap 'lftp_cmd "rm -f /wwwroot/app_offline.htm"' EXIT
+
+          lftp_cmd "put app_offline.htm -o /wwwroot/app_offline.htm"
+          sleep 8
+          lftp_cmd "mirror -R --delete --parallel=4 \
+            -x 'web.config' \
+            -x 'logs' \
+            -x 'logs/*' \
+            -x 'app_offline.htm' \
+            ./publish /wwwroot"
+
+      - name: Verify the API came back
+        run: |
+          for attempt in $(seq 1 15); do
+            body=$(curl -s https://anaquran.runasp.net/health || true)
+            if [[ "$body" == *rayan-academy-api* ]]; then
+              echo "API healthy after $attempt attempt(s)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "API did not become healthy within 75s."
+          exit 1
+
