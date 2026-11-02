@@ -199,6 +199,43 @@ public sealed class LessonTranscriptSegment
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// A support reviewer's assessment of one lesson transcript. Scores are 1-5 and
+/// stay null while the review is a draft; submitting requires all four.
+/// </summary>
+public sealed class LessonQualityReview
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public Guid ReviewerId { get; set; }
+    public AcademyUser? Reviewer { get; set; }
+    public int? TeachingClarity { get; set; }
+    public int? StudentPractice { get; set; }
+    public int? CorrectionQuality { get; set; }
+    public int? Engagement { get; set; }
+    [MaxLength(2000)] public string? Strengths { get; set; }
+    [MaxLength(2000)] public string? Gaps { get; set; }
+    [MaxLength(1000)] public string? TeacherAction { get; set; }
+    [MaxLength(1000)] public string? StudentAction { get; set; }
+    // draft | submitted
+    [MaxLength(20)] public string Status { get; set; } = "draft";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Audit trail for transcript views: support access must stay accountable, and
+/// lesson recordings involve minors.
+/// </summary>
+public sealed class TranscriptAccessLog
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Guid UserId { get; set; }
+    public DateTimeOffset AccessedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class ContactSubmission
 {
     public Guid Id { get; set; } = Guid.NewGuid();

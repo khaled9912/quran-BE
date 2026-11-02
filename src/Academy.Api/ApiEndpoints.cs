@@ -390,7 +390,7 @@ public static class ApiEndpoints
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || string.IsNullOrWhiteSpace(input.Role)) return Results.BadRequest(new { message = "Full name, email, password and role are required." });
             var role = input.Role.Trim().ToLowerInvariant();
-            if (role is not ("teacher" or "admin")) return Results.BadRequest(new { message = "Admin can create teacher or admin accounts only." });
+            if (role is not ("teacher" or "admin" or "support")) return Results.BadRequest(new { message = "Admin can create teacher, support, or admin accounts only." });
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var created = await users.CreateAsync(user, input.Password);
             if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
@@ -402,7 +402,7 @@ public static class ApiEndpoints
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
             var role = await RoleOf(users, user);
-            if (role is not ("teacher" or "student")) return Results.BadRequest(new { message = "Only teacher and student accounts can be edited here." });
+            if (role is not ("teacher" or "student" or "support")) return Results.BadRequest(new { message = "Only teacher, student and support accounts can be edited here." });
             var errors = new Dictionary<string, string[]>();
             var name = input.FullName?.Trim();
             var email = input.Email?.Trim();
@@ -435,7 +435,7 @@ public static class ApiEndpoints
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
             var role = await RoleOf(users, user);
-            if (role is not ("teacher" or "student")) return Results.BadRequest(new { message = "Only teacher and student accounts can be deactivated here." });
+            if (role is not ("teacher" or "student" or "support")) return Results.BadRequest(new { message = "Only teacher, student and support accounts can be deactivated here." });
             var now = DateTimeOffset.UtcNow;
             var upcoming = await db.Lessons.AnyAsync(x => x.Status != "cancelled" && x.EndsAt > now && (x.TeacherId == id || x.StudentId == id));
             if (upcoming) return Results.Conflict(new { message = "This account still has lessons scheduled. Cancel those lessons before deactivating the account." });
@@ -455,6 +455,11 @@ public static class ApiEndpoints
             await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
             await db.AvailabilitySlots.Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > now).ExecuteDeleteAsync();
             return Results.NoContent();
+        });
+        admin.MapGet("/support-users", async (UserManager<AcademyUser> users) =>
+        {
+            var list = await users.GetUsersInRoleAsync("support");
+            return Results.Ok(list.OrderBy(x => x.FullName).Select(x => ToUser(x, "support")).ToList());
         });
         admin.MapGet("/teachers/{teacherId:guid}/availability", async (Guid teacherId, UserManager<AcademyUser> users, AcademyDbContext db) =>
         {
@@ -512,70 +517,7 @@ public static class ApiEndpoints
         admin.MapDelete("/teachers/{teacherId:guid}/availability-rules/{ruleId:guid}", async (Guid teacherId, Guid ruleId, AcademyDbContext db) =>
             await DeleteAvailabilityRuleAsync(teacherId, ruleId, db));
 
-        // Transcript review: flag any lesson where a participant tried to move
-        // the lesson off-platform (numbers, email, chat apps, "call me").
-        admin.MapGet("/transcripts", async (AcademyDbContext db) =>
-        {
-            var grouped = await db.LessonTranscriptSegments
-                .Where(x => x.Flags != "")
-                .GroupBy(x => x.LessonId)
-                .Select(g => new { LessonId = g.Key, Flagged = g.Count(), LastFlaggedAt = g.Max(x => x.CreatedAt) })
-                .OrderByDescending(x => x.LastFlaggedAt)
-                .Take(200)
-                .ToListAsync();
-            if (grouped.Count == 0) return Results.Ok(Array.Empty<object>());
-            var ids = grouped.Select(x => x.LessonId).ToList();
-            var lessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student)
-                .Where(x => ids.Contains(x.Id)).ToListAsync();
-            var rawFlags = await db.LessonTranscriptSegments
-                .Where(x => ids.Contains(x.LessonId) && x.Flags != "")
-                .Select(x => new { x.LessonId, x.Flags })
-                .ToListAsync();
-            return Results.Ok(grouped.Select(g =>
-            {
-                var lesson = lessons.FirstOrDefault(l => l.Id == g.LessonId);
-                var reasons = rawFlags.Where(f => f.LessonId == g.LessonId)
-                    .SelectMany(f => f.Flags.Split(',', StringSplitOptions.RemoveEmptyEntries))
-                    .Distinct().OrderBy(x => x).ToArray();
-                return new
-                {
-                    lessonId = g.LessonId,
-                    startsAt = lesson?.StartsAt,
-                    status = lesson?.Status,
-                    teacherName = lesson?.Teacher?.FullName,
-                    studentName = lesson?.Student?.FullName,
-                    flaggedSegments = g.Flagged,
-                    lastFlaggedAt = g.LastFlaggedAt,
-                    reasons
-                };
-            }));
-        });
-
-        admin.MapGet("/lessons/{id:guid}/transcript", async (Guid id, AcademyDbContext db) =>
-        {
-            var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).AsNoTracking()
-                .FirstOrDefaultAsync(x => x.Id == id);
-            if (lesson is null) return Results.NotFound();
-            var segments = await db.LessonTranscriptSegments.AsNoTracking()
-                .Where(x => x.LessonId == id)
-                .OrderBy(x => x.CreatedAt).ThenBy(x => x.AtSeconds)
-                .Select(x => new { x.Id, x.Speaker, x.Text, x.AtSeconds, x.Flags, x.CreatedAt })
-                .ToListAsync();
-            return Results.Ok(new
-            {
-                lesson = new
-                {
-                    lesson.Id, lesson.StartsAt, lesson.EndsAt, lesson.Status,
-                    teacherName = lesson.Teacher!.FullName,
-                    studentName = lesson.Student!.FullName
-                },
-                segments = segments.Select(x => new
-                {
-                    x.Id, x.Speaker, x.Text, x.AtSeconds, x.CreatedAt,
-                    flags = x.Flags.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                })
-            });
-        });
+        // Transcript review lives in LessonReviewEndpoints (also open to support).
 
         admin.MapGet("/assignments", async (AcademyDbContext db) => await AssignmentList(db));
         api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");

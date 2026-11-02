@@ -19,6 +19,8 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<Lesson> Lessons => Set<Lesson>();
     public DbSet<ContactSubmission> ContactSubmissions => Set<ContactSubmission>();
     public DbSet<LessonTranscriptSegment> LessonTranscriptSegments => Set<LessonTranscriptSegment>();
+    public DbSet<LessonQualityReview> LessonQualityReviews => Set<LessonQualityReview>();
+    public DbSet<TranscriptAccessLog> TranscriptAccessLogs => Set<TranscriptAccessLog>();
     public DbSet<UserAvatar> UserAvatars => Set<UserAvatar>();
     public DbSet<LessonReport> LessonReports => Set<LessonReport>();
     public DbSet<TeacherReview> TeacherReviews => Set<TeacherReview>();
@@ -33,6 +35,13 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<LessonTranscriptSegment>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LessonTranscriptSegment>().HasIndex(x => new { x.LessonId, x.CreatedAt });
         b.Entity<LessonTranscriptSegment>().HasIndex(x => x.Flags).HasFilter("\"Flags\" <> ''");
+        b.Entity<LessonQualityReview>().HasOne(x => x.Lesson).WithOne().HasForeignKey<LessonQualityReview>(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonQualityReview>().HasOne(x => x.Reviewer).WithMany().HasForeignKey(x => x.ReviewerId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonQualityReview>().HasIndex(x => x.LessonId).IsUnique();
+        b.Entity<LessonQualityReview>().HasIndex(x => new { x.Status, x.UpdatedAt });
+        b.Entity<TranscriptAccessLog>().HasOne<Lesson>().WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TranscriptAccessLog>().HasIndex(x => new { x.LessonId, x.AccessedAt });
+        b.Entity<TranscriptAccessLog>().HasIndex(x => x.UserId);
         b.Entity<TeacherStudentAssignment>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<TeacherStudentAssignment>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<TeacherStudentAssignment>().HasIndex(x => new { x.TeacherId, x.StudentId }).IsUnique().HasFilter("\"IsActive\" = TRUE");
