@@ -55,3 +55,19 @@ public sealed record LessonSeriesDto(Guid Id, Guid TeacherId, string TeacherName
 public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<WeeklyRuleDto> Slots, IReadOnlyList<LessonSeriesDto> Series, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null, bool HasLessons = false);
 public sealed record LessonChangeRequestDto(Guid Id, Guid SeriesId, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int CurrentDayOfWeek, string CurrentStartsAtTime, string CurrentEndsAtTime, int RequestedDayOfWeek, string RequestedStartsAtTime, string RequestedEndsAtTime, string TimeZoneId, string Status, string? StudentNote, string? AdminNote, DateTimeOffset CreatedAt, DateTimeOffset? AdminRespondedAt);
 public sealed record TeacherApplicationDto(Guid Id, string FullName, string Email, string PhoneNumber, IReadOnlyList<string> Subjects, string EnglishLevel, int ExperienceYears, string Bio, string AvailabilityNote, string Status, string? RejectionReason, DateTimeOffset CreatedAt, DateTimeOffset? ReviewedAt, Guid? TeacherId, string? CvFileName, string? IntroFileName, string? QuranRecordingFileName);
+
+public sealed record AcademyBankAccountDto(int Id, string BankName, string AccountHolder, string AccountNumber, string Iban, string Swift, string Notes, DateTimeOffset UpdatedAt);
+public sealed record UpdateAcademyBankAccountRequest(string? BankName, string? AccountHolder, string? AccountNumber, string? Iban, string? Swift, string? Notes);
+public sealed record TeacherBillingRateDto(Guid TeacherId, string TeacherName, string TeacherEmail, decimal StudentPriceUsd, decimal PayoutEgp);
+public sealed record UpdateTeacherBillingRateRequest(decimal StudentPriceUsd, decimal PayoutEgp);
+public sealed record TeacherPayoutDetailDto(Guid TeacherId, string InstaPayAccount, string VodafoneCashNumber, string BankName, string BankAccountHolder, string BankIban, DateTimeOffset UpdatedAt);
+public sealed record UpdateTeacherPayoutDetailRequest(string? InstaPayAccount, string? VodafoneCashNumber, string? BankName, string? BankAccountHolder, string? BankIban);
+public sealed record BillingLessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, bool IsTrial, decimal Amount);
+public sealed record BillingMonthDto(string Month, int LessonCount, decimal Total);
+public sealed record MonthlyPaymentClaimDto(Guid Id, Guid StudentId, string StudentName, string StudentEmail, string Month, int LessonCount, decimal AmountUsd, string Status, string? StudentNote, string? AdminNote, DateTimeOffset ClaimedAt, DateTimeOffset? ReviewedAt);
+public sealed record StudentBillingDto(string Month, bool MonthClosed, IReadOnlyList<BillingMonthDto> Months, IReadOnlyList<BillingLessonDto> Lessons, decimal TotalUsd, AcademyBankAccountDto? BankAccount, MonthlyPaymentClaimDto? Claim, bool CanClaim);
+public sealed record TeacherBillingDto(string Month, bool MonthClosed, IReadOnlyList<BillingMonthDto> Months, IReadOnlyList<BillingLessonDto> Lessons, decimal TotalEgp, decimal PayoutPerLessonEgp, TeacherPayoutDetailDto PayoutDetails, bool HasPayoutDetails);
+public sealed record AdminTeacherPayoutDto(Guid TeacherId, string TeacherName, string TeacherEmail, int LessonCount, decimal PayoutPerLessonEgp, decimal TotalEgp, TeacherPayoutDetailDto PayoutDetails);
+public sealed record AdminBillingOverviewDto(AcademyBankAccountDto? BankAccount, IReadOnlyList<TeacherBillingRateDto> Rates, IReadOnlyList<MonthlyPaymentClaimDto> Claims, IReadOnlyList<AdminTeacherPayoutDto> TeacherPayouts, string Month);
+public sealed record CreatePaymentClaimRequest(string? Month, string? Note);
+public sealed record ReviewPaymentClaimRequest(string? Note);

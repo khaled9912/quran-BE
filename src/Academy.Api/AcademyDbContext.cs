@@ -28,6 +28,10 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<TeacherApplicationCv> TeacherApplicationCvs => Set<TeacherApplicationCv>();
     public DbSet<TeacherApplicationIntro> TeacherApplicationIntros => Set<TeacherApplicationIntro>();
     public DbSet<TeacherApplicationQuranRecording> TeacherApplicationQuranRecordings => Set<TeacherApplicationQuranRecording>();
+    public DbSet<TeacherBillingRate> TeacherBillingRates => Set<TeacherBillingRate>();
+    public DbSet<TeacherPayoutDetail> TeacherPayoutDetails => Set<TeacherPayoutDetail>();
+    public DbSet<AcademyBankAccount> AcademyBankAccounts => Set<AcademyBankAccount>();
+    public DbSet<MonthlyPaymentClaim> MonthlyPaymentClaims => Set<MonthlyPaymentClaim>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -116,5 +120,16 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<TeacherApplicationQuranRecording>().Property(x => x.FileName).HasMaxLength(200).IsRequired();
         b.Entity<TeacherApplicationQuranRecording>().Property(x => x.ContentType).HasMaxLength(100).IsRequired();
         b.Entity<TeacherApplicationQuranRecording>().Property(x => x.Data).IsRequired();
+        b.Entity<TeacherBillingRate>().HasKey(x => x.TeacherId);
+        b.Entity<TeacherBillingRate>().HasOne(x => x.Teacher).WithOne().HasForeignKey<TeacherBillingRate>(x => x.TeacherId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TeacherBillingRate>().Property(x => x.StudentPriceUsd).HasPrecision(10, 2);
+        b.Entity<TeacherBillingRate>().Property(x => x.PayoutEgp).HasPrecision(10, 2);
+        b.Entity<TeacherPayoutDetail>().HasKey(x => x.TeacherId);
+        b.Entity<TeacherPayoutDetail>().HasOne(x => x.Teacher).WithOne().HasForeignKey<TeacherPayoutDetail>(x => x.TeacherId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<AcademyBankAccount>().HasKey(x => x.Id);
+        b.Entity<MonthlyPaymentClaim>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<MonthlyPaymentClaim>().Property(x => x.AmountUsd).HasPrecision(10, 2);
+        b.Entity<MonthlyPaymentClaim>().HasIndex(x => new { x.StudentId, x.Month }).IsUnique();
+        b.Entity<MonthlyPaymentClaim>().HasIndex(x => x.Status);
     }
 }

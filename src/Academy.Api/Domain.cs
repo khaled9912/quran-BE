@@ -236,6 +236,69 @@ public sealed class TranscriptAccessLog
     public DateTimeOffset AccessedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// Admin-set prices for one teacher: what a student pays per lesson in USD and
+/// what the teacher is paid per lesson in EGP. A missing row means "not priced".
+/// </summary>
+public sealed class TeacherBillingRate
+{
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    public decimal StudentPriceUsd { get; set; }
+    public decimal PayoutEgp { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public Guid? UpdatedBy { get; set; }
+}
+
+/// <summary>Where the academy sends a teacher's monthly payout (Egyptian methods).</summary>
+public sealed class TeacherPayoutDetail
+{
+    public Guid TeacherId { get; set; }
+    public AcademyUser? Teacher { get; set; }
+    [MaxLength(120)] public string InstaPayAccount { get; set; } = "";
+    [MaxLength(30)] public string VodafoneCashNumber { get; set; } = "";
+    [MaxLength(120)] public string BankName { get; set; } = "";
+    [MaxLength(160)] public string BankAccountHolder { get; set; } = "";
+    [MaxLength(64)] public string BankIban { get; set; } = "";
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>Single academy account (Id = 1) shown to students for USD transfers.</summary>
+public sealed class AcademyBankAccount
+{
+    public int Id { get; set; }
+    [MaxLength(120)] public string BankName { get; set; } = "";
+    [MaxLength(160)] public string AccountHolder { get; set; } = "";
+    [MaxLength(64)] public string AccountNumber { get; set; } = "";
+    [MaxLength(64)] public string Iban { get; set; } = "";
+    [MaxLength(32)] public string Swift { get; set; } = "";
+    [MaxLength(500)] public string Notes { get; set; } = "";
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public Guid? UpdatedBy { get; set; }
+}
+
+/// <summary>
+/// A student telling the academy they transferred a month's balance. The amount
+/// is frozen when claimed; admins confirm or reject it after checking the bank.
+/// </summary>
+public sealed class MonthlyPaymentClaim
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    /// <summary>Academy-time month key, e.g. 2026-11.</summary>
+    [MaxLength(7)] public string Month { get; set; } = "";
+    public int LessonCount { get; set; }
+    public decimal AmountUsd { get; set; }
+    // pending | confirmed | rejected
+    [MaxLength(20)] public string Status { get; set; } = "pending";
+    [MaxLength(500)] public string? StudentNote { get; set; }
+    [MaxLength(500)] public string? AdminNote { get; set; }
+    public DateTimeOffset ClaimedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ReviewedAt { get; set; }
+    public Guid? ReviewedBy { get; set; }
+}
+
 public sealed class ContactSubmission
 {
     public Guid Id { get; set; } = Guid.NewGuid();
