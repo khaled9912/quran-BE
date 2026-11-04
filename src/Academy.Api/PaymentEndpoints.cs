@@ -149,6 +149,23 @@ public static class PaymentEndpoints
         await db.SaveChangesAsync();
 
         claim.Student ??= await db.Users.AsNoTracking().FirstAsync(x => x.Id == studentId);
+        var adminIds = await (
+            from userRole in db.UserRoles
+            join roleRow in db.Roles on userRole.RoleId equals roleRow.Id
+            where roleRow.Name == "admin" || roleRow.Name == "super_admin"
+            select userRole.UserId
+        ).Distinct().ToListAsync();
+        foreach (var adminId in adminIds)
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = adminId,
+                Title = "Payment marked as sent",
+                Body = $"{claim.Student.FullName} marked {key} as paid (${claim.AmountUsd:0.00}). Review the claim when you can.",
+                Kind = "payment",
+                Link = "/people",
+                DedupeKey = $"payment-claim:{claim.Id}:{claim.ClaimedAt.UtcTicks}",
+            });
+        if (adminIds.Count > 0) await db.SaveChangesAsync();
         return Results.Ok(ToClaim(claim, claim.Student));
     }
 
@@ -401,6 +418,15 @@ public static class PaymentEndpoints
         claim.ReviewedAt = DateTimeOffset.UtcNow;
         claim.ReviewedBy = ApiEndpoints.UserId(principal);
         claim.AdminNote = null;
+        db.Notifications.Add(new AppNotification
+        {
+            UserId = claim.StudentId,
+            Title = "Payment confirmed",
+            Body = $"The academy confirmed your payment for {claim.Month} (${claim.AmountUsd:0.00}).",
+            Kind = "payment",
+            Link = "/payments",
+            DedupeKey = $"payment-confirmed:{claim.Id}",
+        });
         await db.SaveChangesAsync();
 
         return Results.Ok(ToClaim(claim, claim.Student));
@@ -423,6 +449,17 @@ public static class PaymentEndpoints
         claim.ReviewedAt = DateTimeOffset.UtcNow;
         claim.ReviewedBy = ApiEndpoints.UserId(principal);
         claim.AdminNote = Clean(input.Note, 500);
+        db.Notifications.Add(new AppNotification
+        {
+            UserId = claim.StudentId,
+            Title = "Payment needs attention",
+            Body = string.IsNullOrWhiteSpace(claim.AdminNote)
+                ? $"The academy could not confirm your payment for {claim.Month}. Open payments for details."
+                : $"The academy could not confirm your {claim.Month} payment: {claim.AdminNote}",
+            Kind = "payment",
+            Link = "/payments",
+            DedupeKey = $"payment-rejected:{claim.Id}:{claim.ReviewedAt.Value.UtcTicks}",
+        });
         await db.SaveChangesAsync();
 
         return Results.Ok(ToClaim(claim, claim.Student));

@@ -32,6 +32,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<TeacherPayoutDetail> TeacherPayoutDetails => Set<TeacherPayoutDetail>();
     public DbSet<AcademyBankAccount> AcademyBankAccounts => Set<AcademyBankAccount>();
     public DbSet<MonthlyPaymentClaim> MonthlyPaymentClaims => Set<MonthlyPaymentClaim>();
+    public DbSet<AppNotification> Notifications => Set<AppNotification>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -84,6 +85,10 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<Lesson>().HasIndex(x => new { x.SeriesId, x.StartsAt }).IsUnique().HasFilter("\"SeriesId\" IS NOT NULL");
         b.Entity<Lesson>().HasIndex(x => new { x.TeacherId, x.StartsAt, x.EndsAt });
         b.Entity<Lesson>().HasIndex(x => new { x.StudentId, x.StartsAt, x.EndsAt });
+        b.Entity<AppNotification>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.CreatedAt });
+        b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.DedupeKey }).IsUnique().HasFilter("\"DedupeKey\" IS NOT NULL");
+        b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.ReadAt });
         b.Entity<UserAvatar>().ToTable("UserAvatars");
         b.Entity<UserAvatar>().HasKey(x => x.UserId);
         b.Entity<UserAvatar>().HasOne(x => x.User).WithOne().HasForeignKey<UserAvatar>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);

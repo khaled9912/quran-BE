@@ -727,7 +727,17 @@ public static class ApiEndpoints
         {
             var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
-            request.Status = "pending_admin"; request.TeacherRespondedAt = DateTimeOffset.UtcNow; await db.SaveChangesAsync();
+            request.Status = "pending_admin"; request.TeacherRespondedAt = DateTimeOffset.UtcNow;
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = request.StudentId,
+                Title = "Teacher accepted your lesson request",
+                Body = "Your teacher agreed to the time. The academy will confirm it on your schedule.",
+                Kind = "request",
+                Link = "/schedule",
+                DedupeKey = $"request-teacher-accepted:{request.Id}",
+            });
+            await db.SaveChangesAsync();
             return Results.Ok(await RequestById(db, id));
         });
         teacher.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RejectRequest? input = null) =>
@@ -735,6 +745,15 @@ public static class ApiEndpoints
             var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
             request.Status = "rejected"; request.RejectionReason = input?.Reason; request.TeacherRespondedAt = DateTimeOffset.UtcNow; request.AvailabilitySlot!.Status = "available";
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = request.StudentId,
+                Title = "Lesson request declined",
+                Body = input?.Reason ?? "Your teacher could not take this time. Pick another weekly slot to keep learning.",
+                Kind = "request",
+                Link = "/book",
+                DedupeKey = $"request-teacher-declined:{request.Id}",
+            });
             await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
         });
 
@@ -827,6 +846,35 @@ public static class ApiEndpoints
                 .Where(x => seriesIds.Contains(x.Id)).ToListAsync();
             var savedLessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review)
                 .Where(x => lessonIds.Contains(x.Id)).OrderBy(x => x.StartsAt).ToListAsync();
+
+            // The teacher must hear about a new booking right away: the slot is
+            // already theirs, so the notice is the first sign on their schedule.
+            var studentName = savedSeries[0].Student?.FullName ?? "A student";
+            var teacherName = savedSeries[0].Teacher?.FullName ?? "your teacher";
+            var bookingKey = $"booking:{savedSeries[0].Id}";
+            var timeWord = savedSeries.Count == 1 ? "weekly time" : "weekly times";
+            db.Notifications.AddRange(
+                new AppNotification
+                {
+                    UserId = teacherId,
+                    Title = "New weekly booking",
+                    Body = $"{studentName} booked {savedSeries.Count} {timeWord} with you. The first lesson is on the way.",
+                    Kind = "booking",
+                    Link = "/schedule",
+                    DedupeKey = bookingKey,
+                },
+                new AppNotification
+                {
+                    UserId = studentId,
+                    Title = "Weekly lessons booked",
+                    Body = $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. Open your schedule to see the first lesson.",
+                    Kind = "booking",
+                    Link = "/schedule",
+                    DedupeKey = $"{bookingKey}:student",
+                });
+            try { await db.SaveChangesAsync(); }
+            catch (DbUpdateException) { /* The booking is already saved; a repeated notice is harmless. */ }
+
             return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
         }).RequireAuthorization("StudentOnly");
         api.MapGet("/student/series", async (ClaimsPrincipal p, AcademyDbContext db) =>
@@ -891,6 +939,16 @@ public static class ApiEndpoints
             else if (!assignment.IsActive) assignment.IsActive = true;
             var request = new LessonRequest { TeacherId = slot.TeacherId, StudentId = studentId, AvailabilitySlotId = slot.Id, Status = "pending_teacher" };
             db.LessonRequests.Add(request);
+            var requesterName = await db.Users.Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A student";
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = slot.TeacherId,
+                Title = "New lesson request",
+                Body = $"{requesterName} requested a lesson time with you. Open your requests to respond.",
+                Kind = "request",
+                Link = "/requests",
+                DedupeKey = $"request:{request.Id}",
+            });
             try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
             catch (DbUpdateException) { await tx.RollbackAsync(); await db.AvailabilitySlots.Where(x => x.Id == slot.Id && x.Status == "requested").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "available")); return Results.Conflict(new { message = "A request is already active or the slot was claimed." }); }
             return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
@@ -937,13 +995,33 @@ public static class ApiEndpoints
         {
             var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
-            request.Status = "pending_admin"; await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+            request.Status = "pending_admin";
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = request.TeacherId,
+                Title = "Student confirmed your proposed time",
+                Body = "The lesson is now waiting for academy approval.",
+                Kind = "request",
+                Link = "/schedule",
+                DedupeKey = $"request-student-accepted:{request.Id}",
+            });
+            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
         }).RequireAuthorization("StudentOnly");
         api.MapPost("/student/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var request = await db.LessonRequests.Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
-            request.Status = "rejected"; request.StudentAvailability!.Status = "available"; await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+            request.Status = "rejected"; request.StudentAvailability!.Status = "available";
+            db.Notifications.Add(new AppNotification
+            {
+                UserId = request.TeacherId,
+                Title = "Student declined the proposed time",
+                Body = "The time is open again. Choose another preferred time from the student.",
+                Kind = "request",
+                Link = "/schedule",
+                DedupeKey = $"request-student-declined:{request.Id}",
+            });
+            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
         }).RequireAuthorization("StudentOnly");
 
         api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db) =>
@@ -1052,6 +1130,7 @@ public static class ApiEndpoints
             if (errors.Count > 0) return Results.ValidationProblem(errors);
 
             var report = lesson.Report;
+            var firstReport = report is null;
             if (report is null)
             {
                 report = new LessonReport { LessonId = lesson.Id, TeacherId = lesson.TeacherId, StudentId = lesson.StudentId };
@@ -1066,6 +1145,16 @@ public static class ApiEndpoints
                 lesson.Status = "completed";
                 lesson.ActualEndedAt ??= lesson.EndsAt;
             }
+            if (firstReport)
+                db.Notifications.Add(new AppNotification
+                {
+                    UserId = lesson.StudentId,
+                    Title = "New lesson report",
+                    Body = $"{lesson.Teacher?.FullName ?? "Your teacher"} shared feedback from your lesson.",
+                    Kind = "report",
+                    Link = $"/lesson/{lesson.Id}",
+                    DedupeKey = $"report-student:{lesson.Id}",
+                });
             await db.SaveChangesAsync();
             return Results.Ok(ToReport(report, lesson));
         }).RequireAuthorization("TeacherOnly");
@@ -1092,6 +1181,7 @@ public static class ApiEndpoints
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["comment"] = ["Keep the review under 2000 characters."] });
 
             var review = lesson.Review;
+            var firstReview = review is null;
             if (review is null)
             {
                 review = new TeacherReview { LessonId = lesson.Id, TeacherId = lesson.TeacherId, StudentId = lesson.StudentId };
@@ -1100,6 +1190,16 @@ public static class ApiEndpoints
             review.Rating = input.Rating;
             review.Comment = comment.Length == 0 ? null : comment;
             review.UpdatedAt = DateTimeOffset.UtcNow;
+            if (firstReview)
+                db.Notifications.Add(new AppNotification
+                {
+                    UserId = lesson.TeacherId,
+                    Title = "New student review",
+                    Body = $"{PublicStudentName(lesson.Student?.FullName)} rated your lesson {input.Rating} out of 5.",
+                    Kind = "lesson",
+                    Link = $"/lesson/{lesson.Id}",
+                    DedupeKey = $"review-teacher:{lesson.Id}",
+                });
             await db.SaveChangesAsync();
             return Results.Ok(ToReview(review, lesson));
         }).RequireAuthorization("StudentOnly");
@@ -1145,6 +1245,29 @@ public static class ApiEndpoints
         if (claimed == 0) return Results.Conflict(new { message = "The availability slot is no longer held by this request." });
         request.Status = "approved"; request.AdminRespondedAt = DateTimeOffset.UtcNow;
         db.Lessons.Add(new Lesson { TeacherId = request.TeacherId, StudentId = request.StudentId, LessonRequestId = request.Id, StartsAt = startsAt, EndsAt = endsAt });
+        var people = await db.Users.Where(x => x.Id == request.TeacherId || x.Id == request.StudentId)
+            .Select(x => new { x.Id, x.FullName }).ToListAsync();
+        var teacherName = people.FirstOrDefault(x => x.Id == request.TeacherId)?.FullName ?? "your teacher";
+        var studentName = people.FirstOrDefault(x => x.Id == request.StudentId)?.FullName ?? "your student";
+        db.Notifications.AddRange(
+            new AppNotification
+            {
+                UserId = request.StudentId,
+                Title = "Lesson confirmed",
+                Body = $"Your lesson with {teacherName} is confirmed. Open your schedule for the time.",
+                Kind = "lesson",
+                Link = "/schedule",
+                DedupeKey = $"request-approved:{request.Id}:student",
+            },
+            new AppNotification
+            {
+                UserId = request.TeacherId,
+                Title = "New lesson confirmed",
+                Body = $"{studentName} is confirmed. Open your schedule for the time.",
+                Kind = "lesson",
+                Link = "/schedule",
+                DedupeKey = $"request-approved:{request.Id}:teacher",
+            });
         try
         {
             await db.SaveChangesAsync();
@@ -1170,6 +1293,25 @@ public static class ApiEndpoints
         request.Status = "rejected"; request.RejectionReason = reason; request.AdminRespondedAt = DateTimeOffset.UtcNow;
         if (request.AvailabilitySlot is not null) request.AvailabilitySlot.Status = "available";
         if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
+        db.Notifications.AddRange(
+            new AppNotification
+            {
+                UserId = request.StudentId,
+                Title = "Lesson request could not be confirmed",
+                Body = reason ?? "The academy could not confirm this time. Book another weekly slot or message us.",
+                Kind = "request",
+                Link = "/book",
+                DedupeKey = $"request-rejected:{request.Id}:student",
+            },
+            new AppNotification
+            {
+                UserId = request.TeacherId,
+                Title = "Lesson request could not be confirmed",
+                Body = reason ?? "The academy could not confirm this lesson time.",
+                Kind = "request",
+                Link = "/schedule",
+                DedupeKey = $"request-rejected:{request.Id}:teacher",
+            });
         await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
     }
 
@@ -1354,6 +1496,25 @@ public static class ApiEndpoints
             series.TimeZoneId = rule.TimeZoneId;
             request.Status = "approved";
             request.AdminRespondedAt = now;
+            db.Notifications.AddRange(
+                new AppNotification
+                {
+                    UserId = series.StudentId,
+                    Title = "Weekly time changed",
+                    Body = $"Your weekly time with {request.Teacher?.FullName ?? "your teacher"} has moved. The new time is now on your schedule.",
+                    Kind = "request",
+                    Link = "/schedule",
+                    DedupeKey = $"change-approved:{request.Id}:student",
+                },
+                new AppNotification
+                {
+                    UserId = series.TeacherId,
+                    Title = "Weekly time changed",
+                    Body = $"{request.Student?.FullName ?? "Your student"}'s weekly time has moved. Check your schedule for the new slot.",
+                    Kind = "request",
+                    Link = "/schedule",
+                    DedupeKey = $"change-approved:{request.Id}:teacher",
+                });
             await db.SaveChangesAsync();
             await BuildSeriesLessonsAsync(db, series, now);
             await db.SaveChangesAsync();
@@ -1375,6 +1536,15 @@ public static class ApiEndpoints
         request.Status = "rejected";
         request.AdminNote = note?.Trim();
         request.AdminRespondedAt = DateTimeOffset.UtcNow;
+        db.Notifications.Add(new AppNotification
+        {
+            UserId = request.StudentId,
+            Title = "Weekly time change declined",
+            Body = note?.Trim() ?? "The academy kept your current weekly time. Message us if you need another slot.",
+            Kind = "request",
+            Link = "/schedule",
+            DedupeKey = $"change-rejected:{request.Id}:student",
+        });
         await db.SaveChangesAsync();
         return Results.Ok(ToChangeRequest(request));
     }

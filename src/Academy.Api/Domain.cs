@@ -299,6 +299,28 @@ public sealed class MonthlyPaymentClaim
     public Guid? ReviewedBy { get; set; }
 }
 
+/// <summary>
+/// An in-app notification for one account. Events are written as they happen
+/// (bookings, confirmations) and lesson-time reminders are materialized when the
+/// account polls, so the bell is accurate even if the app was closed at the time.
+/// </summary>
+public sealed class AppNotification
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public AcademyUser? User { get; set; }
+    [MaxLength(160)] public string Title { get; set; } = "";
+    [MaxLength(500)] public string Body { get; set; } = "";
+    // booking | lesson | request | report | payment | system
+    [MaxLength(30)] public string Kind { get; set; } = "system";
+    /// <summary>App-relative destination, e.g. /lesson/{id} or /schedule.</summary>
+    [MaxLength(200)] public string? Link { get; set; }
+    /// <summary>Stable event key so retries and polling cannot duplicate a notice.</summary>
+    [MaxLength(160)] public string? DedupeKey { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ReadAt { get; set; }
+}
+
 public sealed class ContactSubmission
 {
     public Guid Id { get; set; } = Guid.NewGuid();

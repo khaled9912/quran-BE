@@ -56,6 +56,9 @@ public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<Weekl
 public sealed record LessonChangeRequestDto(Guid Id, Guid SeriesId, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int CurrentDayOfWeek, string CurrentStartsAtTime, string CurrentEndsAtTime, int RequestedDayOfWeek, string RequestedStartsAtTime, string RequestedEndsAtTime, string TimeZoneId, string Status, string? StudentNote, string? AdminNote, DateTimeOffset CreatedAt, DateTimeOffset? AdminRespondedAt);
 public sealed record TeacherApplicationDto(Guid Id, string FullName, string Email, string PhoneNumber, IReadOnlyList<string> Subjects, string EnglishLevel, int ExperienceYears, string Bio, string AvailabilityNote, string Status, string? RejectionReason, DateTimeOffset CreatedAt, DateTimeOffset? ReviewedAt, Guid? TeacherId, string? CvFileName, string? IntroFileName, string? QuranRecordingFileName);
 
+public sealed record NotificationDto(Guid Id, string Title, string Body, string Kind, string? Link, DateTimeOffset CreatedAt, DateTimeOffset? ReadAt);
+public sealed record NotificationsDto(IReadOnlyList<NotificationDto> Items, int Unread);
+
 public sealed record AcademyBankAccountDto(int Id, string BankName, string AccountHolder, string AccountNumber, string Iban, string Swift, string Notes, DateTimeOffset UpdatedAt);
 public sealed record UpdateAcademyBankAccountRequest(string? BankName, string? AccountHolder, string? AccountNumber, string? Iban, string? Swift, string? Notes);
 public sealed record TeacherBillingRateDto(Guid TeacherId, string TeacherName, string TeacherEmail, decimal StudentPriceUsd, decimal PayoutEgp);
