@@ -943,6 +943,63 @@ public static class ApiEndpoints
                 .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
             return Results.Ok(list.Select(ToSeries));
         }).RequireAuthorization("StudentOnly");
+        api.MapDelete("/student/series/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var studentId = UserId(p);
+            var series = await db.LessonSeries.Include(x => x.Student).Include(x => x.Teacher)
+                .FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId && x.IsActive);
+            if (series is null) return Results.NotFound();
+            var now = DateTimeOffset.UtcNow;
+
+            await using var tx = await db.Database.BeginTransactionAsync();
+            series.IsActive = false;
+
+            // A series has no end date, so future lessons are already materialized
+            // on the schedule. Ending the weekly time means releasing them.
+            var futureLessons = await db.Lessons
+                .Where(x => x.SeriesId == series.Id && x.Status == "scheduled" && x.StartsAt > now).ToListAsync();
+            foreach (var lesson in futureLessons)
+            {
+                lesson.Status = "cancelled";
+                lesson.CancellationOutcome = "series_ended";
+                lesson.CancelReason = "The student ended this weekly time.";
+                lesson.CancelledById = studentId;
+                lesson.CancelledAt = now;
+            }
+
+            var pendingRequests = await db.LessonChangeRequests
+                .Where(x => x.SeriesId == series.Id && x.Status == "pending").ToListAsync();
+            foreach (var request in pendingRequests)
+            {
+                request.Status = "rejected";
+                request.AdminNote = "The student ended this weekly time, so the change is no longer needed.";
+                request.AdminRespondedAt = now;
+            }
+
+            var keepsTeacher = await db.LessonSeries.AnyAsync(x =>
+                x.StudentId == studentId && x.TeacherId == series.TeacherId && x.IsActive && x.Id != series.Id);
+            if (!keepsTeacher)
+                await db.Assignments.Where(x => x.StudentId == studentId && x.TeacherId == series.TeacherId && x.IsActive)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+
+            var studentName = series.Student?.FullName ?? "A student";
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                series.TeacherId,
+                "Weekly lessons ended",
+                $"{studentName} ended the weekly lessons with you. The time is now open for other students to book.",
+                "booking",
+                "/schedule",
+                $"series-ended:{series.Id}"));
+
+            try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
+            catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "Unable to end this weekly time. Please try again." }); }
+
+            await realtime.ToParticipantsAsync(series.TeacherId, studentId, RealtimeScopes.Lessons);
+            await realtime.ToUsersAsync([series.TeacherId, studentId], RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            return Results.NoContent();
+        }).RequireAuthorization("StudentOnly");
         api.MapGet("/student/change-requests", async (ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var studentId = UserId(p);
@@ -977,8 +1034,19 @@ public static class ApiEndpoints
             try { await db.SaveChangesAsync(); }
             catch (DbUpdateException) { return Results.Conflict(new { message = "You already have a pending time-change request for this slot." }); }
             var saved = await ChangeRequestsWithDetails(db).FirstAsync(x => x.Id == request.Id);
+            var studentName = await db.Users.Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A student";
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                series.TeacherId,
+                "Time change requested",
+                $"{studentName} asked to move a weekly lesson. The academy will confirm the new time with you.",
+                "request",
+                "/schedule",
+                $"change-request:{request.Id}"));
+            try { await db.SaveChangesAsync(); }
+            catch (DbUpdateException) { /* The request is saved; a repeated notice is harmless. */ }
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
             await realtime.ToUserAsync(series.TeacherId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(series.TeacherId, RealtimeScopes.Notifications);
             return Results.Created($"/api/student/change-requests/{request.Id}", ToChangeRequest(saved));
         }).RequireAuthorization("StudentOnly");
         api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>

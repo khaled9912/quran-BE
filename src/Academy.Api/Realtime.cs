@@ -21,6 +21,8 @@ public static class RealtimeGroups
     public const string Users = "users";
     public const string Staff = "staff";
     public static string User(Guid userId) => $"user:{userId}";
+    /// <summary>Ink is only shared with the people already inside that lesson.</summary>
+    public static string LessonPen(Guid lessonId) => $"lesson-pen:{lessonId}";
 }
 
 public static class RealtimeTicketDefaults

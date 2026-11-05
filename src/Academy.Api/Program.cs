@@ -162,6 +162,7 @@ builder.Services.AddHostedService<LessonOpsMonitor>();
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<RealtimeTicketService>();
 builder.Services.AddSingleton<RealtimeNotifier>();
+builder.Services.AddSingleton<LessonPenBoard>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 

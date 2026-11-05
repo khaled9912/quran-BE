@@ -73,8 +73,8 @@ public sealed class LessonSeries
 
 /// <summary>
 /// A student's request to move their recurring series to another weekly slot.
-/// Only admins see these; the teacher learns the new time after approval, so
-/// the admin can coordinate with them directly first.
+/// Admins see the full request; the teacher is notified that a change is being
+/// reviewed but only learns the new time after the admin confirms it.
 /// </summary>
 public sealed class LessonChangeRequest
 {
