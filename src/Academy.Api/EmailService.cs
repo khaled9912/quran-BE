@@ -78,6 +78,17 @@ public sealed class AcademyEmailSender(IConfiguration configuration, ILogger<Aca
             cancellationToken);
     }
 
+    /// <summary>Plain transactional notice used by lesson operations.</summary>
+    public async Task<bool> SendNoticeAsync(string email, string subject, string body, CancellationToken cancellationToken)
+    {
+        if (!IsConfigured)
+        {
+            logger.LogWarning("Email is not configured; notice for {Email} was not sent.", MaskEmail(email));
+            return false;
+        }
+        return await SendAsync(email, subject, body, null, cancellationToken);
+    }
+
     private async Task<bool> SendAsync(string to, string subject, string body, string? replyTo, CancellationToken cancellationToken)
     {
         try

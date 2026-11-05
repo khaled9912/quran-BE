@@ -49,7 +49,7 @@ public sealed record LessonRequestDto(Guid Id, Guid TeacherId, string TeacherNam
 public sealed record LessonReportDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, DateTimeOffset EndsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, string ClassSummary, string StudentFeedback, string Progress, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record TeacherReviewDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int Rating, string? Comment, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record PublicTeacherDto(Guid Id, string FullName, string? AvatarUrl, double? AverageRating, int ReviewCount, IReadOnlyList<TeacherReviewDto> Reviews);
-public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review, Guid? SeriesId = null, bool IsTrial = false);
+public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review, Guid? SeriesId = null, bool IsTrial = false, string? CancellationOutcome = null, string? CancelReason = null, DateTimeOffset? CancelledAt = null, Guid? CancelledById = null, bool IsMakeup = false, Guid? OriginalLessonId = null);
 public sealed record WeeklyRuleDto(Guid Id, Guid TeacherId, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, string Status);
 public sealed record LessonSeriesDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, bool IsActive, DateTimeOffset CreatedAt);
 public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<WeeklyRuleDto> Slots, IReadOnlyList<LessonSeriesDto> Series, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null, bool HasLessons = false);
@@ -74,3 +74,309 @@ public sealed record AdminTeacherPayoutDto(Guid TeacherId, string TeacherName, s
 public sealed record AdminBillingOverviewDto(AcademyBankAccountDto? BankAccount, IReadOnlyList<TeacherBillingRateDto> Rates, IReadOnlyList<MonthlyPaymentClaimDto> Claims, IReadOnlyList<AdminTeacherPayoutDto> TeacherPayouts, string Month);
 public sealed record CreatePaymentClaimRequest(string? Month, string? Note);
 public sealed record ReviewPaymentClaimRequest(string? Note);
+
+// Lesson operations: cancellation, rescheduling, attendance, hours, reliability.
+public sealed record AcademyPolicyDto(
+    int StudentFreeCancelHours,
+    int TeacherFreeCancelHours,
+    int NoShowGraceMinutes,
+    int RescheduleResponseHours,
+    int StudentGraceCancellationsPerMonth,
+    int StudentWarningStrikeThreshold,
+    int StudentAdminReviewStrikeThreshold,
+    int TeacherAdminReviewStrikeThreshold,
+    int TrialNoShowThreshold,
+    bool PayScheduledDurationWhenAttended,
+    DateTimeOffset UpdatedAt);
+
+public sealed record UpdateAcademyPolicyRequest(
+    int? StudentFreeCancelHours,
+    int? TeacherFreeCancelHours,
+    int? NoShowGraceMinutes,
+    int? RescheduleResponseHours,
+    int? StudentGraceCancellationsPerMonth,
+    int? StudentWarningStrikeThreshold,
+    int? StudentAdminReviewStrikeThreshold,
+    int? TeacherAdminReviewStrikeThreshold,
+    int? TrialNoShowThreshold,
+    bool? PayScheduledDurationWhenAttended);
+
+public sealed record CancellationPreviewDto(
+    bool Allowed,
+    string? BlockedReason,
+    string ActorRole,
+    string Outcome,
+    bool IsLate,
+    bool UsedGrace,
+    int GraceUsedThisMonth,
+    int GraceLimit,
+    double HoursBefore,
+    int ScheduledMinutes,
+    int TeacherPayableMinutes,
+    int CreditChange,
+    // none | deduct | restore
+    string CreditEffect,
+    string? ReliabilityEvent,
+    bool RequiresAdminReview,
+    string Explanation,
+    string? ExistingOutcome,
+    AcademyPolicyDto Policy);
+
+public sealed record CancelLessonRequest(string? Reason);
+
+public sealed record LessonCancellationDto(
+    Guid Id,
+    Guid LessonId,
+    string ActorRole,
+    string Outcome,
+    bool IsLate,
+    bool UsedGrace,
+    double HoursBefore,
+    int TeacherPayableMinutes,
+    string? Reason,
+    DateTimeOffset CreatedAt);
+
+public sealed record CreateRescheduleRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Note);
+public sealed record RespondRescheduleRequest(string? Note);
+
+public sealed record RescheduleRequestDto(
+    Guid Id,
+    Guid LessonId,
+    Guid RequestedById,
+    string RequestedByName,
+    string RequestedByRole,
+    DateTimeOffset ProposedStartsAt,
+    DateTimeOffset ProposedEndsAt,
+    string? Note,
+    string Status,
+    DateTimeOffset ExpiresAt,
+    Guid? RespondedById,
+    DateTimeOffset? RespondedAt,
+    string? ResponseNote,
+    DateTimeOffset CreatedAt,
+    int MinutesRemaining);
+
+public sealed record CreateReplacementRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Note);
+
+public sealed record AttendanceBeatRequest(string? DeviceId, string? EventId, string Action, DateTimeOffset? ClientAt);
+
+public sealed record AttendanceParticipantDto(
+    Guid UserId,
+    string Name,
+    string Role,
+    string Status,
+    DateTimeOffset? FirstJoinedAt,
+    DateTimeOffset? LastLeftAt,
+    int TotalSeconds,
+    int ReconnectionCount,
+    bool JoinedLate,
+    bool LeftEarly);
+
+public sealed record AttendanceIntervalDto(
+    Guid Id,
+    string DeviceId,
+    DateTimeOffset JoinedAt,
+    DateTimeOffset? LeftAt,
+    int Seconds);
+
+public sealed record AttendanceSummaryDto(
+    Guid LessonId,
+    string LessonStatus,
+    DateTimeOffset StartsAt,
+    DateTimeOffset EndsAt,
+    DateTimeOffset ServerNow,
+    IReadOnlyList<AttendanceParticipantDto> Participants);
+
+public sealed record AttendanceBeatResultDto(
+    bool Accepted,
+    string ParticipantStatus,
+    int TotalSeconds,
+    DateTimeOffset ServerAt,
+    AttendanceSummaryDto Summary);
+
+public sealed record CreateExcuseRequest(string? Category, string? Explanation);
+public sealed record ExcuseReviewRequest(string? Note);
+
+public sealed record ExcuseRequestDto(
+    Guid Id,
+    Guid LessonId,
+    Guid StudentId,
+    string StudentName,
+    DateTimeOffset StartsAt,
+    string Category,
+    string Explanation,
+    string Status,
+    string? AdminNote,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ReviewedAt);
+
+public sealed record ResolveIncidentRequest(string Action, string? Note, int? TeacherPayableMinutes);
+public sealed record ReportIncidentRequest(string? Type, string? Detail);
+
+public sealed record LessonIncidentDto(
+    Guid Id,
+    Guid LessonId,
+    DateTimeOffset StartsAt,
+    Guid TeacherId,
+    string TeacherName,
+    Guid StudentId,
+    string StudentName,
+    string Type,
+    string Status,
+    string Detail,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ResolvedAt,
+    string? ResolutionNote);
+
+public sealed record TeacherHoursDto(
+    Guid Id,
+    Guid LessonId,
+    Guid TeacherId,
+    string TeacherName,
+    Guid StudentId,
+    string StudentName,
+    DateTimeOffset StartsAt,
+    DateTimeOffset EndsAt,
+    string LessonStatus,
+    int ScheduledMinutes,
+    int ActualAttendanceMinutes,
+    int ProposedPayableMinutes,
+    int? ApprovedPayableMinutes,
+    string ApprovalStatus,
+    string? AdjustmentReason,
+    DateTimeOffset? ApprovedAt);
+
+public sealed record ApproveTeacherHoursRequest(int? ApprovedMinutes, string? Note);
+
+public sealed record CreateTeacherPenaltyRequest(Guid TeacherId, Guid? LessonId, string? EventType, decimal AmountEgp, string Reason);
+public sealed record ReviewTeacherPenaltyRequest(string Status, string? Note);
+
+public sealed record TeacherPenaltyDto(
+    Guid Id,
+    Guid TeacherId,
+    string TeacherName,
+    Guid? LessonId,
+    string EventType,
+    decimal AmountEgp,
+    string Reason,
+    string Status,
+    string? AdminNote,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ReviewedAt);
+
+public sealed record ReliabilityEventDto(
+    Guid Id,
+    Guid UserId,
+    string UserName,
+    string Role,
+    Guid? LessonId,
+    string Type,
+    string? Notes,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? ResolvedAt,
+    string? ResolutionNote,
+    string? ResolutionAction);
+
+public sealed record ResolveReliabilityRequest(string? Note, string? Action);
+
+public sealed record LessonCreditTransactionDto(
+    Guid Id,
+    Guid StudentId,
+    Guid? LessonId,
+    string Type,
+    int Amount,
+    string Reason,
+    string CreatedByRole,
+    DateTimeOffset CreatedAt);
+
+public sealed record StudentCreditDto(Guid StudentId, int Balance, IReadOnlyList<LessonCreditTransactionDto> Transactions);
+
+public sealed record AdjustCreditRequest(int Amount, string Reason);
+
+public sealed record SalaryPeriodDto(
+    Guid Id,
+    Guid TeacherId,
+    string TeacherName,
+    string Month,
+    string Status,
+    int TotalScheduledMinutes,
+    int TotalActualMinutes,
+    int TotalProposedMinutes,
+    int TotalApprovedMinutes,
+    decimal ApprovedPenaltyEgp,
+    decimal PendingPenaltyEgp,
+    int CompletedLessons,
+    int StudentLateCancellations,
+    int TeacherCancellations,
+    int TeacherNoShows,
+    int StudentNoShows,
+    decimal ManualAdjustmentEgp,
+    decimal? FinalAmountEgp,
+    string? Notes,
+    DateTimeOffset? ReviewedAt,
+    DateTimeOffset? PaidAt);
+
+public sealed record GenerateSalaryPeriodsRequest(string? Month);
+public sealed record UpdateSalaryPeriodRequest(decimal? ManualAdjustmentEgp, decimal? FinalAmountEgp, string? Notes, string? Status);
+
+public sealed record RegisterDeviceTokenRequest(string? Token, string? Platform);
+
+public sealed record LessonOperationsDto(
+    Guid LessonId,
+    CancellationPreviewDto Cancellation,
+    LessonCancellationDto? CancellationRecord,
+    RescheduleRequestDto? PendingReschedule,
+    IReadOnlyList<RescheduleRequestDto> RescheduleHistory,
+    AttendanceSummaryDto Attendance,
+    TeacherHoursDto? Hours,
+    ExcuseRequestDto? Excuse,
+    LessonIncidentDto? Incident,
+    LessonDto? ReplacementLesson,
+    LessonDto? OriginalLesson);
+
+public sealed record LessonOpsSummaryDto(
+    int Lessons,
+    int LiveNow,
+    int Upcoming,
+    int PendingReports,
+    int MissingAttendance,
+    int PendingReschedules,
+    int PendingExcuses,
+    int NoShowIncidents,
+    int PendingHours);
+
+public sealed record LessonOpsLessonDto(
+    LessonDto Lesson,
+    AttendanceSummaryDto Attendance,
+    string? CancellationOutcome,
+    RescheduleRequestDto? PendingReschedule,
+    TeacherHoursDto? Hours,
+    IReadOnlyList<LessonIncidentDto> Incidents,
+    bool ReportDue);
+
+public sealed record AdminLessonOpsDto(
+    string Date,
+    LessonOpsSummaryDto Summary,
+    IReadOnlyList<LessonOpsLessonDto> Lessons);
+
+public sealed record AdminLessonOpsDetailDto(
+    LessonDto Lesson,
+    AttendanceSummaryDto Attendance,
+    IReadOnlyList<AttendanceIntervalDto> Intervals,
+    LessonCancellationDto? Cancellation,
+    IReadOnlyList<RescheduleRequestDto> RescheduleRequests,
+    TeacherHoursDto? Hours,
+    IReadOnlyList<LessonIncidentDto> Incidents,
+    ExcuseRequestDto? Excuse,
+    IReadOnlyList<LessonCreditTransactionDto> Credits,
+    IReadOnlyList<LessonScheduleChangeDto> ScheduleChanges);
+
+public sealed record LessonScheduleChangeDto(
+    Guid Id,
+    DateTimeOffset FromStartsAt,
+    DateTimeOffset FromEndsAt,
+    DateTimeOffset ToStartsAt,
+    DateTimeOffset ToEndsAt,
+    Guid? ChangedById,
+    string? Reason,
+    DateTimeOffset CreatedAt);

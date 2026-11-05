@@ -144,6 +144,15 @@ public sealed class Lesson
     public DateTimeOffset? ActualStartedAt { get; set; }
     public DateTimeOffset? ActualEndedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    // Cancellation detail lives beside Status so the existing cancelled value
+    // and every client that checks for it keep working.
+    [MaxLength(40)] public string? CancellationOutcome { get; set; }
+    [MaxLength(1000)] public string? CancelReason { get; set; }
+    public Guid? CancelledById { get; set; }
+    public DateTimeOffset? CancelledAt { get; set; }
+    /// <summary>A make-up lesson that fulfils an earlier cancelled lesson.</summary>
+    public bool IsMakeup { get; set; }
+    public Guid? OriginalLessonId { get; set; }
     public LessonReport? Report { get; set; }
     public TeacherReview? Review { get; set; }
 }

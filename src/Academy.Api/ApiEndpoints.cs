@@ -50,7 +50,7 @@ public static class ApiEndpoints
     private static TeacherReviewDto ToReview(TeacherReview r) => r.Lesson is null
         ? new(r.Id, r.LessonId, default, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, PublicStudentName(r.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt)
         : ToReview(r, r.Lesson);
-    private static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l), l.SeriesId, l.IsTrial);
+    internal static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l), l.SeriesId, l.IsTrial, l.CancellationOutcome, l.CancelReason, l.CancelledAt, l.CancelledById, l.IsMakeup, l.OriginalLessonId);
     private static async Task<(double? Average, int Count)> TeacherRatingAsync(AcademyDbContext db, Guid teacherId)
     {
         var count = await db.TeacherReviews.CountAsync(x => x.TeacherId == teacherId);
@@ -1081,28 +1081,57 @@ public static class ApiEndpoints
 
         api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
         {
+            // Direct time edits are an academy override. Teachers and students
+            // move lessons through the accept/decline reschedule workflow.
+            if (!IsAdmin(p)) return Results.Forbid();
             var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);
             if (lesson is null) return Results.NotFound();
-            if (HasRole(p, "teacher") && lesson.TeacherId != UserId(p) || HasRole(p, "student") && lesson.StudentId != UserId(p)) return Results.Forbid();
+            if (input.Status == "cancelled")
+                return Results.Conflict(new { message = "Use the cancellation endpoint so the policy and notifications are applied." });
+            if (input.Status == "completed")
+                return Results.Conflict(new { message = "The teacher completes a lesson by submitting its report." });
             var startsAt = input.StartsAt ?? lesson.StartsAt;
             var endsAt = input.EndsAt ?? lesson.EndsAt;
             if (endsAt <= startsAt) return Results.BadRequest(new { message = "The lesson must end after it starts." });
-            if (input.Status is not null && input.Status is not ("scheduled" or "in_progress" or "completed" or "cancelled")) return Results.BadRequest(new { message = "Unknown lesson status." });
-            var conflict = await db.Lessons.AnyAsync(x => x.Id != id && x.Status == "scheduled" && x.StartsAt < endsAt && x.EndsAt > startsAt && (x.TeacherId == lesson.TeacherId || x.StudentId == lesson.StudentId));
+            if (input.Status is not null && input.Status is not ("scheduled" or "in_progress")) return Results.BadRequest(new { message = "Unknown lesson status." });
+            var conflict = await db.Lessons.AnyAsync(x => x.Id != id && x.Status != "cancelled" && x.StartsAt < endsAt && x.EndsAt > startsAt && (x.TeacherId == lesson.TeacherId || x.StudentId == lesson.StudentId));
             if (conflict) return Results.Conflict(new { message = "A teacher or student already has a lesson at this time." });
+            var moved = startsAt != lesson.StartsAt || endsAt != lesson.EndsAt;
+            var previousStarts = lesson.StartsAt;
+            if (moved)
+            {
+                db.LessonScheduleChanges.Add(new LessonScheduleChange
+                {
+                    LessonId = lesson.Id,
+                    FromStartsAt = lesson.StartsAt,
+                    FromEndsAt = lesson.EndsAt,
+                    ToStartsAt = startsAt,
+                    ToEndsAt = endsAt,
+                    ChangedById = UserId(p),
+                    Reason = "Academy schedule override",
+                });
+                var pending = await db.LessonRescheduleRequests
+                    .Where(x => x.LessonId == id && x.Status == "pending").ToListAsync();
+                foreach (var item in pending) item.Status = "expired";
+                db.Notifications.AddRange(
+                    new AppNotification { UserId = lesson.TeacherId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {startsAt:ddd, MMM d 'at' h:mm tt}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" },
+                    new AppNotification { UserId = lesson.StudentId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {startsAt:ddd, MMM d 'at' h:mm tt}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" });
+            }
             lesson.StartsAt = startsAt; lesson.EndsAt = endsAt;
             if (input.Status is not null) lesson.Status = input.Status;
+            db.AuditLogs.Add(new AuditLog
+            {
+                ActorId = UserId(p),
+                Action = "lesson_updated",
+                EntityType = "Lesson",
+                EntityId = lesson.Id,
+                Detail = moved ? $"Academy moved lesson from {previousStarts:u}." : "Academy updated lesson status.",
+            });
             await db.SaveChangesAsync();
             return Results.Ok(ToLesson(lesson));
-        }).RequireAuthorization();
-        api.MapDelete("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
-        {
-            var lesson = await db.Lessons.FirstOrDefaultAsync(x => x.Id == id);
-            if (lesson is null) return Results.NotFound();
-            if (HasRole(p, "teacher") && lesson.TeacherId != UserId(p) || HasRole(p, "student") && lesson.StudentId != UserId(p)) return Results.Forbid();
-            if (lesson.Status != "cancelled") { lesson.Status = "cancelled"; await db.SaveChangesAsync(); }
-            return Results.NoContent();
-        }).RequireAuthorization();
+        }).RequireAuthorization("AdminOnly");
+        api.MapDelete("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
+            await LessonOperationsEndpoints.CancelAsync(id, null, p, db, email, push, ct)).RequireAuthorization();
 
         api.MapGet("/lessons/{id:guid}/report", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
         {
@@ -1145,6 +1174,11 @@ public static class ApiEndpoints
                 lesson.Status = "completed";
                 lesson.ActualEndedAt ??= lesson.EndsAt;
             }
+            // Submitting the report completes the lesson, so this is the point
+            // where attendance is closed and payable time becomes reviewable.
+            var policy = await LessonPolicyService.GetPolicyAsync(db);
+            await LessonPolicyService.CloseAttendanceAsync(db, lesson, DateTimeOffset.UtcNow, policy);
+            await LessonPolicyService.EnsureTeacherHoursAsync(db, lesson, policy, DateTimeOffset.UtcNow);
             if (firstReport)
                 db.Notifications.Add(new AppNotification
                 {

@@ -146,13 +146,16 @@ builder.Services.AddRateLimiter(options =>
 builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
 builder.Services.AddSingleton<AcademyEmailSender>();
+builder.Services.AddSingleton<AcademyPushSender>();
 builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
+builder.Services.AddHttpClient("expo", client => client.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
 if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
 else
     builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
 builder.Services.AddHealthChecks().AddDbContextCheck<AcademyDbContext>("database");
+builder.Services.AddHostedService<LessonOpsMonitor>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -195,6 +198,7 @@ if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "rayan-academy-api" }));
 app.MapHealthChecks("/health/ready");
 app.MapAcademyApi();
+app.MapLessonOperations();
 app.MapTeacherApplications();
 app.MapLessonReviews();
 app.MapPayments();
@@ -493,6 +497,302 @@ await using (var scope = app.Services.CreateAsyncScope())
         CREATE INDEX IF NOT EXISTS "IX_Notifications_UserId_CreatedAt" ON "Notifications" ("UserId", "CreatedAt");
         CREATE INDEX IF NOT EXISTS "IX_Notifications_UserId_ReadAt" ON "Notifications" ("UserId", "ReadAt");
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_Notifications_UserId_DedupeKey" ON "Notifications" ("UserId", "DedupeKey") WHERE "DedupeKey" IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS "AcademyPolicies" (
+            "Id" integer NOT NULL,
+            "StudentFreeCancelHours" integer NOT NULL DEFAULT 24,
+            "TeacherFreeCancelHours" integer NOT NULL DEFAULT 24,
+            "NoShowGraceMinutes" integer NOT NULL DEFAULT 10,
+            "RescheduleResponseHours" integer NOT NULL DEFAULT 12,
+            "StudentGraceCancellationsPerMonth" integer NOT NULL DEFAULT 1,
+            "StudentWarningStrikeThreshold" integer NOT NULL DEFAULT 3,
+            "StudentAdminReviewStrikeThreshold" integer NOT NULL DEFAULT 4,
+            "TeacherAdminReviewStrikeThreshold" integer NOT NULL DEFAULT 2,
+            "TrialNoShowThreshold" integer NOT NULL DEFAULT 2,
+            "PayScheduledDurationWhenAttended" boolean NOT NULL DEFAULT TRUE,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            "UpdatedBy" uuid,
+            CONSTRAINT "PK_AcademyPolicies" PRIMARY KEY ("Id")
+        );
+        INSERT INTO "AcademyPolicies" ("Id", "UpdatedAt") VALUES (1, now()) ON CONFLICT ("Id") DO NOTHING;
+
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancellationOutcome" character varying(40);
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancelReason" character varying(1000);
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancelledById" uuid;
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancelledAt" timestamp with time zone;
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "IsMakeup" boolean NOT NULL DEFAULT FALSE;
+        ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "OriginalLessonId" uuid;
+        CREATE INDEX IF NOT EXISTS "IX_Lessons_OriginalLessonId" ON "Lessons" ("OriginalLessonId");
+
+        CREATE TABLE IF NOT EXISTS "LessonCancellations" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "CancelledById" uuid,
+            "ActorRole" character varying(20) NOT NULL,
+            "Outcome" character varying(40) NOT NULL,
+            "IsLate" boolean NOT NULL,
+            "UsedGrace" boolean NOT NULL,
+            "HoursBefore" double precision NOT NULL,
+            "TeacherPayableMinutes" integer NOT NULL,
+            "Reason" character varying(1000),
+            "PolicySnapshot" character varying(2000) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonCancellations" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonCancellations_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonCancellations_LessonId" ON "LessonCancellations" ("LessonId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonCancellations_Outcome_CreatedAt" ON "LessonCancellations" ("Outcome", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonRescheduleRequests" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "RequestedById" uuid NOT NULL,
+            "RequestedByRole" character varying(20) NOT NULL,
+            "ProposedStartsAt" timestamp with time zone NOT NULL,
+            "ProposedEndsAt" timestamp with time zone NOT NULL,
+            "Note" character varying(1000),
+            "Status" character varying(20) NOT NULL,
+            "ExpiresAt" timestamp with time zone NOT NULL,
+            "RespondedById" uuid,
+            "RespondedAt" timestamp with time zone,
+            "ResponseNote" character varying(500),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonRescheduleRequests" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonRescheduleRequests_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonRescheduleRequests_LessonId" ON "LessonRescheduleRequests" ("LessonId") WHERE "Status" = 'pending';
+        CREATE INDEX IF NOT EXISTS "IX_LessonRescheduleRequests_Status_ExpiresAt" ON "LessonRescheduleRequests" ("Status", "ExpiresAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonScheduleChanges" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "FromStartsAt" timestamp with time zone NOT NULL,
+            "FromEndsAt" timestamp with time zone NOT NULL,
+            "ToStartsAt" timestamp with time zone NOT NULL,
+            "ToEndsAt" timestamp with time zone NOT NULL,
+            "ChangedById" uuid,
+            "Reason" character varying(500),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonScheduleChanges" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonScheduleChanges_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS "IX_LessonScheduleChanges_LessonId_CreatedAt" ON "LessonScheduleChanges" ("LessonId", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonAttendances" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "Role" character varying(20) NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "FirstJoinedAt" timestamp with time zone,
+            "LastLeftAt" timestamp with time zone,
+            "TotalSeconds" integer NOT NULL DEFAULT 0,
+            "ReconnectionCount" integer NOT NULL DEFAULT 0,
+            "JoinedLate" boolean NOT NULL DEFAULT FALSE,
+            "LeftEarly" boolean NOT NULL DEFAULT FALSE,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonAttendances" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonAttendances_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE,
+            CONSTRAINT "FK_LessonAttendances_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonAttendances_LessonId_UserId" ON "LessonAttendances" ("LessonId", "UserId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonAttendances_UserId_CreatedAt" ON "LessonAttendances" ("UserId", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonAttendanceEvents" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "DeviceId" character varying(120) NOT NULL DEFAULT '',
+            "EventId" character varying(80) NOT NULL,
+            "Action" character varying(10) NOT NULL,
+            "ClientAt" timestamp with time zone NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonAttendanceEvents" PRIMARY KEY ("Id")
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonAttendanceEvents_UserId_EventId" ON "LessonAttendanceEvents" ("UserId", "EventId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonAttendanceEvents_LessonId" ON "LessonAttendanceEvents" ("LessonId");
+
+        CREATE TABLE IF NOT EXISTS "LessonAttendanceIntervals" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "AttendanceId" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "DeviceId" character varying(120) NOT NULL DEFAULT '',
+            "JoinedAt" timestamp with time zone NOT NULL,
+            "LeftAt" timestamp with time zone,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonAttendanceIntervals" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonAttendanceIntervals_LessonAttendances_AttendanceId" FOREIGN KEY ("AttendanceId") REFERENCES "LessonAttendances" ("Id") ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS "IX_LessonAttendanceIntervals_LessonId" ON "LessonAttendanceIntervals" ("LessonId");
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonAttendanceIntervals_LessonId_UserId_DeviceId" ON "LessonAttendanceIntervals" ("LessonId", "UserId", "DeviceId") WHERE "LeftAt" IS NULL;
+
+        CREATE TABLE IF NOT EXISTS "LessonCreditTransactions" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "LessonId" uuid,
+            "Type" character varying(40) NOT NULL,
+            "Amount" integer NOT NULL,
+            "Reason" character varying(500) NOT NULL,
+            "CreatedBy" uuid,
+            "CreatedByRole" character varying(40) NOT NULL,
+            "RelatedTransactionId" uuid,
+            "DedupeKey" character varying(200),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonCreditTransactions" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonCreditTransactions_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT,
+            CONSTRAINT "FK_LessonCreditTransactions_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS "IX_LessonCreditTransactions_StudentId_CreatedAt" ON "LessonCreditTransactions" ("StudentId", "CreatedAt");
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonCreditTransactions_DedupeKey" ON "LessonCreditTransactions" ("DedupeKey") WHERE "DedupeKey" IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS "TeacherHours" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "ScheduledMinutes" integer NOT NULL,
+            "ActualAttendanceMinutes" integer NOT NULL DEFAULT 0,
+            "ProposedPayableMinutes" integer NOT NULL DEFAULT 0,
+            "ApprovedPayableMinutes" integer,
+            "ApprovalStatus" character varying(20) NOT NULL,
+            "ApprovedBy" uuid,
+            "ApprovedAt" timestamp with time zone,
+            "AdjustmentReason" character varying(500),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherHours" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_TeacherHours_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherHours_LessonId" ON "TeacherHours" ("LessonId");
+        CREATE INDEX IF NOT EXISTS "IX_TeacherHours_TeacherId_CreatedAt" ON "TeacherHours" ("TeacherId", "CreatedAt");
+        CREATE INDEX IF NOT EXISTS "IX_TeacherHours_ApprovalStatus" ON "TeacherHours" ("ApprovalStatus");
+
+        CREATE TABLE IF NOT EXISTS "TeacherPenalties" (
+            "Id" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "LessonId" uuid,
+            "EventType" character varying(60) NOT NULL,
+            "AmountEgp" numeric(10,2) NOT NULL,
+            "Reason" character varying(500) NOT NULL,
+            "Status" character varying(30) NOT NULL,
+            "ReviewedBy" uuid,
+            "ReviewedAt" timestamp with time zone,
+            "AdminNote" character varying(500),
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_TeacherPenalties" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_TeacherPenalties_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS "IX_TeacherPenalties_TeacherId_Status" ON "TeacherPenalties" ("TeacherId", "Status");
+
+        CREATE TABLE IF NOT EXISTS "ReliabilityEvents" (
+            "Id" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "Role" character varying(20) NOT NULL,
+            "LessonId" uuid,
+            "Type" character varying(50) NOT NULL,
+            "Notes" character varying(500),
+            "CreatedBy" uuid,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "ResolvedBy" uuid,
+            "ResolvedAt" timestamp with time zone,
+            "ResolutionNote" character varying(500),
+            "ResolutionAction" character varying(50),
+            CONSTRAINT "PK_ReliabilityEvents" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_ReliabilityEvents_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS "IX_ReliabilityEvents_UserId_CreatedAt" ON "ReliabilityEvents" ("UserId", "CreatedAt");
+        CREATE INDEX IF NOT EXISTS "IX_ReliabilityEvents_Role_Type_CreatedAt" ON "ReliabilityEvents" ("Role", "Type", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "SalaryPeriods" (
+            "Id" uuid NOT NULL,
+            "TeacherId" uuid NOT NULL,
+            "Month" character varying(7) NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "TotalScheduledMinutes" integer NOT NULL DEFAULT 0,
+            "TotalActualMinutes" integer NOT NULL DEFAULT 0,
+            "TotalProposedMinutes" integer NOT NULL DEFAULT 0,
+            "TotalApprovedMinutes" integer NOT NULL DEFAULT 0,
+            "ApprovedPenaltyEgp" numeric(10,2) NOT NULL DEFAULT 0,
+            "PendingPenaltyEgp" numeric(10,2) NOT NULL DEFAULT 0,
+            "CompletedLessons" integer NOT NULL DEFAULT 0,
+            "StudentLateCancellations" integer NOT NULL DEFAULT 0,
+            "TeacherCancellations" integer NOT NULL DEFAULT 0,
+            "TeacherNoShows" integer NOT NULL DEFAULT 0,
+            "StudentNoShows" integer NOT NULL DEFAULT 0,
+            "ManualAdjustmentEgp" numeric(10,2) NOT NULL DEFAULT 0,
+            "FinalAmountEgp" numeric(10,2),
+            "Notes" character varying(1000),
+            "ReviewedBy" uuid,
+            "ReviewedAt" timestamp with time zone,
+            "PaidAt" timestamp with time zone,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_SalaryPeriods" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_SalaryPeriods_AspNetUsers_TeacherId" FOREIGN KEY ("TeacherId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_SalaryPeriods_TeacherId_Month" ON "SalaryPeriods" ("TeacherId", "Month");
+
+        CREATE TABLE IF NOT EXISTS "AuditLogs" (
+            "Id" uuid NOT NULL,
+            "ActorId" uuid,
+            "Action" character varying(80) NOT NULL,
+            "EntityType" character varying(60) NOT NULL,
+            "EntityId" uuid,
+            "Detail" character varying(2000) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_AuditLogs" PRIMARY KEY ("Id")
+        );
+        CREATE INDEX IF NOT EXISTS "IX_AuditLogs_EntityType_EntityId_CreatedAt" ON "AuditLogs" ("EntityType", "EntityId", "CreatedAt");
+        CREATE INDEX IF NOT EXISTS "IX_AuditLogs_ActorId_CreatedAt" ON "AuditLogs" ("ActorId", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonExcuseRequests" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "Category" character varying(40) NOT NULL,
+            "Explanation" character varying(2000) NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "AdminNote" character varying(1000),
+            "ReviewedBy" uuid,
+            "ReviewedAt" timestamp with time zone,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_LessonExcuseRequests" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonExcuseRequests_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE,
+            CONSTRAINT "FK_LessonExcuseRequests_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonExcuseRequests_LessonId" ON "LessonExcuseRequests" ("LessonId") WHERE "Status" = 'pending';
+        CREATE INDEX IF NOT EXISTS "IX_LessonExcuseRequests_Status_CreatedAt" ON "LessonExcuseRequests" ("Status", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonIncidents" (
+            "Id" uuid NOT NULL,
+            "LessonId" uuid NOT NULL,
+            "Type" character varying(40) NOT NULL,
+            "Status" character varying(20) NOT NULL,
+            "Detail" character varying(1000) NOT NULL,
+            "ReportedBy" uuid,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "ResolvedBy" uuid,
+            "ResolvedAt" timestamp with time zone,
+            "ResolutionNote" character varying(1000),
+            CONSTRAINT "PK_LessonIncidents" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_LessonIncidents_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonIncidents_LessonId_Type" ON "LessonIncidents" ("LessonId", "Type");
+        CREATE INDEX IF NOT EXISTS "IX_LessonIncidents_Status_CreatedAt" ON "LessonIncidents" ("Status", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "DeviceTokens" (
+            "Id" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "Token" character varying(200) NOT NULL,
+            "Platform" character varying(20) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "LastSeenAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_DeviceTokens" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_DeviceTokens_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_Token" ON "DeviceTokens" ("Token");
+        CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserId" ON "DeviceTokens" ("UserId");
 
         CREATE TABLE IF NOT EXISTS "DataProtectionKeys" (
             "Id" integer GENERATED BY DEFAULT AS IDENTITY,

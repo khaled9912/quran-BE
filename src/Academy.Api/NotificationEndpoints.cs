@@ -69,9 +69,9 @@ public static class NotificationEndpoints
         DateTimeOffset now)
     {
         var isTeacher = role == "teacher";
-        var leadHorizon = now.AddMinutes(5);
-        // A lesson stays in scope while it runs, so a late poll still raises the
-        // "starting now" notice once instead of missing the start window.
+        // The account's poll also materializes reminders, using the same dedupe
+        // keys as the background monitor so the two never duplicate each other.
+        var leadHorizon = now.AddHours(25);
         var lessons = await db.Lessons.AsNoTracking()
             .Include(x => x.Teacher)
             .Include(x => x.Student)
@@ -87,6 +87,7 @@ public static class NotificationEndpoints
         foreach (var lesson in lessons)
         {
             var started = lesson.StartsAt <= now;
+            var withinHour = lesson.StartsAt - now <= TimeSpan.FromHours(1);
             var otherName = isTeacher
                 ? lesson.Student?.FullName ?? "your student"
                 : lesson.Teacher?.FullName ?? "your teacher";
@@ -104,15 +105,25 @@ public static class NotificationEndpoints
                 continue;
             }
 
-            pending.Add(new AppNotification
-            {
-                UserId = userId,
-                Title = "Lesson in 5 minutes",
-                Body = $"Your lesson with {otherName} starts in 5 minutes. Tap to open the room.",
-                Kind = "lesson",
-                Link = $"/lesson/{lesson.Id}",
-                DedupeKey = $"lesson-lead:{lesson.Id}",
-            });
+            pending.Add(withinHour
+                ? new AppNotification
+                {
+                    UserId = userId,
+                    Title = "Lesson in 1 hour",
+                    Body = $"Your lesson with {otherName} starts in 1 hour. Tap to review the details.",
+                    Kind = "lesson",
+                    Link = $"/lesson/{lesson.Id}",
+                    DedupeKey = $"lesson-reminder-1h:{lesson.Id}",
+                }
+                : new AppNotification
+                {
+                    UserId = userId,
+                    Title = "Lesson tomorrow",
+                    Body = $"Your lesson with {otherName} starts in 24 hours. Tap to review the details.",
+                    Kind = "lesson",
+                    Link = $"/lesson/{lesson.Id}",
+                    DedupeKey = $"lesson-reminder-24h:{lesson.Id}",
+                });
         }
 
         if (isTeacher)

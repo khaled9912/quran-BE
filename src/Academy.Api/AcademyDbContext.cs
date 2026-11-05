@@ -33,6 +33,22 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<AcademyBankAccount> AcademyBankAccounts => Set<AcademyBankAccount>();
     public DbSet<MonthlyPaymentClaim> MonthlyPaymentClaims => Set<MonthlyPaymentClaim>();
     public DbSet<AppNotification> Notifications => Set<AppNotification>();
+    public DbSet<AcademyPolicy> AcademyPolicies => Set<AcademyPolicy>();
+    public DbSet<LessonCancellation> LessonCancellations => Set<LessonCancellation>();
+    public DbSet<LessonRescheduleRequest> LessonRescheduleRequests => Set<LessonRescheduleRequest>();
+    public DbSet<LessonScheduleChange> LessonScheduleChanges => Set<LessonScheduleChange>();
+    public DbSet<LessonAttendance> LessonAttendances => Set<LessonAttendance>();
+    public DbSet<LessonAttendanceEvent> LessonAttendanceEvents => Set<LessonAttendanceEvent>();
+    public DbSet<LessonAttendanceInterval> LessonAttendanceIntervals => Set<LessonAttendanceInterval>();
+    public DbSet<LessonCreditTransaction> LessonCreditTransactions => Set<LessonCreditTransaction>();
+    public DbSet<TeacherHours> TeacherHours => Set<TeacherHours>();
+    public DbSet<TeacherPenalty> TeacherPenalties => Set<TeacherPenalty>();
+    public DbSet<ReliabilityEvent> ReliabilityEvents => Set<ReliabilityEvent>();
+    public DbSet<SalaryPeriod> SalaryPeriods => Set<SalaryPeriod>();
+    public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<LessonExcuseRequest> LessonExcuseRequests => Set<LessonExcuseRequest>();
+    public DbSet<LessonIncident> LessonIncidents => Set<LessonIncident>();
+    public DbSet<DeviceToken> DeviceTokens => Set<DeviceToken>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -136,5 +152,56 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<MonthlyPaymentClaim>().Property(x => x.AmountUsd).HasPrecision(10, 2);
         b.Entity<MonthlyPaymentClaim>().HasIndex(x => new { x.StudentId, x.Month }).IsUnique();
         b.Entity<MonthlyPaymentClaim>().HasIndex(x => x.Status);
+
+        b.Entity<AcademyPolicy>().HasKey(x => x.Id);
+        b.Entity<LessonCancellation>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonCancellation>().HasIndex(x => x.LessonId).IsUnique();
+        b.Entity<LessonCancellation>().HasIndex(x => new { x.Outcome, x.CreatedAt });
+        b.Entity<LessonRescheduleRequest>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonRescheduleRequest>().HasIndex(x => x.LessonId).IsUnique().HasFilter("\"Status\" = 'pending'");
+        b.Entity<LessonRescheduleRequest>().HasIndex(x => new { x.Status, x.ExpiresAt });
+        b.Entity<LessonScheduleChange>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonScheduleChange>().HasIndex(x => new { x.LessonId, x.CreatedAt });
+        b.Entity<LessonAttendance>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonAttendance>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonAttendance>().HasIndex(x => new { x.LessonId, x.UserId }).IsUnique();
+        b.Entity<LessonAttendance>().HasIndex(x => new { x.UserId, x.CreatedAt });
+        b.Entity<LessonAttendanceEvent>().HasIndex(x => new { x.UserId, x.EventId }).IsUnique();
+        b.Entity<LessonAttendanceEvent>().HasIndex(x => x.LessonId);
+        b.Entity<LessonAttendanceInterval>().HasOne(x => x.Attendance).WithMany().HasForeignKey(x => x.AttendanceId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonAttendanceInterval>().HasIndex(x => x.LessonId);
+        b.Entity<LessonAttendanceInterval>().HasIndex(x => new { x.LessonId, x.UserId, x.DeviceId }).IsUnique().HasFilter("\"LeftAt\" IS NULL");
+        b.Entity<LessonCreditTransaction>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonCreditTransaction>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.SetNull);
+        b.Entity<LessonCreditTransaction>().HasIndex(x => new { x.StudentId, x.CreatedAt });
+        b.Entity<LessonCreditTransaction>().HasIndex(x => x.DedupeKey).IsUnique().HasFilter("\"DedupeKey\" IS NOT NULL");
+        b.Entity<TeacherHours>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<TeacherHours>().HasIndex(x => x.LessonId).IsUnique();
+        b.Entity<TeacherHours>().HasIndex(x => new { x.TeacherId, x.CreatedAt });
+        b.Entity<TeacherHours>().HasIndex(x => x.ApprovalStatus);
+        b.Entity<TeacherPenalty>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<TeacherPenalty>().Property(x => x.AmountEgp).HasPrecision(10, 2);
+        b.Entity<TeacherPenalty>().HasIndex(x => new { x.TeacherId, x.Status });
+        b.Entity<ReliabilityEvent>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<ReliabilityEvent>().HasIndex(x => new { x.UserId, x.CreatedAt });
+        b.Entity<ReliabilityEvent>().HasIndex(x => new { x.Role, x.Type, x.CreatedAt });
+        b.Entity<SalaryPeriod>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<SalaryPeriod>().Property(x => x.ApprovedPenaltyEgp).HasPrecision(10, 2);
+        b.Entity<SalaryPeriod>().Property(x => x.PendingPenaltyEgp).HasPrecision(10, 2);
+        b.Entity<SalaryPeriod>().Property(x => x.ManualAdjustmentEgp).HasPrecision(10, 2);
+        b.Entity<SalaryPeriod>().Property(x => x.FinalAmountEgp).HasPrecision(10, 2);
+        b.Entity<SalaryPeriod>().HasIndex(x => new { x.TeacherId, x.Month }).IsUnique();
+        b.Entity<AuditLog>().HasIndex(x => new { x.EntityType, x.EntityId, x.CreatedAt });
+        b.Entity<AuditLog>().HasIndex(x => new { x.ActorId, x.CreatedAt });
+        b.Entity<LessonExcuseRequest>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonExcuseRequest>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<LessonExcuseRequest>().HasIndex(x => x.LessonId).IsUnique().HasFilter("\"Status\" = 'pending'");
+        b.Entity<LessonExcuseRequest>().HasIndex(x => new { x.Status, x.CreatedAt });
+        b.Entity<LessonIncident>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonIncident>().HasIndex(x => new { x.LessonId, x.Type }).IsUnique();
+        b.Entity<LessonIncident>().HasIndex(x => new { x.Status, x.CreatedAt });
+        b.Entity<DeviceToken>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<DeviceToken>().HasIndex(x => x.Token).IsUnique();
+        b.Entity<DeviceToken>().HasIndex(x => x.UserId);
     }
 }
