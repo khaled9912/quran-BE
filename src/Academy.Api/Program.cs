@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Claims;
 using Academy.Api;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http.Features;
@@ -115,7 +116,9 @@ builder.Services.AddAuthentication(IdentityConstants.ApplicationScheme)
             OnRedirectToLogin = context => { context.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; },
             OnRedirectToAccessDenied = context => { context.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; }
         };
-    });
+    })
+    .AddScheme<AuthenticationSchemeOptions, RealtimeTicketAuthenticationHandler>(
+        RealtimeTicketDefaults.Scheme, null);
 builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("AdminOnly", p => p.RequireRole("admin", "super_admin"));
@@ -156,6 +159,9 @@ else
     builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
 builder.Services.AddHealthChecks().AddDbContextCheck<AcademyDbContext>("database");
 builder.Services.AddHostedService<LessonOpsMonitor>();
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<RealtimeTicketService>();
+builder.Services.AddSingleton<RealtimeNotifier>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -194,9 +200,25 @@ app.Use(async (context, next) =>
 });
 app.UseAuthentication();
 app.UseAuthorization();
+// A successful mutation makes the caller's screens and the staff dashboards
+// stale. Participants on the other side of a lesson change are notified
+// explicitly by the handlers, which know who they are.
+app.Use(async (context, next) =>
+{
+    await next();
+    if (context.Request.Method is "GET" or "HEAD" or "OPTIONS") return;
+    if (context.Response.StatusCode is < 200 or >= 300) return;
+    if (context.User?.Identity?.IsAuthenticated != true) return;
+
+    var notifier = context.RequestServices.GetRequiredService<RealtimeNotifier>();
+    // Staff dashboards are the one view every mutation can affect; participant
+    // and billing scopes are published explicitly by the endpoints that change them.
+    _ = notifier.ToStaffAsync(RealtimeScopes.Admin);
+});
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "rayan-academy-api" }));
 app.MapHealthChecks("/health/ready");
+app.MapRealtime();
 app.MapAcademyApi();
 app.MapLessonOperations();
 app.MapTeacherApplications();

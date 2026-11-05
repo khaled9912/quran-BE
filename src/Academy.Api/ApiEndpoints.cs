@@ -184,7 +184,7 @@ public static class ApiEndpoints
                 : Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         });
 
-        profile.MapPatch("", async (UpdateProfileRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users) =>
+        profile.MapPatch("", async (UpdateProfileRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             var user = await users.GetUserAsync(principal);
             if (user is null || !user.IsActive) return Results.Unauthorized();
@@ -229,10 +229,12 @@ public static class ApiEndpoints
             var updated = await users.UpdateAsync(user);
             if (!updated.Succeeded)
                 return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            await realtime.ToUserAsync(user.Id, RealtimeScopes.Self);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         });
 
-        profile.MapPost("/avatar", async (HttpContext http, ClaimsPrincipal principal, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        profile.MapPost("/avatar", async (HttpContext http, ClaimsPrincipal principal, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             var user = await users.GetUserAsync(principal);
             if (user is null || !user.IsActive) return Results.Unauthorized();
@@ -276,10 +278,12 @@ public static class ApiEndpoints
             avatar.Data = data;
             avatar.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync();
+            await realtime.ToUserAsync(user.Id, RealtimeScopes.Self);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Ok(new { avatarUrl = $"/api/users/{user.Id}/avatar" });
         });
 
-        profile.MapDelete("/avatar", async (ClaimsPrincipal principal, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        profile.MapDelete("/avatar", async (ClaimsPrincipal principal, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             var user = await users.GetUserAsync(principal);
             if (user is null || !user.IsActive) return Results.Unauthorized();
@@ -289,6 +293,8 @@ public static class ApiEndpoints
                 db.UserAvatars.Remove(avatar);
                 await db.SaveChangesAsync();
             }
+            await realtime.ToUserAsync(user.Id, RealtimeScopes.Self);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.NoContent();
         });
 
@@ -367,7 +373,7 @@ public static class ApiEndpoints
             return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         }).RequireRateLimiting("otp");
 
-        api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db, AcademyEmailSender notifier, HttpContext http) =>
+        api.MapPost("/contact", async (ContactRequest input, AcademyDbContext db, AcademyEmailSender notifier, RealtimeNotifier realtime, HttpContext http) =>
         {
             var errors = new Dictionary<string, string[]>();
             var name = input.Name?.Trim() ?? "";
@@ -380,13 +386,14 @@ public static class ApiEndpoints
             var submission = new ContactSubmission { Name = name, Email = email, Message = message };
             db.ContactSubmissions.Add(submission);
             await db.SaveChangesAsync();
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
             // The receiver is fixed by server configuration, never by the request body.
             await notifier.SendContactMessageAsync(submission, http.RequestAborted);
             return Results.Accepted();
         }).AllowAnonymous().RequireRateLimiting("contact");
 
         var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
-        admin.MapPost("/users", async (CreateUserRequest input, UserManager<AcademyUser> users) =>
+        admin.MapPost("/users", async (CreateUserRequest input, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || string.IsNullOrWhiteSpace(input.Role)) return Results.BadRequest(new { message = "Full name, email, password and role are required." });
             var role = input.Role.Trim().ToLowerInvariant();
@@ -395,9 +402,10 @@ public static class ApiEndpoints
             var created = await users.CreateAsync(user, input.Password);
             if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, role);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/{role}s/{user.Id}", new { user = ToUser(user, role) });
         });
-        admin.MapPatch("/users/{id:guid}", async (Guid id, UpdateUserRequest input, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        admin.MapPatch("/users/{id:guid}", async (Guid id, UpdateUserRequest input, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
@@ -427,10 +435,12 @@ public static class ApiEndpoints
                 if (!reset.Succeeded) return Results.ValidationProblem(reset.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
             }
             if (input.IsActive == false) await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            await realtime.ToUserAsync(id, RealtimeScopes.Self);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Ok(ToUser(user, role));
         });
         // Deletes are soft: lessons keep their historical teacher/student owners.
-        admin.MapDelete("/users/{id:guid}", async (Guid id, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        admin.MapDelete("/users/{id:guid}", async (Guid id, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
@@ -454,6 +464,8 @@ public static class ApiEndpoints
             await db.SaveChangesAsync();
             await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
             await db.AvailabilitySlots.Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > now).ExecuteDeleteAsync();
+            await realtime.ToUserAsync(id, RealtimeScopes.Self);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.NoContent();
         });
         admin.MapGet("/support-users", async (UserManager<AcademyUser> users) =>
@@ -467,7 +479,7 @@ public static class ApiEndpoints
             if (teacher is null || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
             return Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == teacherId && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync());
         });
-        admin.MapPost("/teachers/{teacherId:guid}/availability", async (Guid teacherId, PublishAvailabilityRequest input, UserManager<AcademyUser> users, AcademyDbContext db) =>
+        admin.MapPost("/teachers/{teacherId:guid}/availability", async (Guid teacherId, PublishAvailabilityRequest input, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var teacher = await users.FindByIdAsync(teacherId.ToString());
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
@@ -477,14 +489,19 @@ public static class ApiEndpoints
             if (conflict) return Results.Conflict(new { message = "This time overlaps another published slot or lesson." });
             var slot = new AvailabilitySlot { TeacherId = teacherId, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
             db.AvailabilitySlots.Add(slot); await db.SaveChangesAsync();
+            await realtime.ToUserAsync(teacherId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/admin/teachers/{teacherId}/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
         });
-        admin.MapDelete("/teachers/{teacherId:guid}/availability/{slotId:guid}", async (Guid teacherId, Guid slotId, AcademyDbContext db) =>
+        admin.MapDelete("/teachers/{teacherId:guid}/availability/{slotId:guid}", async (Guid teacherId, Guid slotId, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == teacherId);
             if (slot is null) return Results.NotFound();
             if (slot.Status != "available") return Results.Conflict(new { message = "A requested or booked slot cannot be deleted." });
-            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
+            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync();
+            await realtime.ToUserAsync(teacherId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            return Results.NoContent();
         });
         admin.MapGet("/contact-submissions", async (AcademyDbContext db) => await db.ContactSubmissions.OrderByDescending(x => x.CreatedAt).ToListAsync());
         admin.MapGet("/lesson-requests", async (string? status, AcademyDbContext db) =>
@@ -493,35 +510,42 @@ public static class ApiEndpoints
             if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
             return Results.Ok((await q.OrderBy(x => x.CreatedAt).ToListAsync()).Select(ToRequest));
         });
-        admin.MapPost("/lesson-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveRequest(id, db));
-        admin.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, AcademyDbContext db, RejectRequest? input = null) => await RejectRequestByAdmin(id, input?.Reason, db));
+        admin.MapPost("/lesson-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime) => await ApproveRequest(id, db, realtime));
+        admin.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime, RejectRequest? input = null) => await RejectRequestByAdmin(id, input?.Reason, db, realtime));
         admin.MapGet("/change-requests", async (string? status, AcademyDbContext db) =>
         {
             var q = ChangeRequestsWithDetails(db);
             if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
             return Results.Ok((await q.OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToChangeRequest));
         });
-        admin.MapPost("/change-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db) => await ApproveChangeRequestAsync(id, db));
-        admin.MapPost("/change-requests/{id:guid}/reject", async (Guid id, RejectChangeRequestInput? input, AcademyDbContext db) => await RejectChangeRequestAsync(id, input?.Note, db));
+        admin.MapPost("/change-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime) => await ApproveChangeRequestAsync(id, db, realtime));
+        admin.MapPost("/change-requests/{id:guid}/reject", async (Guid id, RejectChangeRequestInput? input, AcademyDbContext db, RealtimeNotifier realtime) => await RejectChangeRequestAsync(id, input?.Note, db, realtime));
         admin.MapGet("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, AcademyDbContext db) =>
             await db.Users.AnyAsync(x => x.Id == teacherId)
                 ? Results.Ok(await WeeklyRulesAsync(db, teacherId, null))
                 : Results.NotFound());
-        admin.MapPost("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, CreateAvailabilityRulesRequest input, AcademyDbContext db) =>
+        admin.MapPost("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, CreateAvailabilityRulesRequest input, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             if (!await db.Users.AnyAsync(x => x.Id == teacherId)) return Results.NotFound();
             var (created, error) = await CreateAvailabilityRulesAsync(teacherId, input, db);
             if (error is not null) return Results.BadRequest(new { message = error });
+            await realtime.ToUserAsync(teacherId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/admin/teachers/{teacherId}/availability-rules", created!.Select(x => ToRule(x, "available")).ToList());
         });
-        admin.MapDelete("/teachers/{teacherId:guid}/availability-rules/{ruleId:guid}", async (Guid teacherId, Guid ruleId, AcademyDbContext db) =>
-            await DeleteAvailabilityRuleAsync(teacherId, ruleId, db));
+        admin.MapDelete("/teachers/{teacherId:guid}/availability-rules/{ruleId:guid}", async (Guid teacherId, Guid ruleId, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var result = await DeleteAvailabilityRuleAsync(teacherId, ruleId, db);
+            await realtime.ToUserAsync(teacherId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            return result;
+        });
 
         // Transcript review lives in LessonReviewEndpoints (also open to support).
 
         admin.MapGet("/assignments", async (AcademyDbContext db) => await AssignmentList(db));
         api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");
-        api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             var teacher = await users.FindByIdAsync(input.TeacherId.ToString());
             var student = await users.FindByIdAsync(input.StudentId.ToString());
@@ -529,15 +553,26 @@ public static class ApiEndpoints
             var activeElsewhere = await db.Assignments.Where(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId).ToListAsync();
             foreach (var previous in activeElsewhere) previous.IsActive = false;
             var existing = await db.Assignments.FirstOrDefaultAsync(x => x.TeacherId == input.TeacherId && x.StudentId == input.StudentId);
-            if (existing is not null) { existing.IsActive = true; await db.SaveChangesAsync(); return Results.Ok(await AssignmentById(db, existing.Id)); }
+            if (existing is not null)
+            {
+                existing.IsActive = true; await db.SaveChangesAsync();
+                await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
+                await realtime.ToStaffAsync(RealtimeScopes.Directory);
+                return Results.Ok(await AssignmentById(db, existing.Id));
+            }
             var assignment = new TeacherStudentAssignment { TeacherId = input.TeacherId, StudentId = input.StudentId };
             db.Assignments.Add(assignment); await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/teacher-student-assignments/{assignment.Id}", await AssignmentById(db, assignment.Id));
         }).RequireAuthorization("AdminOnly");
-        api.MapDelete("/teacher-student-assignments/{id:guid}", async (Guid id, AcademyDbContext db) =>
+        api.MapDelete("/teacher-student-assignments/{id:guid}", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var item = await db.Assignments.FindAsync(id); if (item is null) return Results.NotFound();
-            item.IsActive = false; await db.SaveChangesAsync(); return Results.NoContent();
+            item.IsActive = false; await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(item.TeacherId, item.StudentId, RealtimeScopes.Directory);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            return Results.NoContent();
         }).RequireAuthorization("AdminOnly");
 
         api.MapGet("/teachers", async (bool? includeInactive, AcademyDbContext db, UserManager<AcademyUser> users) =>
@@ -671,7 +706,7 @@ public static class ApiEndpoints
             foreach (var user in list) if (await users.IsInRoleAsync(user, "student")) result.Add(ToUser(user, "student"));
             return Results.Ok(result);
         }).RequireAuthorization();
-        api.MapPost("/students", async (CreateStudentRequest input, UserManager<AcademyUser> users) =>
+        api.MapPost("/students", async (CreateStudentRequest input, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || !System.Net.Mail.MailAddress.TryCreate(input.Email, out _) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["student"] = ["Full name, a valid email and a password of at least 8 characters are required."] });
@@ -680,6 +715,7 @@ public static class ApiEndpoints
             var created = await users.CreateAsync(user, input.Password);
             if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, "student");
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/students/{user.Id}", ToUser(user, "student"));
         }).RequireAuthorization("AdminOnly");
         api.MapGet("/students/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
@@ -692,7 +728,7 @@ public static class ApiEndpoints
 
         var teacher = api.MapGroup("/teacher").RequireAuthorization("TeacherOnly");
         teacher.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
-        teacher.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        teacher.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future slot with a duration up to 4 hours." });
             var id = UserId(p);
@@ -702,28 +738,38 @@ public static class ApiEndpoints
             if (conflict) return Results.Conflict(new { message = "This time overlaps another published slot or lesson." });
             var slot = new AvailabilitySlot { TeacherId = id, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
             db.AvailabilitySlots.Add(slot); await db.SaveChangesAsync();
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            await realtime.ToUserAsync(id, RealtimeScopes.Directory);
             return Results.Created($"/api/teacher/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
         });
-        teacher.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        teacher.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var slot = await db.AvailabilitySlots.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == UserId(p));
             if (slot is null) return Results.NotFound(); if (slot.Status != "available") return Results.Conflict(new { message = "A requested or booked slot cannot be deleted." });
-            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
+            db.AvailabilitySlots.Remove(slot); await db.SaveChangesAsync();
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            await realtime.ToUserAsync(UserId(p), RealtimeScopes.Directory);
+            return Results.NoContent();
         });
 
         // Weekly availability announcement: one row per bookable weekly slot.
         teacher.MapGet("/availability-rules", async (ClaimsPrincipal p, AcademyDbContext db) =>
             Results.Ok(await WeeklyRulesAsync(db, UserId(p), null)));
-        teacher.MapPost("/availability-rules", async (CreateAvailabilityRulesRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        teacher.MapPost("/availability-rules", async (CreateAvailabilityRulesRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var (created, error) = await CreateAvailabilityRulesAsync(UserId(p), input, db);
             if (error is not null) return Results.BadRequest(new { message = error });
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created("/api/teacher/availability-rules", created!.Select(x => ToRule(x, "available")).ToList());
         });
-        teacher.MapDelete("/availability-rules/{ruleId:guid}", async (Guid ruleId, ClaimsPrincipal p, AcademyDbContext db) =>
-            await DeleteAvailabilityRuleAsync(UserId(p), ruleId, db));
+        teacher.MapDelete("/availability-rules/{ruleId:guid}", async (Guid ruleId, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var result = await DeleteAvailabilityRuleAsync(UserId(p), ruleId, db);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+            return result;
+        });
         teacher.MapGet("/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.TeacherId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest)));
-        teacher.MapPost("/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        teacher.MapPost("/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
@@ -738,9 +784,12 @@ public static class ApiEndpoints
                 DedupeKey = $"request-teacher-accepted:{request.Id}",
             });
             await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(request.StudentId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
             return Results.Ok(await RequestById(db, id));
         });
-        teacher.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RejectRequest? input = null) =>
+        teacher.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, RejectRequest? input = null) =>
         {
             var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
@@ -754,7 +803,11 @@ public static class ApiEndpoints
                 Link = "/book",
                 DedupeKey = $"request-teacher-declined:{request.Id}",
             });
-            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+            await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(request.StudentId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await RequestById(db, id));
         });
 
         api.MapGet("/student/teacher/availability", async (ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
@@ -785,7 +838,7 @@ public static class ApiEndpoints
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
             return Results.Ok(await WeeklyAvailabilityAsync(db, teacher, UserId(p)));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
             var ruleIds = (input.RuleIds ?? []).Distinct().ToList();
@@ -875,6 +928,11 @@ public static class ApiEndpoints
             try { await db.SaveChangesAsync(); }
             catch (DbUpdateException) { /* The booking is already saved; a repeated notice is harmless. */ }
 
+            await realtime.ToParticipantsAsync(teacherId, studentId, RealtimeScopes.Lessons);
+            await realtime.ToUsersAsync([teacherId, studentId], RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
+
             return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
         }).RequireAuthorization("StudentOnly");
         api.MapGet("/student/series", async (ClaimsPrincipal p, AcademyDbContext db) =>
@@ -892,7 +950,7 @@ public static class ApiEndpoints
                 .OrderByDescending(x => x.CreatedAt).ToListAsync();
             return Results.Ok(list.Select(ToChangeRequest));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
             var series = await db.LessonSeries.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId && x.IsActive);
@@ -919,9 +977,11 @@ public static class ApiEndpoints
             try { await db.SaveChangesAsync(); }
             catch (DbUpdateException) { return Results.Conflict(new { message = "You already have a pending time-change request for this slot." }); }
             var saved = await ChangeRequestsWithDetails(db).FirstAsync(x => x.Id == request.Id);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            await realtime.ToUserAsync(series.TeacherId, RealtimeScopes.Lessons);
             return Results.Created($"/api/student/change-requests/{request.Id}", ToChangeRequest(saved));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
             if (await db.LessonRequests.AnyAsync(x => x.StudentId == studentId && (x.Status == "pending_teacher" || x.Status == "pending_student" || x.Status == "pending_admin"))) return Results.Conflict(new { message = "You already have a lesson request awaiting approval." });
@@ -951,13 +1011,17 @@ public static class ApiEndpoints
             });
             try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
             catch (DbUpdateException) { await tx.RollbackAsync(); await db.AvailabilitySlots.Where(x => x.Id == slot.Id && x.Status == "requested").ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "available")); return Results.Conflict(new { message = "A request is already active or the slot was claimed." }); }
+            await realtime.ToParticipantsAsync(slot.TeacherId, studentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(slot.TeacherId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
         }).RequireAuthorization("StudentOnly");
         api.MapGet("/student/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.StudentId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest))).RequireAuthorization("StudentOnly");
 
         var studentApi = api.MapGroup("/student").RequireAuthorization("StudentOnly");
         studentApi.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.StudentAvailabilities.Where(x => x.StudentId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
-        studentApi.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        studentApi.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
             if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future preferred time with a duration up to 4 hours." });
@@ -967,16 +1031,21 @@ public static class ApiEndpoints
             if (overlaps) return Results.Conflict(new { message = "This overlaps another preferred time you have submitted." });
             var slot = new StudentAvailability { StudentId = studentId, TeacherId = assignment.TeacherId, StartsAt = input.StartsAt.ToUniversalTime(), EndsAt = input.EndsAt.ToUniversalTime() };
             db.StudentAvailabilities.Add(slot); await db.SaveChangesAsync();
+            await realtime.ToUserAsync(assignment.TeacherId, RealtimeScopes.Directory);
+            await realtime.ToUserAsync(studentId, RealtimeScopes.Directory);
             return Results.Created($"/api/student/availability/{slot.Id}", new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status));
         });
-        studentApi.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        studentApi.MapDelete("/availability/{slotId:guid}", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var slot = await db.StudentAvailabilities.FirstOrDefaultAsync(x => x.Id == slotId && x.StudentId == UserId(p));
             if (slot is null) return Results.NotFound(); if (slot.Status != "available") return Results.Conflict(new { message = "A selected or booked preference cannot be deleted." });
-            db.StudentAvailabilities.Remove(slot); await db.SaveChangesAsync(); return Results.NoContent();
+            db.StudentAvailabilities.Remove(slot); await db.SaveChangesAsync();
+            await realtime.ToUserAsync(slot.TeacherId, RealtimeScopes.Directory);
+            await realtime.ToUserAsync(UserId(p), RealtimeScopes.Directory);
+            return Results.NoContent();
         });
         api.MapGet("/teacher/student-availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.StudentAvailabilities.Include(x => x.Student).Where(x => x.TeacherId == UserId(p) && x.Status == "available" && x.StartsAt > DateTimeOffset.UtcNow).OrderBy(x => x.StartsAt).Select(x => new { x.Id, x.StudentId, studentName = x.Student!.FullName, x.StartsAt, x.EndsAt, x.Status }).ToListAsync())).RequireAuthorization("TeacherOnly");
-        api.MapPost("/teacher/student-availability/{slotId:guid}/select", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/teacher/student-availability/{slotId:guid}/select", async (Guid slotId, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var teacherId = UserId(p);
             var slot = await db.StudentAvailabilities.FirstOrDefaultAsync(x => x.Id == slotId && x.TeacherId == teacherId);
@@ -989,9 +1058,12 @@ public static class ApiEndpoints
             db.LessonRequests.Add(request);
             try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
             catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "An active request already exists for this student." }); }
+            await realtime.ToParticipantsAsync(teacherId, slot.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(slot.StudentId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
             return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
         }).RequireAuthorization("TeacherOnly");
-        api.MapPost("/student/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/student/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
@@ -1005,9 +1077,13 @@ public static class ApiEndpoints
                 Link = "/schedule",
                 DedupeKey = $"request-student-accepted:{request.Id}",
             });
-            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+            await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(request.TeacherId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await RequestById(db, id));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/student/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var request = await db.LessonRequests.Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_student") return Results.Conflict(new { message = "This request is not awaiting your confirmation." });
@@ -1021,7 +1097,11 @@ public static class ApiEndpoints
                 Link = "/schedule",
                 DedupeKey = $"request-student-declined:{request.Id}",
             });
-            await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+            await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUserAsync(request.TeacherId, RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await RequestById(db, id));
         }).RequireAuthorization("StudentOnly");
 
         api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db) =>
@@ -1079,7 +1159,7 @@ public static class ApiEndpoints
             return Results.Ok(new { accepted, flagged });
         }).AllowAnonymous();
 
-        api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             // Direct time edits are an academy override. Teachers and students
             // move lessons through the accept/decline reschedule workflow.
@@ -1128,10 +1208,12 @@ public static class ApiEndpoints
                 Detail = moved ? $"Academy moved lesson from {previousStarts:u}." : "Academy updated lesson status.",
             });
             await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
+            if (moved) await realtime.ToUsersAsync([lesson.TeacherId, lesson.StudentId], RealtimeScopes.Notifications);
             return Results.Ok(ToLesson(lesson));
         }).RequireAuthorization("AdminOnly");
-        api.MapDelete("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
-            await LessonOperationsEndpoints.CancelAsync(id, null, p, db, email, push, ct)).RequireAuthorization();
+        api.MapDelete("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, AcademyEmailSender email, AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
+            await LessonOperationsEndpoints.CancelAsync(id, null, p, db, email, push, realtime, ct)).RequireAuthorization();
 
         api.MapGet("/lessons/{id:guid}/report", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
         {
@@ -1141,7 +1223,7 @@ public static class ApiEndpoints
             return lesson.Report is null ? Results.NotFound() : Results.Ok(ToReport(lesson.Report, lesson));
         }).RequireAuthorization();
 
-        api.MapPost("/lessons/{id:guid}/report", async (Guid id, SaveLessonReportRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/lessons/{id:guid}/report", async (Guid id, SaveLessonReportRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var teacherId = UserId(p);
             var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == teacherId);
@@ -1190,6 +1272,9 @@ public static class ApiEndpoints
                     DedupeKey = $"report-student:{lesson.Id}",
                 });
             await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
+            await realtime.ToUserAsync(lesson.TeacherId, RealtimeScopes.Billing);
+            if (firstReport) await realtime.ToUserAsync(lesson.StudentId, RealtimeScopes.Notifications);
             return Results.Ok(ToReport(report, lesson));
         }).RequireAuthorization("TeacherOnly");
 
@@ -1201,7 +1286,7 @@ public static class ApiEndpoints
             return lesson.Review is null ? Results.NotFound() : Results.Ok(ToReview(lesson.Review, lesson));
         }).RequireAuthorization();
 
-        api.MapPost("/lessons/{id:guid}/review", async (Guid id, SaveTeacherReviewRequest input, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/lessons/{id:guid}/review", async (Guid id, SaveTeacherReviewRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
             var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId);
@@ -1235,6 +1320,8 @@ public static class ApiEndpoints
                     DedupeKey = $"review-teacher:{lesson.Id}",
                 });
             await db.SaveChangesAsync();
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
+            if (firstReview) await realtime.ToUserAsync(lesson.TeacherId, RealtimeScopes.Notifications);
             return Results.Ok(ToReview(review, lesson));
         }).RequireAuthorization("StudentOnly");
 
@@ -1261,7 +1348,7 @@ public static class ApiEndpoints
         }).RequireAuthorization();
     }
 
-    private static async Task<IResult> ApproveRequest(Guid id, AcademyDbContext db)
+    private static async Task<IResult> ApproveRequest(Guid id, AcademyDbContext db, RealtimeNotifier realtime)
     {
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id);
@@ -1317,10 +1404,13 @@ public static class ApiEndpoints
             await tx.RollbackAsync();
             return Results.Conflict(new { message = "This lesson conflicts with another booking or was approved by another admin action. Refresh and try again." });
         }
+        await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+        await realtime.ToUsersAsync([request.TeacherId, request.StudentId], RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
         return Results.Ok(await RequestById(db, id));
     }
 
-    private static async Task<IResult> RejectRequestByAdmin(Guid id, string? reason, AcademyDbContext db)
+    private static async Task<IResult> RejectRequestByAdmin(Guid id, string? reason, AcademyDbContext db, RealtimeNotifier realtime)
     {
         var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id);
         if (request is null) return Results.NotFound(); if (request.Status != "pending_admin") return Results.Conflict(new { message = "This request is not awaiting admin approval." });
@@ -1346,7 +1436,11 @@ public static class ApiEndpoints
                 Link = "/schedule",
                 DedupeKey = $"request-rejected:{request.Id}:teacher",
             });
-        await db.SaveChangesAsync(); return Results.Ok(await RequestById(db, id));
+        await db.SaveChangesAsync();
+        await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+        await realtime.ToUsersAsync([request.TeacherId, request.StudentId], RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
+        return Results.Ok(await RequestById(db, id));
     }
 
     private static WeeklyRuleDto ToRule(TeacherAvailabilityRule r, string status) => new(r.Id, r.TeacherId, r.DayOfWeek, FormatTime(r.StartsAtTime), FormatTime(r.EndsAtTime), r.TimeZoneId, status);
@@ -1503,7 +1597,7 @@ public static class ApiEndpoints
         catch (DbUpdateException) { db.ChangeTracker.Clear(); }
     }
 
-    private static async Task<IResult> ApproveChangeRequestAsync(Guid id, AcademyDbContext db)
+    private static async Task<IResult> ApproveChangeRequestAsync(Guid id, AcademyDbContext db, RealtimeNotifier realtime)
     {
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
@@ -1559,10 +1653,13 @@ public static class ApiEndpoints
             await tx.RollbackAsync();
             return Results.Conflict(new { message = "This change could not be applied. Refresh and try again." });
         }
+        await realtime.ToParticipantsAsync(series.TeacherId, series.StudentId, RealtimeScopes.Lessons);
+        await realtime.ToUsersAsync([series.TeacherId, series.StudentId], RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
         return Results.Ok(ToChangeRequest(request));
     }
 
-    private static async Task<IResult> RejectChangeRequestAsync(Guid id, string? note, AcademyDbContext db)
+    private static async Task<IResult> RejectChangeRequestAsync(Guid id, string? note, AcademyDbContext db, RealtimeNotifier realtime)
     {
         var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
         if (request is null) return Results.NotFound();
@@ -1580,6 +1677,9 @@ public static class ApiEndpoints
             DedupeKey = $"change-rejected:{request.Id}:student",
         });
         await db.SaveChangesAsync();
+        await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
+        await realtime.ToUserAsync(request.StudentId, RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
         return Results.Ok(ToChangeRequest(request));
     }
 

@@ -46,10 +46,14 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AcademyDbContext>();
         var push = scope.ServiceProvider.GetRequiredService<AcademyPushSender>();
+        var realtime = scope.ServiceProvider.GetRequiredService<RealtimeNotifier>();
         var now = DateTimeOffset.UtcNow;
         var policy = await LessonPolicyService.GetPolicyAsync(db, ct);
 
         // Requests that ran out of time without a reply.
+        var expiredLessonIds = await db.LessonRescheduleRequests
+            .Where(x => x.Status == "pending" && x.ExpiresAt <= now)
+            .Select(x => x.LessonId).Distinct().ToListAsync(ct);
         await db.LessonRescheduleRequests
             .Where(x => x.Status == "pending" && x.ExpiresAt <= now)
             .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "expired"), ct);
@@ -215,6 +219,12 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
 
         if (db.ChangeTracker.HasChanges())
         {
+            var changedLessonIds = db.ChangeTracker.Entries()
+                .Where(e => e.State != EntityState.Unchanged)
+                .Select(e => ChangedLessonId(e.Entity))
+                .OfType<Guid>()
+                .Distinct()
+                .ToList();
             try
             {
                 await db.SaveChangesAsync(ct);
@@ -224,10 +234,44 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
                 // A concurrent poll may have inserted the same reminder first.
                 db.ChangeTracker.Clear();
                 logger.LogDebug(ex, "Lesson operations monitor skipped a duplicate notification.");
+                changedLessonIds.Clear();
+            }
+
+            if (changedLessonIds.Count > 0)
+            {
+                var participants = ended.Concat(live).Concat(upcoming)
+                    .GroupBy(x => x.Id)
+                    .ToDictionary(g => g.Key, g => (g.First().TeacherId, g.First().StudentId));
+                foreach (var lessonId in changedLessonIds)
+                {
+                    if (participants.TryGetValue(lessonId, out var pair))
+                        await realtime.ToParticipantsAsync(pair.TeacherId, pair.StudentId, RealtimeScopes.Lessons, lessonId);
+                }
+                await realtime.ToStaffAsync(RealtimeScopes.Admin);
             }
         }
+
+        foreach (var lessonId in expiredLessonIds)
+        {
+            var lesson = await db.Lessons.AsNoTracking().FirstOrDefaultAsync(x => x.Id == lessonId, ct);
+            if (lesson is not null)
+                await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lessonId);
+        }
+
+        foreach (var userId in pushJobs.Select(x => x.UserId).Distinct())
+            await realtime.ToUserAsync(userId, RealtimeScopes.Notifications);
 
         foreach (var job in pushJobs)
             await LessonOpsMessaging.PushAsync(db, push, [job.UserId], job.Title, job.Body, job.Link, ct);
     }
+
+    private static Guid? ChangedLessonId(object entity) => entity switch
+    {
+        Lesson lesson => lesson.Id,
+        LessonAttendance attendance => attendance.LessonId,
+        LessonAttendanceInterval interval => interval.LessonId,
+        LessonIncident incident => incident.LessonId,
+        TeacherHours hours => hours.LessonId,
+        _ => null,
+    };
 }

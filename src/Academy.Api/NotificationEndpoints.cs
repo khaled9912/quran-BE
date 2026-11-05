@@ -31,7 +31,7 @@ public static class NotificationEndpoints
             return Results.Ok(new NotificationsDto(items, unread));
         });
 
-        api.MapPost("/{id:guid}/read", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/{id:guid}/read", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var userId = ApiEndpoints.UserId(p);
             var item = await db.Notifications.FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId);
@@ -40,16 +40,18 @@ public static class NotificationEndpoints
             {
                 item.ReadAt = DateTimeOffset.UtcNow;
                 await db.SaveChangesAsync();
+                await realtime.ToUserAsync(userId, RealtimeScopes.Notifications);
             }
             return Results.NoContent();
         });
 
-        api.MapPost("/read-all", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapPost("/read-all", async (ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var userId = ApiEndpoints.UserId(p);
             var now = DateTimeOffset.UtcNow;
             await db.Notifications.Where(x => x.UserId == userId && x.ReadAt == null)
                 .ExecuteUpdateAsync(s => s.SetProperty(x => x.ReadAt, now));
+            await realtime.ToUserAsync(userId, RealtimeScopes.Notifications);
             return Results.NoContent();
         });
     }

@@ -99,7 +99,8 @@ public static class PaymentEndpoints
     private static async Task<IResult> CreateClaimAsync(
         CreatePaymentClaimRequest input,
         ClaimsPrincipal principal,
-        AcademyDbContext db)
+        AcademyDbContext db,
+        RealtimeNotifier realtime)
     {
         if (!TryParseMonth(input.Month, out var month))
             return Results.ValidationProblem(new Dictionary<string, string[]>() { ["month"] = ["Choose a valid month (YYYY-MM)."] });
@@ -166,6 +167,10 @@ public static class PaymentEndpoints
                 DedupeKey = $"payment-claim:{claim.Id}:{claim.ClaimedAt.UtcTicks}",
             });
         if (adminIds.Count > 0) await db.SaveChangesAsync();
+        await realtime.ToStaffAsync(RealtimeScopes.Billing);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
+        await realtime.ToUserAsync(studentId, RealtimeScopes.Billing);
+        await realtime.ToUsersAsync(adminIds, RealtimeScopes.Notifications);
         return Results.Ok(ToClaim(claim, claim.Student));
     }
 
@@ -228,7 +233,8 @@ public static class PaymentEndpoints
     private static async Task<IResult> SavePayoutDetailsAsync(
         UpdateTeacherPayoutDetailRequest input,
         ClaimsPrincipal principal,
-        AcademyDbContext db)
+        AcademyDbContext db,
+        RealtimeNotifier realtime)
     {
         var instapay = Clean(input.InstaPayAccount, 120);
         var vodafone = Clean(input.VodafoneCashNumber, 30);
@@ -258,6 +264,8 @@ public static class PaymentEndpoints
         details.BankIban = iban ?? "";
         details.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+        await realtime.ToUserAsync(teacherId, RealtimeScopes.Billing);
+        await realtime.ToStaffAsync(RealtimeScopes.Billing);
 
         return Results.Ok(ToDetails(teacherId, details));
     }
@@ -342,7 +350,8 @@ public static class PaymentEndpoints
     private static async Task<IResult> SaveAcademyAccountAsync(
         UpdateAcademyBankAccountRequest input,
         ClaimsPrincipal principal,
-        AcademyDbContext db)
+        AcademyDbContext db,
+        RealtimeNotifier realtime)
     {
         var bankName = Clean(input.BankName, 120);
         var holder = Clean(input.AccountHolder, 160);
@@ -368,6 +377,7 @@ public static class PaymentEndpoints
         account.UpdatedAt = DateTimeOffset.UtcNow;
         account.UpdatedBy = ApiEndpoints.UserId(principal);
         await db.SaveChangesAsync();
+        await realtime.ToAllAsync(RealtimeScopes.Billing);
 
         return Results.Ok(ToBank(account));
     }
@@ -376,7 +386,8 @@ public static class PaymentEndpoints
         Guid teacherId,
         UpdateTeacherBillingRateRequest input,
         AcademyDbContext db,
-        UserManager<AcademyUser> users)
+        UserManager<AcademyUser> users,
+        RealtimeNotifier realtime)
     {
         if (input.StudentPriceUsd < 0 || input.PayoutEgp < 0)
             return Results.ValidationProblem(new Dictionary<string, string[]>() { ["rate"] = ["Rates cannot be negative."] });
@@ -396,6 +407,8 @@ public static class PaymentEndpoints
         rate.PayoutEgp = decimal.Round(input.PayoutEgp, 2);
         rate.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+        await realtime.ToUserAsync(teacherId, RealtimeScopes.Billing);
+        await realtime.ToStaffAsync(RealtimeScopes.Billing);
 
         return Results.Ok(new TeacherBillingRateDto(
             teacher.Id, teacher.FullName, teacher.Email ?? "",
@@ -405,7 +418,8 @@ public static class PaymentEndpoints
     private static async Task<IResult> ConfirmClaimAsync(
         Guid id,
         ClaimsPrincipal principal,
-        AcademyDbContext db)
+        AcademyDbContext db,
+        RealtimeNotifier realtime)
     {
         var claim = await db.MonthlyPaymentClaims
             .Include(x => x.Student)
@@ -428,6 +442,9 @@ public static class PaymentEndpoints
             DedupeKey = $"payment-confirmed:{claim.Id}",
         });
         await db.SaveChangesAsync();
+        await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Billing);
+        await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Billing);
 
         return Results.Ok(ToClaim(claim, claim.Student));
     }
@@ -436,7 +453,8 @@ public static class PaymentEndpoints
         Guid id,
         ReviewPaymentClaimRequest input,
         ClaimsPrincipal principal,
-        AcademyDbContext db)
+        AcademyDbContext db,
+        RealtimeNotifier realtime)
     {
         var claim = await db.MonthlyPaymentClaims
             .Include(x => x.Student)
@@ -461,6 +479,9 @@ public static class PaymentEndpoints
             DedupeKey = $"payment-rejected:{claim.Id}:{claim.ReviewedAt.Value.UtcTicks}",
         });
         await db.SaveChangesAsync();
+        await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Billing);
+        await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Billing);
 
         return Results.Ok(ToClaim(claim, claim.Student));
     }

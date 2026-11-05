@@ -125,7 +125,7 @@ public static class LessonOperationsEndpoints
         api.MapGet("/lesson-policy", async (AcademyDbContext db, CancellationToken ct) =>
             Results.Ok(LessonPolicyService.ToDto(await LessonPolicyService.GetPolicyAsync(db, ct))));
 
-        api.MapPut("/lesson-policy", async (UpdateAcademyPolicyRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+        api.MapPut("/lesson-policy", async (UpdateAcademyPolicyRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var policy = await LessonPolicyService.GetPolicyAsync(db, ct);
             var errors = new Dictionary<string, string[]>();
@@ -163,6 +163,7 @@ public static class LessonOperationsEndpoints
             policy.UpdatedBy = UserId(p);
             Audit(db, UserId(p), "policy_update", "AcademyPolicy", null, "Lesson cancellation and compensation policy updated.");
             await db.SaveChangesAsync(ct);
+            await realtime.ToAllAsync(RealtimeScopes.Policy);
             return Results.Ok(LessonPolicyService.ToDto(policy));
         }).RequireAuthorization("AdminOnly");
 
@@ -216,8 +217,9 @@ public static class LessonOperationsEndpoints
         });
 
         api.MapPost("/lessons/{id:guid}/cancel", (Guid id, CancelLessonRequest? input, ClaimsPrincipal p,
-            AcademyDbContext db, AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
-            CancelAsync(id, input?.Reason, p, db, email, push, ct));
+            AcademyDbContext db, AcademyEmailSender email, AcademyPushSender push, RealtimeNotifier realtime,
+            CancellationToken ct) =>
+            CancelAsync(id, input?.Reason, p, db, email, push, realtime, ct));
 
         // ------------------------------------------------------------ reschedule
         api.MapGet("/lessons/{id:guid}/reschedule-requests", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
@@ -234,7 +236,7 @@ public static class LessonOperationsEndpoints
 
         api.MapPost("/lessons/{id:guid}/reschedule-requests", async (
             Guid id, CreateRescheduleRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
+            AcademyEmailSender email, AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var lesson = await LoadLessonAsync(db, id, ct);
             if (lesson is null) return Results.NotFound();
@@ -296,13 +298,14 @@ public static class LessonOperationsEndpoints
             await LessonOpsMessaging.EmailAsync(email, role == "teacher" ? lesson.Student : lesson.Teacher,
                 "Lesson reschedule request", body, ct);
             await LessonOpsMessaging.PushAsync(db, push, [otherId], "Reschedule request", body, $"/lesson/{lesson.Id}", ct);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
 
             return Results.Ok(ToReschedule(request, requesterName, now));
         });
 
         api.MapPost("/reschedule-requests/{requestId:guid}/accept", async (
             Guid requestId, RespondRescheduleRequest? input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
+            AcademyEmailSender email, AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var request = await db.LessonRescheduleRequests
                 .Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
@@ -364,12 +367,13 @@ public static class LessonOperationsEndpoints
 
             await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], "Reschedule accepted",
                 $"Your lesson moved to {lesson.StartsAt:ddd, MMM d 'at' h:mm tt}.", $"/lesson/{lesson.Id}", ct);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToReschedule(request, "User", now));
         });
 
         api.MapPost("/reschedule-requests/{requestId:guid}/decline", async (
             Guid requestId, RespondRescheduleRequest? input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var request = await db.LessonRescheduleRequests.Include(x => x.Lesson)
                 .FirstOrDefaultAsync(x => x.Id == requestId, ct);
@@ -396,6 +400,7 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], "Reschedule declined",
                 "The proposed new time was declined.", $"/lesson/{lesson.Id}", ct);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToReschedule(request, "User", DateTimeOffset.UtcNow));
         });
 
@@ -416,7 +421,7 @@ public static class LessonOperationsEndpoints
         // ------------------------------------------------------------- make-up
         api.MapPost("/lessons/{id:guid}/replacement", async (
             Guid id, CreateReplacementRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyEmailSender email, AcademyPushSender push, CancellationToken ct) =>
+            AcademyEmailSender email, AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var original = await LoadLessonAsync(db, id, ct);
             if (original is null) return Results.NotFound();
@@ -464,6 +469,7 @@ public static class LessonOperationsEndpoints
 
             await LessonOpsMessaging.EmailAsync(email, original.Student, "Make-up lesson scheduled", body, ct);
             await LessonOpsMessaging.PushAsync(db, push, [original.StudentId], "Make-up lesson scheduled", body, $"/lesson/{replacement.Id}", ct);
+            await realtime.ToParticipantsAsync(original.TeacherId, original.StudentId, RealtimeScopes.Lessons, replacement.Id);
             return Results.Ok(ApiEndpoints.ToLesson(replacement));
         });
 
@@ -479,7 +485,8 @@ public static class LessonOperationsEndpoints
         });
 
         api.MapPost("/lessons/{id:guid}/attendance/events", async (
-            Guid id, AttendanceBeatRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+            Guid id, AttendanceBeatRequest input, ClaimsPrincipal p, AcademyDbContext db,
+            RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var lesson = await LoadLessonAsync(db, id, ct);
             if (lesson is null) return Results.NotFound();
@@ -570,6 +577,13 @@ public static class LessonOperationsEndpoints
                 // Two devices or a retry raced. The stored state is authoritative.
                 db.ChangeTracker.Clear();
             }
+
+            // The caller's own tabs are refreshed by the mutation middleware; the
+            // other participant's lesson screen needs this push to show someone
+            // joining or leaving the room.
+            await realtime.ToUserAsync(
+                userId == lesson.TeacherId ? lesson.StudentId : lesson.TeacherId,
+                RealtimeScopes.Lessons, lesson.Id);
 
             var current = await LessonPolicyService.BuildAttendanceSummaryAsync(db, lesson, now, policy, ct);
             var participant = current.Participants.First(x => x.UserId == userId);
@@ -770,6 +784,7 @@ public static class LessonOperationsEndpoints
         AcademyDbContext db,
         AcademyEmailSender email,
         AcademyPushSender push,
+        RealtimeNotifier realtime,
         CancellationToken ct)
     {
         var lesson = await LoadLessonAsync(db, id, ct);
@@ -868,6 +883,7 @@ public static class LessonOperationsEndpoints
 
         await db.SaveChangesAsync(ct);
         await LessonOpsMessaging.PushAsync(db, push, notifyIds, title, body, $"/lesson/{lesson.Id}", ct);
+        await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
 
         return Results.Ok(new { preview = decision, lesson = ApiEndpoints.ToLesson(lesson) });
     }
@@ -981,7 +997,7 @@ public static class LessonOperationsEndpoints
 
         admin.MapPost("/excuse-requests/{id:guid}/approve", async (
             Guid id, ExcuseReviewRequest? input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, AcademyEmailSender email, CancellationToken ct) =>
+            AcademyPushSender push, AcademyEmailSender email, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var excuse = await db.LessonExcuseRequests
                 .Include(x => x.Student).Include(x => x.Lesson)
@@ -1019,12 +1035,13 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [lesson.StudentId], "Excuse approved", body, $"/lesson/{lesson.Id}", ct);
             await LessonOpsMessaging.EmailAsync(email, lesson.Student, "Excuse approved", body, ct);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToExcuse(excuse));
         });
 
         admin.MapPost("/excuse-requests/{id:guid}/reject", async (
             Guid id, ExcuseReviewRequest? input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var excuse = await db.LessonExcuseRequests.Include(x => x.Student).Include(x => x.Lesson)
                 .FirstOrDefaultAsync(x => x.Id == id, ct);
@@ -1044,6 +1061,7 @@ public static class LessonOperationsEndpoints
             Audit(db, UserId(p), "excuse_rejected", "Lesson", excuse.LessonId, excuse.AdminNote ?? "");
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [excuse.Lesson.StudentId], "Excuse not approved", body, $"/lesson/{excuse.LessonId}", ct);
+            await realtime.ToParticipantsAsync(excuse.Lesson.TeacherId, excuse.Lesson.StudentId, RealtimeScopes.Lessons, excuse.LessonId);
             return Results.Ok(ToExcuse(excuse));
         });
 
@@ -1061,7 +1079,7 @@ public static class LessonOperationsEndpoints
 
         admin.MapPost("/lesson-incidents/{id:guid}/resolve", async (
             Guid id, ResolveIncidentRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, AcademyEmailSender email, CancellationToken ct) =>
+            AcademyPushSender push, AcademyEmailSender email, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var incident = await db.LessonIncidents
                 .Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
@@ -1181,6 +1199,7 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [lesson.StudentId, lesson.TeacherId],
                 "Attendance issue resolved", "The academy resolved a lesson attendance issue.", $"/lesson/{lesson.Id}", ct);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToIncident(incident, lesson));
         });
 
@@ -1200,7 +1219,7 @@ public static class LessonOperationsEndpoints
 
         admin.MapPost("/teacher-hours/{id:guid}/approve", async (
             Guid id, ApproveTeacherHoursRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var hours = await db.TeacherHours.Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
@@ -1221,11 +1240,13 @@ public static class LessonOperationsEndpoints
                 $"Proposed {hours.ProposedPayableMinutes}, approved {approved}. {hours.AdjustmentReason}".Trim());
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [hours.TeacherId], "Teacher hours approved", body, $"/lesson/{hours.LessonId}", ct);
+            await realtime.ToUserAsync(hours.TeacherId, RealtimeScopes.Billing, hours.LessonId);
             return Results.Ok(ToHours(hours, hours.Lesson));
         });
 
         admin.MapPost("/teacher-hours/{id:guid}/reject", async (
-            Guid id, ApproveTeacherHoursRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+            Guid id, ApproveTeacherHoursRequest input, ClaimsPrincipal p, AcademyDbContext db,
+            RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var hours = await db.TeacherHours.Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
@@ -1239,6 +1260,7 @@ public static class LessonOperationsEndpoints
             hours.AdjustmentReason = (input.Note ?? "").Trim() is { Length: > 0 } note ? note[..Math.Min(note.Length, 500)] : null;
             Audit(db, UserId(p), "teacher_hours_rejected", "TeacherHours", hours.Id, hours.AdjustmentReason ?? "");
             await db.SaveChangesAsync(ct);
+            await realtime.ToUserAsync(hours.TeacherId, RealtimeScopes.Billing, hours.LessonId);
             return Results.Ok(ToHours(hours, hours.Lesson));
         });
 
@@ -1252,7 +1274,8 @@ public static class LessonOperationsEndpoints
         });
 
         admin.MapPost("/teacher-penalties", async (
-            CreateTeacherPenaltyRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+            CreateTeacherPenaltyRequest input, ClaimsPrincipal p, AcademyDbContext db,
+            RealtimeNotifier realtime, CancellationToken ct) =>
         {
             if (!await db.Users.AnyAsync(x => x.Id == input.TeacherId, ct)) return Results.NotFound();
             if (input.AmountEgp < 0 || input.AmountEgp > 100_000)
@@ -1273,13 +1296,14 @@ public static class LessonOperationsEndpoints
             db.TeacherPenalties.Add(penalty);
             Audit(db, UserId(p), "penalty_created", "TeacherPenalty", penalty.Id, $"{eventType}: {reason}");
             await db.SaveChangesAsync(ct);
+            await realtime.ToUserAsync(penalty.TeacherId, RealtimeScopes.Billing);
             return Results.Ok(ToPenalty(await db.TeacherPenalties.Include(x => x.Teacher)
                 .FirstAsync(x => x.Id == penalty.Id, ct)));
         });
 
         admin.MapPost("/teacher-penalties/{id:guid}/review", async (
             Guid id, ReviewTeacherPenaltyRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var penalty = await db.TeacherPenalties.Include(x => x.Teacher).FirstOrDefaultAsync(x => x.Id == id, ct);
             if (penalty is null) return Results.NotFound();
@@ -1298,6 +1322,7 @@ public static class LessonOperationsEndpoints
             Audit(db, UserId(p), $"penalty_{status}", "TeacherPenalty", penalty.Id, penalty.AdminNote ?? "");
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [penalty.TeacherId], "Penalty review", body, "/earnings", ct);
+            await realtime.ToUserAsync(penalty.TeacherId, RealtimeScopes.Billing);
             return Results.Ok(ToPenalty(penalty));
         });
 
@@ -1343,7 +1368,7 @@ public static class LessonOperationsEndpoints
 
         admin.MapPost("/students/{studentId:guid}/credits/adjust", async (
             Guid studentId, AdjustCreditRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             if (input.Amount is 0 || Math.Abs(input.Amount) > 50)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["amount"] = ["Adjust by a non-zero amount between -50 and 50."] });
@@ -1367,6 +1392,7 @@ public static class LessonOperationsEndpoints
             Audit(db, UserId(p), "credit_adjusted", "Student", studentId, body);
             await db.SaveChangesAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [studentId], "Lesson credit adjustment", body, "/schedule", ct);
+            await realtime.ToUserAsync(studentId, RealtimeScopes.Lessons);
             return Results.Ok(ToCredit(credit));
         });
 
@@ -1379,7 +1405,7 @@ public static class LessonOperationsEndpoints
             return Results.Ok(items.Select(ToSalary));
         });
 
-        admin.MapPost("/salary-periods/generate", async (GenerateSalaryPeriodsRequest? input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+        admin.MapPost("/salary-periods/generate", async (GenerateSalaryPeriodsRequest? input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var now = DateTimeOffset.UtcNow;
             var (start, end, key) = LessonPolicyService.MonthBounds(input?.Month, now);
@@ -1429,6 +1455,7 @@ public static class LessonOperationsEndpoints
 
             Audit(db, UserId(p), "salary_periods_generated", "SalaryPeriod", null, $"Generated {key} salary review totals.");
             await db.SaveChangesAsync(ct);
+            await realtime.ToUsersAsync(teacherIds, RealtimeScopes.Billing);
             var rows = await db.SalaryPeriods.AsNoTracking().Include(x => x.Teacher)
                 .Where(x => x.Month == key).OrderBy(x => x.Teacher!.FullName).ToListAsync(ct);
             return Results.Ok(rows.Select(ToSalary));
@@ -1436,7 +1463,7 @@ public static class LessonOperationsEndpoints
 
         admin.MapPatch("/salary-periods/{id:guid}", async (
             Guid id, UpdateSalaryPeriodRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
             var period = await db.SalaryPeriods.Include(x => x.Teacher).FirstOrDefaultAsync(x => x.Id == id, ct);
             if (period is null) return Results.NotFound();
@@ -1482,6 +1509,7 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
             if (status is "reviewed" or "paid")
                 await LessonOpsMessaging.PushAsync(db, push, [period.TeacherId], "Salary review", body, "/earnings", ct);
+            await realtime.ToUserAsync(period.TeacherId, RealtimeScopes.Billing, period.Id);
             return Results.Ok(ToSalary(period));
         });
     }
