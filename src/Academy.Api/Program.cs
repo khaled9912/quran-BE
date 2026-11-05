@@ -156,7 +156,6 @@ else
     builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
 builder.Services.AddHealthChecks().AddDbContextCheck<AcademyDbContext>("database");
 builder.Services.AddHostedService<LessonOpsMonitor>();
-builder.Services.AddSignalR();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -198,8 +197,6 @@ app.UseAuthorization();
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "rayan-academy-api" }));
 app.MapHealthChecks("/health/ready");
-// TEMPORARY: WebSocket transport probe for MonsterASP. Remove with the hub.
-app.MapHub<RealtimeSpikeHub>("/api/realtime/spike");
 app.MapAcademyApi();
 app.MapLessonOperations();
 app.MapTeacherApplications();
