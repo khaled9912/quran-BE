@@ -4,6 +4,7 @@ using System.Security.Claims;
 using Academy.Api;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
@@ -121,6 +122,12 @@ builder.Services.AddAuthentication(IdentityConstants.ApplicationScheme)
         RealtimeTicketDefaults.Scheme, null);
 builder.Services.AddAuthorization(options =>
 {
+    // Fail closed. Every endpoint is private unless it declares its own policy, so a
+    // new route that forgets RequireAuthorization() cannot ship as an open door.
+    // Public routes opt out with AllowAnonymous(), which overrides this fallback.
+    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
     options.AddPolicy("AdminOnly", p => p.RequireRole("admin", "super_admin"));
     options.AddPolicy("TeacherOnly", p => p.RequireRole("teacher"));
     options.AddPolicy("StudentOnly", p => p.RequireRole("student"));
@@ -217,8 +224,8 @@ app.Use(async (context, next) =>
     _ = notifier.ToStaffAsync(RealtimeScopes.Admin);
 });
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
-app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "ana-quran-academy-api" }));
-app.MapHealthChecks("/health/ready");
+app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "ana-quran-academy-api" })).AllowAnonymous();
+app.MapHealthChecks("/health/ready").AllowAnonymous();
 app.MapRealtime();
 app.MapAcademyApi();
 app.MapLessonOperations();
