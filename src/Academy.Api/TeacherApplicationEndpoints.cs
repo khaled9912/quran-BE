@@ -74,6 +74,8 @@ public static class TeacherApplicationEndpoints
 
         if (fullName.Length is < 2 or > 160)
             errors["fullName"] = ["Enter your full name (2 to 160 characters)."];
+        else if (ApiEndpoints.NameContainsContact(fullName))
+            errors["fullName"] = ["Enter your name, not an email address."];
         if (email.Length is 0 or > 254 || !System.Net.Mail.MailAddress.TryCreate(email, out _))
             errors["email"] = ["Enter a valid email address."];
         if (phone is null)

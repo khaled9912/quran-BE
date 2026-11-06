@@ -14,6 +14,14 @@ public static class ApiEndpoints
     private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
     private static bool IsAdmin(ClaimsPrincipal p) => p.IsInRole("admin") || p.IsInRole("super_admin");
     private static UserDto ToUser(AcademyUser u, string role) => new(u.Id, u.FullName, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, u.FullName, u.IsActive, u.FullName, u.PhoneNumber, $"/api/users/{u.Id}/avatar");
+
+    // What the other side of a lesson is allowed to see: who they are, never how
+    // to reach them. Contact details stay inside staff and self-service responses.
+    private static UserDto ToPerson(AcademyUser u, string role) => ToUser(u, role) with { Email = "", PhoneNumber = null };
+
+    // A name field is for a person, so an email address in it is a mistake even
+    // when the address is valid, and it would leak into every listing.
+    internal static bool NameContainsContact(string? fullName) => fullName is not null && fullName.Contains('@');
     private static async Task<string> RoleOf(UserManager<AcademyUser> users, AcademyUser user)
         => (await users.GetRolesAsync(user)).FirstOrDefault() ?? "student";
     private static LessonRequestDto ToRequest(LessonRequest r)
@@ -67,6 +75,8 @@ public static class ApiEndpoints
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
+            if (NameContainsContact(input.FullName))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter the student's name, not an email address."] });
             if (!RegistrationPolicy.IsAllowed(http, input.Country))
                 return Results.Problem(RegistrationPolicy.BlockedMessage, statusCode: 403);
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
@@ -198,6 +208,8 @@ public static class ApiEndpoints
 
             if (input.FullName is not null && (fullName!.Length is < 2 or > 160))
                 errors["fullName"] = ["Enter your full name (2 to 160 characters)."];
+            if (input.FullName is not null && NameContainsContact(fullName))
+                errors["fullName"] = ["Enter your name, not an email address."];
             if (input.Email is not null && (email!.Length == 0 || !System.Net.Mail.MailAddress.TryCreate(email, out _)))
                 errors["email"] = ["Enter a valid email address."];
             if (input.PhoneNumber is not null)
@@ -353,6 +365,8 @@ public static class ApiEndpoints
                 if (fullName.Length == 0) return Results.Ok(new { requiresProfile = true });
                 if (fullName.Length is < 2 or > 160)
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter your full name (2 to 160 characters)."] });
+                if (NameContainsContact(fullName))
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter your name, not an email address."] });
                 user = new AcademyUser
                 {
                     Id = Guid.NewGuid(),
@@ -608,7 +622,7 @@ public static class ApiEndpoints
                 {
                     ratings.TryGetValue(teacher.Id, out var rating);
                     return new TeacherAvailabilityDto(
-                        ToUser(teacher, "teacher"),
+                        ToPerson(teacher, "teacher"),
                         slots.Where(slot => slot.TeacherId == teacher.Id)
                             .Select(slot => new AvailabilityDto(slot.Id, slot.TeacherId, slot.StartsAt, slot.EndsAt, slot.Status))
                             .ToList(),
@@ -634,7 +648,7 @@ public static class ApiEndpoints
             {
                 ratings.TryGetValue(teacher.Id, out var rating);
                 result.Add(new WeeklyTeacherDto(
-                    ToUser(teacher, "teacher"),
+                    ToPerson(teacher, "teacher"),
                     await WeeklyRulesAsync(db, teacher.Id, null),
                     rating?.Average,
                     rating?.Count ?? 0));
@@ -659,7 +673,7 @@ public static class ApiEndpoints
                 .ToListAsync();
             var reviewCount = await db.TeacherReviews.CountAsync(x => x.TeacherId == id);
             var average = reviewCount == 0 ? (double?)null : await db.TeacherReviews.Where(x => x.TeacherId == id).AverageAsync(x => (double)x.Rating);
-            return Results.Ok(new TeacherAvailabilityDto(ToUser(teacher, "teacher"), slots, average, reviewCount, reviews.Select(ToReview).ToList()));
+            return Results.Ok(new TeacherAvailabilityDto(ToPerson(teacher, "teacher"), slots, average, reviewCount, reviews.Select(ToReview).ToList()));
         }).RequireAuthorization();
 
         api.MapGet("/teachers/public", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
@@ -707,7 +721,7 @@ public static class ApiEndpoints
             var q = users.Users.Where(x => x.IsActive || includeInactiveForAdmin);
             if (HasRole(p, "teacher")) { var id = UserId(p); var studentIds = db.Assignments.Where(a => a.TeacherId == id && a.IsActive).Select(a => a.StudentId); q = q.Where(u => studentIds.Contains(u.Id)); }
             var list = await q.ToListAsync(); var result = new List<UserDto>();
-            foreach (var user in list) if (await users.IsInRoleAsync(user, "student")) result.Add(ToUser(user, "student"));
+            foreach (var user in list) if (await users.IsInRoleAsync(user, "student")) result.Add(IsAdmin(p) ? ToUser(user, "student") : ToPerson(user, "student"));
             return Results.Ok(result);
         }).RequireAuthorization();
         api.MapPost("/students", async (CreateStudentRequest input, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
@@ -727,7 +741,10 @@ public static class ApiEndpoints
             var user = await users.FindByIdAsync(id.ToString()); if (user is null || !await users.IsInRoleAsync(user, "student")) return Results.NotFound();
             if (HasRole(p, "teacher") && !await db.Assignments.AnyAsync(a => a.TeacherId == UserId(p) && a.StudentId == id && a.IsActive)) return Results.Forbid();
             if (!IsAdmin(p) && !HasRole(p, "teacher") && UserId(p) != id) return Results.Forbid();
-            return Results.Ok(ToUser(user, "student"));
+            // Staff and the student themself keep the contact fields; a teacher
+            // sees who the student is, not how to reach them.
+            var canSeeContact = IsAdmin(p) || UserId(p) == id;
+            return Results.Ok(canSeeContact ? ToUser(user, "student") : ToPerson(user, "student"));
         }).RequireAuthorization();
 
         var teacher = api.MapGroup("/teacher").RequireAuthorization("TeacherOnly");
@@ -825,7 +842,7 @@ public static class ApiEndpoints
             var reviews = await db.TeacherReviews.AsNoTracking().Include(x => x.Lesson).Include(x => x.Teacher).Include(x => x.Student)
                 .Where(x => x.TeacherId == assignment.TeacherId)
                 .OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
-            return Results.Ok(new TeacherAvailabilityDto(ToUser(assignment.Teacher, "teacher"), slots, rating.Average, rating.Count, reviews.Select(x => ToReview(x)).ToList()));
+            return Results.Ok(new TeacherAvailabilityDto(ToPerson(assignment.Teacher, "teacher"), slots, rating.Average, rating.Count, reviews.Select(x => ToReview(x)).ToList()));
         }).RequireAuthorization("StudentOnly");
 
         // Weekly availability: the teacher announces recurring slots once and
@@ -1768,7 +1785,7 @@ public static class ApiEndpoints
         var reviews = await db.TeacherReviews.AsNoTracking().Include(x => x.Lesson).Include(x => x.Teacher).Include(x => x.Student)
             .Where(x => x.TeacherId == teacher.Id).OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
         var hasLessons = await db.Lessons.AnyAsync(x => x.StudentId == studentId);
-        return new WeeklyAvailabilityDto(ToUser(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons);
+        return new WeeklyAvailabilityDto(ToPerson(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons);
     }
 
     private static async Task<(List<TeacherAvailabilityRule>? Created, string? Error)> CreateAvailabilityRulesAsync(
