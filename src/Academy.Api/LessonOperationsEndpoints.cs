@@ -259,7 +259,19 @@ public static class LessonOperationsEndpoints
             var role = ActorRole(p);
             var participant = lesson.TeacherId == UserId(p) || lesson.StudentId == UserId(p);
             if (!participant && !IsAdmin(p)) return Results.Forbid();
-            if (lesson.Status != "scheduled" || lesson.EndsAt <= DateTimeOffset.UtcNow)
+
+            // A cancelled lesson can still be rebooked, but only as a proposal:
+            // the make-up row is not created until the student accepts it.
+            var isMakeup = lesson.Status == "cancelled";
+            if (isMakeup)
+            {
+                if (!IsAdmin(p) && ActorRole(p) != "teacher") return Results.Forbid();
+                if (lesson.IsMakeup)
+                    return Results.Conflict(new { message = "A make-up lesson cannot be rescheduled again." });
+                if (await db.Lessons.AnyAsync(x => x.OriginalLessonId == id && x.Status != "cancelled", ct))
+                    return Results.Conflict(new { message = "This cancelled lesson already has an active replacement." });
+            }
+            else if (lesson.Status != "scheduled" || lesson.EndsAt <= DateTimeOffset.UtcNow)
                 return Results.Conflict(new { message = "Only a scheduled, upcoming lesson can be rescheduled." });
 
             var now = DateTimeOffset.UtcNow;
@@ -300,20 +312,26 @@ public static class LessonOperationsEndpoints
             };
             db.LessonRescheduleRequests.Add(request);
 
-            var otherId = role == "teacher" ? lesson.StudentId : lesson.TeacherId;
+            var otherId = isMakeup || role == "teacher" ? lesson.StudentId : lesson.TeacherId;
             var requesterName = role == "teacher"
                 ? lesson.Teacher?.FullName ?? "Your teacher"
                 : role == "student" ? lesson.Student?.FullName ?? "Your student" : "The academy";
-            var body = $"{requesterName} proposed moving the lesson to {LessonOpsMessaging.When(proposedStarts, lesson.Series?.TimeZoneId)}. Reply within {policy.RescheduleResponseHours} hours.";
+            var replyWindow = policy.RescheduleResponseHours;
+            var when = LessonOpsMessaging.When(proposedStarts, lesson.Series?.TimeZoneId);
+            var (noticeTitle, body) = isMakeup
+                ? ("Make-up lesson request",
+                    $"{requesterName} proposed a make-up lesson on {when}. Reply within {replyWindow} hours.")
+                : ("Reschedule request",
+                    $"{requesterName} proposed moving the lesson to {when}. Reply within {replyWindow} hours.");
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                otherId, "Reschedule request", body, "lesson", $"/lesson/{lesson.Id}", $"reschedule:{request.Id}"));
+                otherId, noticeTitle, body, "lesson", $"/lesson/{lesson.Id}", $"reschedule:{request.Id}"));
             Audit(db, UserId(p), "reschedule_requested", "Lesson", lesson.Id,
-                $"Proposed {proposedStarts:u} to {proposedEnds:u}.");
+                $"{(isMakeup ? "Proposed make-up" : "Proposed")} {proposedStarts:u} to {proposedEnds:u}.");
             await db.SaveChangesAsync(ct);
 
-            await LessonOpsMessaging.EmailAsync(email, role == "teacher" ? lesson.Student : lesson.Teacher,
-                "Lesson reschedule request", body, ct);
-            await LessonOpsMessaging.PushAsync(db, push, [otherId], "Reschedule request", body, $"/lesson/{lesson.Id}", ct);
+            await LessonOpsMessaging.EmailAsync(email, isMakeup || role == "teacher" ? lesson.Student : lesson.Teacher,
+                isMakeup ? "Make-up lesson proposal" : "Lesson reschedule request", body, ct);
+            await LessonOpsMessaging.PushAsync(db, push, [otherId], noticeTitle, body, $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
 
             return Results.Ok(ToReschedule(request, requesterName, now));
@@ -338,18 +356,26 @@ public static class LessonOperationsEndpoints
             }
             if (request.Status != "pending")
                 return Results.Conflict(new { message = "This reschedule request is no longer open." });
-            if (lesson.Status != "scheduled" || lesson.EndsAt <= now)
+            // A cancelled lesson is rebooked as a make-up instead of moved.
+            var isMakeup = lesson.Status == "cancelled";
+            if (!isMakeup && (lesson.Status != "scheduled" || lesson.EndsAt <= now))
             {
                 request.Status = "cancelled";
                 request.RespondedAt = now;
                 await db.SaveChangesAsync(ct);
                 return Results.Conflict(new { message = "This lesson is no longer open for rescheduling." });
             }
+            if (isMakeup && await db.Lessons.AnyAsync(
+                    x => x.OriginalLessonId == lesson.Id && x.Status != "cancelled", ct))
+                return Results.Conflict(new { message = "This cancelled lesson already has an active replacement." });
 
-            var counterpart = request.RequestedById == lesson.TeacherId ? lesson.StudentId
+            // The student answers a make-up proposal whoever raised it; the other
+            // side of a normal reschedule is whichever participant did not ask.
+            var responderId = isMakeup ? lesson.StudentId
+                : request.RequestedById == lesson.TeacherId ? lesson.StudentId
                 : request.RequestedById == lesson.StudentId ? lesson.TeacherId
                 : Guid.Empty;
-            if (UserId(p) != counterpart && !IsAdmin(p)) return Results.Forbid();
+            if (UserId(p) != responderId && !IsAdmin(p)) return Results.Forbid();
             if (UserId(p) == request.RequestedById) return Results.Forbid();
             if (request.ProposedStartsAt <= now)
                 return Results.Conflict(new { message = "The proposed time has already passed. Ask for a new time." });
@@ -357,13 +383,48 @@ public static class LessonOperationsEndpoints
                     request.ProposedStartsAt, request.ProposedEndsAt, ct))
                 return Results.Conflict(new { message = "The teacher or student now has another lesson at that time." });
 
-            var previous = (lesson.StartsAt, lesson.EndsAt);
-            lesson.StartsAt = request.ProposedStartsAt;
-            lesson.EndsAt = request.ProposedEndsAt;
+            var responseNote = (input?.Note ?? "").Trim() is { Length: > 0 } note
+                ? note[..Math.Min(note.Length, 500)]
+                : null;
             request.Status = "accepted";
             request.RespondedById = UserId(p);
             request.RespondedAt = now;
-            request.ResponseNote = (input?.Note ?? "").Trim() is { Length: > 0 } note ? note[..Math.Min(note.Length, 500)] : null;
+            request.ResponseNote = responseNote;
+
+            if (isMakeup)
+            {
+                var replacement = new Lesson
+                {
+                    TeacherId = lesson.TeacherId,
+                    StudentId = lesson.StudentId,
+                    StartsAt = request.ProposedStartsAt,
+                    EndsAt = request.ProposedEndsAt,
+                    Status = "scheduled",
+                    IsMakeup = true,
+                    OriginalLessonId = lesson.Id,
+                    Teacher = lesson.Teacher,
+                    Student = lesson.Student,
+                };
+                db.Lessons.Add(replacement);
+                var bookedFor = LessonOpsMessaging.When(replacement.StartsAt, lesson.Series?.TimeZoneId);
+                var reply = $"Your make-up lesson is booked for {bookedFor}.";
+                db.Notifications.Add(LessonOpsMessaging.Notice(
+                    request.RequestedById, "Make-up lesson booked", reply,
+                    "lesson", $"/lesson/{replacement.Id}", $"reschedule-accepted:{request.Id}"));
+                Audit(db, UserId(p), "reschedule_accepted", "Lesson", replacement.Id,
+                    $"Make-up for cancelled lesson {lesson.Id} accepted at {replacement.StartsAt:u}.");
+                await db.SaveChangesAsync(ct);
+
+                await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById],
+                    "Make-up lesson booked", reply, $"/lesson/{replacement.Id}", ct);
+                await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
+                await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, replacement.Id);
+                return Results.Ok(ToReschedule(request, "User", now));
+            }
+
+            var previous = (lesson.StartsAt, lesson.EndsAt);
+            lesson.StartsAt = request.ProposedStartsAt;
+            lesson.EndsAt = request.ProposedEndsAt;
             db.LessonScheduleChanges.Add(new LessonScheduleChange
             {
                 LessonId = lesson.Id,
@@ -399,10 +460,12 @@ public static class LessonOperationsEndpoints
             if (request.Status != "pending")
                 return Results.Conflict(new { message = "This reschedule request is no longer open." });
             var lesson = request.Lesson;
-            var counterpart = request.RequestedById == lesson.TeacherId ? lesson.StudentId
+            var isMakeup = lesson.Status == "cancelled";
+            var responderId = isMakeup ? lesson.StudentId
+                : request.RequestedById == lesson.TeacherId ? lesson.StudentId
                 : request.RequestedById == lesson.StudentId ? lesson.TeacherId
                 : Guid.Empty;
-            if (UserId(p) != counterpart && !IsAdmin(p)) return Results.Forbid();
+            if (UserId(p) != responderId && !IsAdmin(p)) return Results.Forbid();
             if (UserId(p) == request.RequestedById) return Results.Forbid();
 
             var note = (input?.Note ?? "").Trim();
@@ -410,14 +473,19 @@ public static class LessonOperationsEndpoints
             request.RespondedById = UserId(p);
             request.RespondedAt = DateTimeOffset.UtcNow;
             request.ResponseNote = note.Length == 0 ? null : note[..Math.Min(note.Length, 500)];
+            var (declineTitle, declineBody) = isMakeup
+                ? ("Make-up declined", note.Length == 0
+                    ? "The proposed make-up time was declined. Nothing was booked."
+                    : $"The proposed make-up time was declined: {request.ResponseNote}")
+                : ("Reschedule declined", note.Length == 0
+                    ? "The proposed new time was declined. Your lesson stays as scheduled."
+                    : $"The proposed new time was declined: {request.ResponseNote}");
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                request.RequestedById, "Reschedule declined",
-                note.Length == 0 ? "The proposed new time was declined. Your lesson stays as scheduled."
-                    : $"The proposed new time was declined: {request.ResponseNote}",
+                request.RequestedById, declineTitle, declineBody,
                 "lesson", $"/lesson/{lesson.Id}", $"reschedule-declined:{request.Id}"));
             await db.SaveChangesAsync(ct);
-            await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], "Reschedule declined",
-                "The proposed new time was declined.", $"/lesson/{lesson.Id}", ct);
+            await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], declineTitle, declineBody,
+                $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToReschedule(request, "User", DateTimeOffset.UtcNow));
         });
@@ -443,8 +511,9 @@ public static class LessonOperationsEndpoints
         {
             var original = await LoadLessonAsync(db, id, ct);
             if (original is null) return Results.NotFound();
-            if (!IsAdmin(p) && !(p.IsInRole("teacher") && original.TeacherId == UserId(p)))
-                return Results.Forbid();
+            // Teachers propose a make-up through the reschedule request above and
+            // the student accepts it; this direct booking is the staff override.
+            if (!IsAdmin(p)) return Results.Forbid();
             if (original.Status != "cancelled")
                 return Results.Conflict(new { message = "A replacement can only be created for a cancelled lesson." });
             if (await db.Lessons.AnyAsync(x => x.OriginalLessonId == id && x.Status != "cancelled", ct))

@@ -193,11 +193,15 @@ student, a teacher, and an admin can call the same route on their own lesson.
 | GET | `/lessons/{id}/cancellation-preview` | Participant or admin |
 | POST | `/lessons/{id}/cancel` | Participant or admin; `{ reason?, ... }` |
 | GET | `/lessons/{id}/reschedule-requests` | Participant or admin |
-| POST | `/lessons/{id}/reschedule-requests` | Participant or admin |
-| POST | `/reschedule-requests/{requestId}/accept` | Invited participant |
+| POST | `/lessons/{id}/reschedule-requests` | Participant or admin; on a cancelled lesson, teacher or admin only |
+| POST | `/reschedule-requests/{requestId}/accept` | Invited participant; the student when the lesson was cancelled |
 | POST | `/reschedule-requests/{requestId}/decline` | Invited participant |
 | POST | `/reschedule-requests/{requestId}/cancel` | Requester |
-| POST | `/lessons/{id}/replacement` | Admin; make-up lesson |
+| POST | `/lessons/{id}/replacement` | Admin only; direct make-up override, no client calls it |
+
+Accepting a request on a scheduled lesson moves that lesson. Accepting one on a cancelled
+lesson books the make-up (`isMakeup`, `originalLessonId`) instead — the proposal alone books
+nothing, so a rebooked time is only settled once the student replies.
 | GET | `/lessons/{id}/attendance` | Participant or admin |
 | POST | `/lessons/{id}/attendance/events` | Participant; idempotent `eventId` |
 | GET | `/lessons/{id}/excuse` | Participant or admin |

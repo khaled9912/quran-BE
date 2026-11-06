@@ -2,13 +2,13 @@ using System.Text.Json.Serialization;
 
 namespace Academy.Api;
 
-public sealed record RegisterRequest(string FullName, string Email, string Password);
+public sealed record RegisterRequest(string FullName, string Email, string Password, string? Country);
 public sealed record LoginRequest(string Email, string Password);
 public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
 public sealed record PasswordResetRequestInput(string Email);
 public sealed record PasswordResetInput(string Email, string Code, string NewPassword);
 public sealed record OtpRequest(string Phone);
-public sealed record OtpVerifyRequest(string Phone, string Code, string? FullName);
+public sealed record OtpVerifyRequest(string Phone, string Code, string? FullName, string? Country);
 public sealed record CreateUserRequest(string FullName, string Email, string Password, string Role);
 public sealed record CreateStudentRequest(string FullName, string Email, string Password, string? Grade);
 public sealed record UpdateUserRequest(string? FullName, string? Email, string? Password, bool? IsActive);
