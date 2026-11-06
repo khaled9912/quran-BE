@@ -12,6 +12,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
     public DbSet<TeacherStudentAssignment> Assignments => Set<TeacherStudentAssignment>();
     public DbSet<AvailabilitySlot> AvailabilitySlots => Set<AvailabilitySlot>();
     public DbSet<StudentAvailability> StudentAvailabilities => Set<StudentAvailability>();
+    public DbSet<OpenStudentOffer> OpenStudentOffers => Set<OpenStudentOffer>();
     public DbSet<LessonRequest> LessonRequests => Set<LessonRequest>();
     public DbSet<TeacherAvailabilityRule> TeacherAvailabilityRules => Set<TeacherAvailabilityRule>();
     public DbSet<LessonSeries> LessonSeries => Set<LessonSeries>();
@@ -72,6 +73,12 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<StudentAvailability>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<StudentAvailability>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<StudentAvailability>().HasIndex(x => new { x.StudentId, x.StartsAt, x.EndsAt });
+        b.Entity<OpenStudentOffer>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<OpenStudentOffer>().HasOne(x => x.ClaimedByTeacher).WithMany().HasForeignKey(x => x.ClaimedByTeacherId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<OpenStudentOffer>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.SetNull);
+        b.Entity<OpenStudentOffer>().HasIndex(x => new { x.StudentId, x.StartsAt });
+        b.Entity<OpenStudentOffer>().HasIndex(x => new { x.Status, x.StartsAt });
+        b.Entity<OpenStudentOffer>().HasIndex(x => new { x.Status, x.ClaimedAt });
         b.Entity<LessonRequest>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<LessonRequest>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<LessonRequest>().HasOne(x => x.AvailabilitySlot).WithMany().HasForeignKey(x => x.AvailabilitySlotId).OnDelete(DeleteBehavior.Restrict);
@@ -104,6 +111,8 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<AppNotification>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.CreatedAt });
         b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.DedupeKey }).IsUnique().HasFilter("\"DedupeKey\" IS NOT NULL");
+        // Broadcast notifications are updated by dedupe key across every recipient.
+        b.Entity<AppNotification>().HasIndex(x => x.DedupeKey).HasFilter("\"DedupeKey\" IS NOT NULL");
         b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.ReadAt });
         b.Entity<UserAvatar>().ToTable("UserAvatars");
         b.Entity<UserAvatar>().HasKey(x => x.UserId);

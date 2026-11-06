@@ -107,6 +107,27 @@ public sealed class StudentAvailability
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+/// <summary>
+/// A time an unassigned student offers to every active teacher. The first
+/// teacher to accept books a one-off lesson instantly and closes the offer.
+/// </summary>
+public sealed class OpenStudentOffer
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    public DateTimeOffset StartsAt { get; set; }
+    public DateTimeOffset EndsAt { get; set; }
+    // open | claimed | withdrawn
+    [MaxLength(20)] public string Status { get; set; } = "open";
+    public Guid? ClaimedByTeacherId { get; set; }
+    public AcademyUser? ClaimedByTeacher { get; set; }
+    public Guid? LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ClaimedAt { get; set; }
+}
+
 public sealed class LessonRequest
 {
     public Guid Id { get; set; } = Guid.NewGuid();

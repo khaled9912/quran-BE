@@ -20,6 +20,7 @@ public sealed record CreateLessonRequest(Guid TeacherId, Guid StudentId, DateTim
 public sealed record ContactRequest(string Name, string Email, string Message);
 public sealed record RejectRequest(string? Reason);
 public sealed record RequestSlotInput(Guid AvailabilitySlotId);
+public sealed record PublishOpenOfferRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt);
 public sealed record CreateAvailabilityRulesRequest(List<int>? DaysOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
 public sealed record BookWeeklySlotsRequest(List<Guid>? RuleIds);
 public sealed record CreateLessonChangeRequestInput(Guid RequestedRuleId, string? Note);
@@ -43,6 +44,7 @@ public sealed record LessonQualityReviewInput(
 public sealed record UserDto(Guid Id, string FullName, string Email, string Role, bool IsActive, [property: JsonPropertyName("full_name")] string FullNameSnake, [property: JsonPropertyName("is_active")] bool IsActiveSnake, string Name, string? PhoneNumber, string? AvatarUrl);
 public sealed record AssignmentDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset CreatedAt, bool IsActive, string Status);
 public sealed record AvailabilityDto(Guid Id, Guid TeacherId, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status);
+public sealed record OpenStudentOfferDto(Guid Id, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, Guid? ClaimedByTeacherId, string? ClaimedByTeacherName, Guid? LessonId, DateTimeOffset CreatedAt, DateTimeOffset? ClaimedAt);
 public sealed record TeacherAvailabilityDto(UserDto Teacher, IReadOnlyList<AvailabilityDto> Slots, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null);
 public sealed record WeeklyTeacherDto(UserDto Teacher, IReadOnlyList<WeeklyRuleDto> Slots, double? AverageRating = null, int ReviewCount = 0);
 public sealed record LessonRequestDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, Guid? AvailabilitySlotId, Guid? StudentAvailabilityId, string InitiatedBy, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset CreatedAt, string? RejectionReason);

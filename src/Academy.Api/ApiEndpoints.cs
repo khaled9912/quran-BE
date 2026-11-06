@@ -483,7 +483,8 @@ public static class ApiEndpoints
         {
             var teacher = await users.FindByIdAsync(teacherId.ToString());
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
-            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future slot with a duration up to 4 hours." });
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt) return Results.BadRequest(new { message = "Choose a future slot with an end after the start." });
+            if (!HasAllowedLessonLength(input.EndsAt - input.StartsAt)) return Results.BadRequest(new { message = LessonLengthMessage });
             var conflict = await db.AvailabilitySlots.AnyAsync(x => x.TeacherId == teacherId && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
                 || await db.Lessons.AnyAsync(x => x.TeacherId == teacherId && x.Status == "scheduled" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt);
             if (conflict) return Results.Conflict(new { message = "This time overlaps another published slot or lesson." });
@@ -730,7 +731,8 @@ public static class ApiEndpoints
         teacher.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
         teacher.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
-            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future slot with a duration up to 4 hours." });
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt) return Results.BadRequest(new { message = "Choose a future slot with an end after the start." });
+            if (!HasAllowedLessonLength(input.EndsAt - input.StartsAt)) return Results.BadRequest(new { message = LessonLengthMessage });
             var id = UserId(p);
             var conflict = await db.AvailabilitySlots.AnyAsync(x => x.TeacherId == id && x.Status != "available" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
                 || await db.Lessons.AnyAsync(x => x.TeacherId == id && x.Status == "scheduled" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt)
@@ -892,6 +894,11 @@ public static class ApiEndpoints
             if (firstEverLesson && created.Count > 0) created.OrderBy(x => x.StartsAt).First().IsTrial = true;
             await db.SaveChangesAsync();
             await tx.CommitAsync();
+
+            // Booking a weekly time makes the student assigned, so any open
+            // broadcast offers can no longer be claimed.
+            await db.OpenStudentOffers.Where(x => x.StudentId == studentId && x.Status == "open")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "withdrawn"));
 
             var seriesIds = series.Select(x => x.Id).ToList();
             var lessonIds = created.Select(x => x.Id).ToList();
@@ -1092,7 +1099,8 @@ public static class ApiEndpoints
         studentApi.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
-            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt || input.EndsAt - input.StartsAt > TimeSpan.FromHours(4)) return Results.BadRequest(new { message = "Choose a future preferred time with a duration up to 4 hours." });
+            if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt) return Results.BadRequest(new { message = "Choose a future preferred time with an end after the start." });
+            if (!HasAllowedLessonLength(input.EndsAt - input.StartsAt)) return Results.BadRequest(new { message = LessonLengthMessage });
             var assignment = await db.Assignments.Where(x => x.StudentId == studentId && x.IsActive).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync();
             if (assignment is null) return Results.Conflict(new { message = "You do not have an assigned teacher yet." });
             var overlaps = await db.StudentAvailabilities.AnyAsync(x => x.StudentId == studentId && x.Status != "rejected" && x.StartsAt < input.EndsAt && x.EndsAt > input.StartsAt);
@@ -1131,6 +1139,192 @@ public static class ApiEndpoints
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
             return Results.Created($"/api/lesson-requests/{request.Id}", await RequestById(db, request.Id));
         }).RequireAuthorization("TeacherOnly");
+
+        // Open student offers: an unassigned student posts a time, every active
+        // teacher is notified, and the first acceptance books the lesson.
+        studentApi.MapGet("/open-offers", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var studentId = UserId(p);
+            var now = DateTimeOffset.UtcNow;
+            var offers = await db.OpenStudentOffers.AsNoTracking()
+                .Where(x => x.StudentId == studentId && x.StartsAt > now.AddDays(-1))
+                .OrderBy(x => x.StartsAt)
+                .Select(x => new OpenStudentOfferDto(
+                    x.Id, x.StudentId, x.Student != null ? x.Student.FullName : "Student",
+                    x.StartsAt, x.EndsAt, x.Status, x.ClaimedByTeacherId,
+                    x.ClaimedByTeacher != null ? x.ClaimedByTeacher.FullName : null,
+                    x.LessonId, x.CreatedAt, x.ClaimedAt))
+                .ToListAsync();
+            return Results.Ok(offers);
+        });
+        studentApi.MapPost("/open-offers", async (PublishOpenOfferRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var studentId = UserId(p);
+            var now = DateTimeOffset.UtcNow;
+            var starts = input.StartsAt.ToUniversalTime();
+            var ends = input.EndsAt.ToUniversalTime();
+            if (starts <= now || ends <= starts)
+                return Results.BadRequest(new { message = "Choose a future time with an end after the start." });
+            if (!HasAllowedLessonLength(ends - starts))
+                return Results.BadRequest(new { message = LessonLengthMessage });
+            if (await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.IsActive))
+                return Results.Conflict(new { message = "You already have a teacher. Book a weekly time from the book page instead." });
+            if (await db.OpenStudentOffers.CountAsync(x => x.StudentId == studentId && x.Status == "open" && x.StartsAt > now) >= 4)
+                return Results.Conflict(new { message = "You can offer up to 4 times. Withdraw one to add another." });
+            if (await db.OpenStudentOffers.AnyAsync(x => x.StudentId == studentId && x.Status == "open" && x.StartsAt < ends && x.EndsAt > starts))
+                return Results.Conflict(new { message = "This overlaps another time you offered." });
+            if (await db.Lessons.AnyAsync(x => x.StudentId == studentId && x.Status == "scheduled" && x.StartsAt < ends && x.EndsAt > starts))
+                return Results.Conflict(new { message = "This overlaps a lesson you already have." });
+
+            var offer = new OpenStudentOffer { StudentId = studentId, StartsAt = starts, EndsAt = ends };
+            db.OpenStudentOffers.Add(offer);
+            await db.SaveChangesAsync();
+
+            var teacherIds = await ActiveTeacherIdsAsync(db);
+            var studentName = await db.Users.Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A student";
+            foreach (var teacherId in teacherIds)
+                db.Notifications.Add(LessonOpsMessaging.Notice(
+                    teacherId,
+                    "A student offered a lesson time",
+                    $"{studentName} is looking for a teacher and offered a lesson time. The first teacher to accept books it.",
+                    "request",
+                    "/teacher/availability",
+                    $"open-offer-broadcast:{offer.Id}"));
+            try { await db.SaveChangesAsync(); }
+            catch (DbUpdateException) { /* The offer is saved; a repeated notice is harmless. */ }
+            await realtime.ToUsersAsync(teacherIds, RealtimeScopes.Offers);
+            await realtime.ToUsersAsync(teacherIds, RealtimeScopes.Notifications);
+            await realtime.ToUserAsync(studentId, RealtimeScopes.Offers);
+            return Results.Created($"/api/student/open-offers/{offer.Id}", ToOpenOffer(offer, studentName, null));
+        });
+        studentApi.MapDelete("/open-offers/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var studentId = UserId(p);
+            var offer = await db.OpenStudentOffers.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId);
+            if (offer is null) return Results.NotFound();
+            if (offer.Status != "open") return Results.Conflict(new { message = "This time is no longer open." });
+            var studentName = await db.Users.Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A student";
+            offer.Status = "withdrawn";
+            await db.SaveChangesAsync();
+            await db.Notifications.Where(x => x.DedupeKey == $"open-offer-broadcast:{offer.Id}")
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Title, "Time offer withdrawn")
+                    .SetProperty(x => x.Body, $"{studentName} withdrew the time they offered. No action is needed."));
+            var teacherIds = await ActiveTeacherIdsAsync(db);
+            await realtime.ToUsersAsync(teacherIds, RealtimeScopes.Offers);
+            await realtime.ToUsersAsync(teacherIds, RealtimeScopes.Notifications);
+            await realtime.ToUserAsync(studentId, RealtimeScopes.Offers);
+            return Results.NoContent();
+        });
+        teacher.MapGet("/open-offers", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            var offers = await db.OpenStudentOffers.AsNoTracking()
+                .Where(x => (x.Status == "open" && x.StartsAt > now)
+                    || (x.Status == "claimed" && x.ClaimedAt > now.AddHours(-24)))
+                .OrderBy(x => x.StartsAt).Take(100)
+                .Select(x => new OpenStudentOfferDto(
+                    x.Id, x.StudentId, x.Student != null ? x.Student.FullName : "Student",
+                    x.StartsAt, x.EndsAt, x.Status, x.ClaimedByTeacherId,
+                    x.ClaimedByTeacher != null ? x.ClaimedByTeacher.FullName : null,
+                    x.LessonId, x.CreatedAt, x.ClaimedAt))
+                .ToListAsync();
+            return Results.Ok(offers);
+        });
+        teacher.MapPost("/open-offers/{id:guid}/accept", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var teacherId = UserId(p);
+            var now = DateTimeOffset.UtcNow;
+            var offer = await db.OpenStudentOffers.Include(x => x.Student).FirstOrDefaultAsync(x => x.Id == id);
+            if (offer is null || offer.Status != "open" || offer.StartsAt <= now)
+                return Results.Conflict(new { message = "This time is no longer available." });
+            if (!await db.Users.AnyAsync(x => x.Id == teacherId && x.IsActive))
+                return Results.Conflict(new { message = "Your account is not active." });
+            if (await db.Assignments.AnyAsync(x => x.StudentId == offer.StudentId && x.IsActive))
+            {
+                offer.Status = "withdrawn";
+                await db.SaveChangesAsync();
+                return Results.Conflict(new { message = "This student already has a teacher." });
+            }
+            if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < offer.EndsAt && x.EndsAt > offer.StartsAt
+                && (x.TeacherId == teacherId || x.StudentId == offer.StudentId)))
+                return Results.Conflict(new { message = "This time overlaps a lesson on your schedule or the student's." });
+
+            await using var tx = await db.Database.BeginTransactionAsync();
+            var claimed = await db.OpenStudentOffers.Where(x => x.Id == offer.Id && x.Status == "open")
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, "claimed")
+                    .SetProperty(x => x.ClaimedByTeacherId, teacherId)
+                    .SetProperty(x => x.ClaimedAt, now));
+            if (claimed == 0)
+            {
+                await tx.RollbackAsync();
+                return Results.Conflict(new { message = "Another teacher just accepted this time." });
+            }
+            offer.Status = "claimed";
+            offer.ClaimedByTeacherId = teacherId;
+            offer.ClaimedAt = now;
+
+            await db.Assignments.Where(x => x.StudentId == offer.StudentId && x.IsActive && x.TeacherId != teacherId)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            var assignment = await db.Assignments.FirstOrDefaultAsync(x => x.StudentId == offer.StudentId && x.TeacherId == teacherId);
+            if (assignment is null) db.Assignments.Add(new TeacherStudentAssignment { TeacherId = teacherId, StudentId = offer.StudentId });
+            else if (!assignment.IsActive) assignment.IsActive = true;
+
+            var firstEverLesson = !await db.Lessons.AnyAsync(x => x.StudentId == offer.StudentId);
+            var lesson = new Lesson
+            {
+                TeacherId = teacherId,
+                StudentId = offer.StudentId,
+                StartsAt = offer.StartsAt,
+                EndsAt = offer.EndsAt,
+                IsTrial = firstEverLesson,
+            };
+            db.Lessons.Add(lesson);
+            offer.LessonId = lesson.Id;
+
+            // The student is booked now, so their other offers must not stay claimable.
+            await db.OpenStudentOffers.Where(x => x.StudentId == offer.StudentId && x.Status == "open" && x.Id != offer.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "withdrawn"));
+
+            var studentName = offer.Student?.FullName ?? "A student";
+            var teacherName = await db.Users.Where(x => x.Id == teacherId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A teacher";
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                offer.StudentId,
+                "A teacher accepted your time",
+                $"{teacherName} booked the time you offered. Open your schedule to see the lesson.",
+                "booking",
+                "/schedule",
+                $"open-offer-claimed:{offer.Id}"));
+
+            var broadcastKey = $"open-offer-broadcast:{offer.Id}";
+            await db.Notifications.Where(x => x.DedupeKey == broadcastKey && x.UserId == teacherId)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Title, "You booked this time")
+                    .SetProperty(x => x.Body, $"{studentName}'s offered time is now on your schedule."));
+            await db.Notifications.Where(x => x.DedupeKey == broadcastKey && x.UserId != teacherId)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Title, "Time offer taken")
+                    .SetProperty(x => x.Body, $"{studentName} chose {teacherName}. Their offered time is no longer open.")
+                    // Re-surface the notice: the outcome is new information even
+                    // for a teacher who already read the original offer.
+                    .SetProperty(x => x.ReadAt, (DateTimeOffset?)null));
+
+            try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
+            catch (DbUpdateException)
+            {
+                await tx.RollbackAsync();
+                return Results.Conflict(new { message = "This time was just accepted by another teacher." });
+            }
+
+            var teacherIds = await ActiveTeacherIdsAsync(db);
+            await realtime.ToParticipantsAsync(teacherId, offer.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUsersAsync(teacherIds.Append(offer.StudentId), RealtimeScopes.Offers);
+            await realtime.ToUsersAsync(teacherIds.Append(offer.StudentId), RealtimeScopes.Notifications);
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(new { lessonId = lesson.Id, offer = ToOpenOffer(offer, studentName, teacherName) });
+        });
+
         api.MapPost("/student/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == UserId(p));
@@ -1512,6 +1706,20 @@ public static class ApiEndpoints
     }
 
     private static WeeklyRuleDto ToRule(TeacherAvailabilityRule r, string status) => new(r.Id, r.TeacherId, r.DayOfWeek, FormatTime(r.StartsAtTime), FormatTime(r.EndsAtTime), r.TimeZoneId, status);
+    private static OpenStudentOfferDto ToOpenOffer(OpenStudentOffer offer, string studentName, string? claimedByTeacherName)
+        => new(offer.Id, offer.StudentId, studentName, offer.StartsAt, offer.EndsAt, offer.Status, offer.ClaimedByTeacherId, claimedByTeacherName, offer.LessonId, offer.CreatedAt, offer.ClaimedAt);
+    // Lessons are standardized so billing, reminders, and reports stay predictable.
+    private static readonly TimeSpan[] AllowedLessonLengths = [TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(45), TimeSpan.FromHours(1)];
+    private const string LessonLengthMessage = "A lesson can last 30, 45, or 60 minutes.";
+    private static bool HasAllowedLessonLength(TimeSpan duration) => AllowedLessonLengths.Contains(duration);
+    private static async Task<List<Guid>> ActiveTeacherIdsAsync(AcademyDbContext db, CancellationToken ct = default)
+    {
+        var roleId = await db.Roles.Where(r => r.NormalizedName == "TEACHER").Select(r => r.Id).FirstOrDefaultAsync(ct);
+        if (roleId == Guid.Empty) return [];
+        return await db.UserRoles.Where(x => x.RoleId == roleId)
+            .Join(db.Users.Where(u => u.IsActive), x => x.UserId, u => u.Id, (x, u) => u.Id)
+            .Distinct().ToListAsync(ct);
+    }
     private static LessonSeriesDto ToSeries(LessonSeries s) => new(s.Id, s.TeacherId, s.Teacher?.FullName ?? "", s.StudentId, s.Student?.FullName ?? "", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt);
     private static LessonChangeRequestDto ToChangeRequest(LessonChangeRequest r) => new(
         r.Id, r.SeriesId, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "",
@@ -1582,7 +1790,7 @@ public static class ApiEndpoints
         starts = new TimeOnly(starts.Hour, starts.Minute);
         ends = new TimeOnly(ends.Hour, ends.Minute);
         if (ends <= starts) return (null, "The end time must be after the start time.");
-        if (ends - starts > TimeSpan.FromHours(4)) return (null, "A weekly slot can last up to 4 hours.");
+        if (!HasAllowedLessonLength(ends - starts)) return (null, LessonLengthMessage);
         var timeZoneId = string.IsNullOrWhiteSpace(input.TimeZoneId) ? "UTC" : input.TimeZoneId.Trim();
         if (!TimeZoneInfo.TryFindSystemTimeZoneById(timeZoneId, out _)) return (null, "Unknown time zone.");
 

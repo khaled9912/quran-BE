@@ -11,6 +11,7 @@ public static class RealtimeScopes
     public const string Admin = "admin";
     public const string Self = "self";
     public const string Directory = "directory";
+    public const string Offers = "offers";
     public const string Billing = "billing";
     public const string Policy = "policy";
     public const string Support = "support";
