@@ -87,11 +87,12 @@ public sealed class AcademyPushSender(IHttpClientFactory factory, ILogger<Academ
 /// <summary>
 /// How hard a push hits the device. Android volume, vibration and lockscreen
 /// visibility live on the named channel, which the app registers at startup;
-/// a plain push can never change them.
+/// a plain push can never change them. The default channel id must match
+/// DEFAULT_NOTIFICATION_CHANNEL_ID in the mobile app.
 /// </summary>
 public sealed record PushOptions(
     string Sound = "default",
-    string? ChannelId = null,
+    string ChannelId = "academy-notifications",
     string? Priority = null,
     string? InterruptionLevel = null,
     string? Tag = null,
@@ -115,8 +116,7 @@ public static class LessonOpsMessaging
         Priority: "high",
         InterruptionLevel: "time-sensitive",
         Tag: "lesson-call",
-        TtlSeconds: 60,
-        Badge: 1);
+        TtlSeconds: 60);
 
     public static AppNotification Notice(
         Guid userId,
@@ -205,10 +205,24 @@ public static class LessonOpsMessaging
         if (ids.Count == 0) return;
         var tokens = await db.DeviceTokens.AsNoTracking()
             .Where(x => ids.Contains(x.UserId))
-            .Select(x => x.Token)
+            .Select(x => new { x.UserId, x.Token })
             .ToListAsync(ct);
         if (tokens.Count == 0) return;
-        await push.SendAsync(tokens, title, body, link, options, ct);
+
+        // The badge is the reader's unread count, so the icon matches the tray
+        // even when the app is closed. iOS applies the number itself; Android
+        // shows a dot from the channel, and the app keeps the count in step.
+        var unread = await db.Notifications.AsNoTracking()
+            .Where(x => ids.Contains(x.UserId) && x.ReadAt == null)
+            .GroupBy(x => x.UserId)
+            .Select(g => new { UserId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.UserId, x => x.Count, ct);
+
+        var messageOptions = options ?? new PushOptions();
+        foreach (var group in tokens.GroupBy(x => x.UserId))
+            await push.SendAsync(
+                group.Select(x => x.Token).ToList(), title, body, link,
+                messageOptions with { Badge = unread.GetValueOrDefault(group.Key) }, ct);
     }
 
     public static async Task EmailAsync(
