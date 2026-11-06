@@ -862,6 +862,23 @@ await using (var scope = app.Services.CreateAsyncScope())
             CONSTRAINT "PK_DataProtectionKeys" PRIMARY KEY ("Id")
         );
         """);
+
+    // Incident notices used to open the whole lesson-ops queue. They now open
+    // the lesson itself, so re-point rows queued by older builds. The dedupe
+    // key carries the incident id, which maps back to the lesson.
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(
+            """
+            UPDATE "Notifications" AS n
+            SET "Link" = '/lesson/' || i."LessonId"::text
+            FROM "LessonIncidents" AS i
+            WHERE n."Link" = '/admin/lesson-ops'
+              AND n."DedupeKey" = 'incident-admin:' || i."Id"::text || ':' || n."UserId"::text;
+            """);
+    }
+    catch (Exception ex) { app.Logger.LogWarning(ex, "Could not re-point incident notification links."); }
+
     // Roles are seeded on every boot, not only for a fresh database, so new
     // roles (for example "support") reach an existing production database.
     var roleManager = scope.ServiceProvider.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
