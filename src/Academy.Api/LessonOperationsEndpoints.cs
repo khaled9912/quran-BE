@@ -23,6 +23,7 @@ public static class LessonOperationsEndpoints
         db.Lessons
             .Include(x => x.Teacher)
             .Include(x => x.Student)
+            .Include(x => x.Series)
             .Include(x => x.Report)
             .Include(x => x.Review)
             .FirstOrDefaultAsync(x => x.Id == id, ct);
@@ -117,6 +118,17 @@ public static class LessonOperationsEndpoints
         x.Id, x.FromStartsAt, x.FromEndsAt, x.ToStartsAt, x.ToEndsAt,
         x.ChangedById, x.Reason, x.CreatedAt);
 
+    private static LessonCallDto ToCall(LessonCall x) => new(
+        x.Id, x.LessonId, x.CallerId, x.Caller?.FullName ?? "User", x.CallerRole,
+        x.CalleeId, x.Callee?.FullName ?? "User", x.CalleeRole, x.Origin,
+        x.CalleeStatus, x.CreatedAt);
+
+    /// <summary>A ring is a interruption, not a chat: it can be sent at most
+    /// this often per lesson, and never twice in a row within the cooldown.</summary>
+    private static readonly TimeSpan CallCooldown = TimeSpan.FromSeconds(30);
+    private const int CallsPerLesson = 3;
+    private static readonly TimeSpan CallLead = TimeSpan.FromMinutes(15);
+
     public static void MapLessonOperations(this WebApplication app)
     {
         var api = app.MapGroup("/api").RequireAuthorization();
@@ -187,6 +199,9 @@ public static class LessonOperationsEndpoints
                 .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(ct);
             var incident = await db.LessonIncidents.AsNoTracking()
                 .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(ct);
+            var calls = await db.LessonCalls.AsNoTracking()
+                .Include(x => x.Caller).Include(x => x.Callee)
+                .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).Take(20).ToListAsync(ct);
             var replacement = lesson.IsMakeup ? null : await db.Lessons.AsNoTracking()
                 .Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review)
                 .FirstOrDefaultAsync(x => x.OriginalLessonId == id && x.Status != "cancelled", ct);
@@ -202,7 +217,8 @@ public static class LessonOperationsEndpoints
                 excuse is null ? null : ToExcuse(excuse),
                 incident is null ? null : ToIncident(incident, lesson),
                 replacement is null ? null : ApiEndpoints.ToLesson(replacement),
-                original is null ? null : ApiEndpoints.ToLesson(original)));
+                original is null ? null : ApiEndpoints.ToLesson(original),
+                calls.Select(ToCall).ToList()));
         });
 
         api.MapGet("/lessons/{id:guid}/cancellation-preview", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
@@ -288,7 +304,7 @@ public static class LessonOperationsEndpoints
             var requesterName = role == "teacher"
                 ? lesson.Teacher?.FullName ?? "Your teacher"
                 : role == "student" ? lesson.Student?.FullName ?? "Your student" : "The academy";
-            var body = $"{requesterName} proposed moving the lesson to {proposedStarts:ddd, MMM d 'at' h:mm tt}. Reply within {policy.RescheduleResponseHours} hours.";
+            var body = $"{requesterName} proposed moving the lesson to {LessonOpsMessaging.When(proposedStarts, lesson.Series?.TimeZoneId)}. Reply within {policy.RescheduleResponseHours} hours.";
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 otherId, "Reschedule request", body, "lesson", $"/lesson/{lesson.Id}", $"reschedule:{request.Id}"));
             Audit(db, UserId(p), "reschedule_requested", "Lesson", lesson.Id,
@@ -310,6 +326,7 @@ public static class LessonOperationsEndpoints
             var request = await db.LessonRescheduleRequests
                 .Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
+                .Include(x => x.Lesson).ThenInclude(x => x!.Series)
                 .FirstOrDefaultAsync(x => x.Id == requestId, ct);
             if (request?.Lesson is null) return Results.NotFound();
             var lesson = request.Lesson;
@@ -357,16 +374,17 @@ public static class LessonOperationsEndpoints
                 ChangedById = UserId(p),
                 Reason = "Reschedule request accepted",
             });
+            var movedTo = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 request.RequestedById, "Reschedule accepted",
-                $"Your lesson moved to {lesson.StartsAt:ddd, MMM d 'at' h:mm tt}.",
+                $"Your lesson moved to {movedTo}.",
                 "lesson", $"/lesson/{lesson.Id}", $"reschedule-accepted:{request.Id}"));
             Audit(db, UserId(p), "reschedule_accepted", "Lesson", lesson.Id,
                 $"Moved from {previous.StartsAt:u} to {lesson.StartsAt:u}.");
             await db.SaveChangesAsync(ct);
 
             await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], "Reschedule accepted",
-                $"Your lesson moved to {lesson.StartsAt:ddd, MMM d 'at' h:mm tt}.", $"/lesson/{lesson.Id}", ct);
+                $"Your lesson moved to {movedTo}.", $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToReschedule(request, "User", now));
         });
@@ -459,7 +477,7 @@ public static class LessonOperationsEndpoints
             };
             db.Lessons.Add(replacement);
 
-            var body = $"A make-up lesson was added for {startsAt:ddd, MMM d 'at' h:mm tt}.";
+            var body = $"A make-up lesson was added for {LessonOpsMessaging.When(startsAt, original.Series?.TimeZoneId)}.";
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 original.StudentId, "Make-up lesson scheduled", body, "lesson",
                 $"/lesson/{replacement.Id}", $"replacement:{replacement.Id}"));
@@ -633,11 +651,13 @@ public static class LessonOperationsEndpoints
             db.LessonExcuseRequests.Add(excuse);
 
             var admins = await LessonOpsMessaging.AdminUserIdsAsync(db, ct);
+            var excuseLink = LessonOpsMessaging.LessonLink(lesson);
             foreach (var adminId in admins)
                 db.Notifications.Add(LessonOpsMessaging.Notice(
                     adminId, "Excuse request",
-                    $"{lesson.Student?.FullName ?? "A student"} asked to excuse the lesson on {lesson.StartsAt:ddd, MMM d}.",
-                    "system", "/admin/lesson-ops", $"excuse-admin:{excuse.Id}:{adminId}"));
+                    LessonOpsMessaging.LessonSummary(
+                        lesson, $"{lesson.Student?.FullName ?? "A student"} asked to excuse this lesson: {explanation}"),
+                    "lesson", excuseLink, $"excuse-admin:{excuse.Id}:{adminId}"));
             Audit(db, UserId(p), "excuse_requested", "Lesson", id, explanation);
             await db.SaveChangesAsync(ct);
 
@@ -683,14 +703,112 @@ public static class LessonOperationsEndpoints
             };
             db.LessonIncidents.Add(incident);
             var admins = await LessonOpsMessaging.AdminUserIdsAsync(db, ct);
+            var reporter = lesson.StudentId == UserId(p) ? lesson.Student : lesson.Teacher;
+            var body = LessonOpsMessaging.LessonSummary(
+                lesson, $"{reporter?.FullName ?? "A participant"} reported: {detail}");
+            var link = LessonOpsMessaging.LessonLink(lesson);
             foreach (var adminId in admins)
                 db.Notifications.Add(LessonOpsMessaging.Notice(
-                    adminId, "Lesson attendance issue",
-                    $"{lesson.Student?.FullName ?? "A student"} reported: {detail}",
-                    "system", "/admin/lesson-ops", $"incident-admin:{incident.Id}:{adminId}"));
+                    adminId, "Lesson attendance issue", body, "lesson", link,
+                    $"incident-admin:{incident.Id}:{adminId}"));
             await db.SaveChangesAsync(ct);
-            await LessonOpsMessaging.PushAsync(db, push, admins, "Lesson attendance issue", detail, "/admin/lesson-ops", ct);
+            await LessonOpsMessaging.PushAsync(db, push, admins, "Lesson attendance issue", body, link, ct);
             return Results.Ok(ToIncident(incident, lesson));
+        });
+
+        // ------------------------------------------------------------ lesson call
+        api.MapPost("/lessons/{id:guid}/call", async (
+            Guid id, CallLessonRequest? input, ClaimsPrincipal p, AcademyDbContext db,
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
+        {
+            var lesson = await LoadLessonAsync(db, id, ct);
+            if (lesson is null) return Results.NotFound();
+            if (!CanView(lesson, p)) return Results.Forbid();
+
+            var now = DateTimeOffset.UtcNow;
+            if (lesson.Status == "cancelled")
+                return Results.Conflict(new { message = "This lesson was cancelled." });
+            if (lesson.EndsAt <= now)
+                return Results.Conflict(new { message = "The lesson time has already passed." });
+            if (now < lesson.StartsAt - CallLead)
+                return Results.Conflict(new { message = "Calls open shortly before the lesson starts." });
+
+            var targetRole = (input?.TargetRole ?? "").Trim().ToLowerInvariant();
+            if (targetRole.Length > 0 && targetRole is not ("teacher" or "student"))
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["targetRole"] = ["Target must be teacher or student."] });
+
+            var callerId = UserId(p);
+            var policy = await LessonPolicyService.GetPolicyAsync(db, ct);
+            var attendance = await LessonPolicyService.BuildAttendanceSummaryAsync(db, lesson, now, policy, ct);
+            AttendanceParticipantDto ByRole(string role) => attendance.Participants.First(x => x.Role == role);
+
+            var staffOnly = callerId != lesson.TeacherId && callerId != lesson.StudentId;
+            AttendanceParticipantDto target =
+                staffOnly ? (targetRole.Length > 0
+                    ? ByRole(targetRole)
+                    : attendance.Participants.FirstOrDefault(x => x.Status != "joined") ?? ByRole("student"))
+                : ByRole(callerId == lesson.TeacherId ? "student" : "teacher");
+
+            if (target.Status == "joined")
+                return Results.Conflict(new { message = $"{target.Name} is already in the lesson room." });
+
+            var callerRole = ActorRole(p);
+            var origin = staffOnly ? "monitor" : "room";
+            if (await db.LessonCalls.AnyAsync(
+                    x => x.LessonId == id && x.CallerId == callerId && x.CreatedAt > now - CallCooldown, ct))
+                return Results.Conflict(new { message = "You just called. Wait a moment before calling again." });
+            if (await db.LessonCalls.CountAsync(x => x.LessonId == id && x.CallerId == callerId, ct) >= CallsPerLesson)
+                return Results.Conflict(new { message = $"You have used the {CallsPerLesson} calls allowed for this lesson." });
+
+            var call = new LessonCall
+            {
+                LessonId = id,
+                CallerId = callerId,
+                CallerRole = callerRole,
+                CalleeId = target.UserId,
+                CalleeRole = target.Role,
+                Origin = origin,
+                CalleeStatus = target.Status,
+                CreatedAt = now,
+            };
+            db.LessonCalls.Add(call);
+
+            var callerName = callerId == lesson.TeacherId ? lesson.Teacher?.FullName
+                : callerId == lesson.StudentId ? lesson.Student?.FullName
+                : (await db.Users.AsNoTracking().Where(x => x.Id == callerId).Select(x => x.FullName).FirstOrDefaultAsync(ct));
+            var detail = callerRole == "student" ? "is calling you. Open the lesson room."
+                : callerRole == "teacher" ? "is calling you. Join the lesson now."
+                : "is calling you from the academy. Join the lesson now.";
+            var body = LessonOpsMessaging.LessonSummary(lesson, $"{callerName ?? "The other participant"} {detail}");
+            var title = callerRole switch
+            {
+                "student" => "Call from your student",
+                "teacher" => "Call from your teacher",
+                _ => "The academy is calling you",
+            };
+            var link = LessonOpsMessaging.LessonLink(lesson);
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                target.UserId, title, body, "lesson", link, $"call:{call.Id}"));
+            Audit(db, callerId, "lesson_called", "Lesson", id,
+                $"{callerName ?? "A user"} ({callerRole}) called {target.Name} ({target.Role}). Status: {target.Status}.");
+            await db.SaveChangesAsync(ct);
+
+            await LessonOpsMessaging.PushAsync(
+                db, push, [target.UserId], title, body, link, ct, LessonOpsMessaging.UrgentCall);
+            await realtime.ToUsersAsync([callerId, target.UserId], RealtimeScopes.Calls, id);
+            return Results.Ok(ToCall(call));
+        });
+
+        // Calls still worth ringing for: the client asks on launch and on focus,
+        // because a push can be missed while another app owns the screen.
+        api.MapGet("/calls/recent", async (ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+        {
+            var cutoff = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(30);
+            var items = await db.LessonCalls.AsNoTracking()
+                .Include(x => x.Caller).Include(x => x.Callee)
+                .Where(x => x.CalleeId == UserId(p) && x.CreatedAt >= cutoff)
+                .OrderByDescending(x => x.CreatedAt).Take(20).ToListAsync(ct);
+            return Results.Ok(items.Select(ToCall));
         });
 
         // ------------------------------------------------------------ my records
@@ -825,14 +943,19 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
         }
 
-        var otherName = role == "teacher"
-            ? lesson.Student?.FullName ?? "your student"
-            : lesson.Teacher?.FullName ?? "your teacher";
-        var when = lesson.StartsAt.ToString("ddd, MMM d 'at' h:mm tt");
+        // Every notice below names whoever actually cancelled, so a student never
+        // reads their own name in "… cancelled your lesson".
+        var actorName = role switch
+        {
+            "teacher" => lesson.Teacher?.FullName ?? "Your teacher",
+            "student" => lesson.Student?.FullName ?? "Your student",
+            _ => "The academy",
+        };
+        var when = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
         var (title, body) = role switch
         {
-            "student" => ("Lesson cancelled", $"{lesson.Student?.FullName ?? "Your student"} cancelled the lesson on {when}."),
-            "teacher" => ("Lesson cancelled", $"{otherName} cancelled your lesson on {when}."),
+            "student" => ("Lesson cancelled", $"{actorName} cancelled the lesson on {when}."),
+            "teacher" => ("Lesson cancelled", $"{actorName} cancelled your lesson on {when}."),
             _ => ("Lesson cancelled by the academy", $"The lesson on {when} was cancelled. Your teacher/student has been notified."),
         };
 
@@ -872,11 +995,13 @@ public static class LessonOperationsEndpoints
         if (decision.RequiresAdminReview || reliability?.AdminReviewRequired == true)
         {
             var admins = await LessonOpsMessaging.AdminUserIdsAsync(db, ct);
+            var reviewBody = LessonOpsMessaging.LessonSummary(
+                lesson, $"{actorName} cancelled {decision.HoursBefore:0.#} hours before it started. Review reliability and compensation.");
+            var reviewLink = LessonOpsMessaging.LessonLink(lesson);
             foreach (var adminId in admins)
                 db.Notifications.Add(LessonOpsMessaging.Notice(
-                    adminId, "Cancellation needs review",
-                    $"{otherName} cancelled a lesson {decision.HoursBefore:0.#} hours before it started. Review reliability and compensation.",
-                    "system", "/admin/lesson-ops", $"cancel-review:{lesson.Id}:{adminId}"));
+                    adminId, "Cancellation needs review", reviewBody, "lesson", reviewLink,
+                    $"cancel-review:{lesson.Id}:{adminId}"));
             await LessonOpsMessaging.EmailAdminsAsync(db, email,
                 "Late cancellation needs review", body, ct);
         }
@@ -970,6 +1095,9 @@ public static class LessonOperationsEndpoints
                 .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
             var changes = await db.LessonScheduleChanges.AsNoTracking()
                 .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
+            var calls = await db.LessonCalls.AsNoTracking()
+                .Include(x => x.Caller).Include(x => x.Callee)
+                .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).Take(20).ToListAsync(ct);
 
             return Results.Ok(new AdminLessonOpsDetailDto(
                 ApiEndpoints.ToLesson(lesson), attendance,
@@ -982,7 +1110,8 @@ public static class LessonOperationsEndpoints
                 incidents.Select(x => ToIncident(x, lesson)).ToList(),
                 excuse is null ? null : ToExcuse(excuse),
                 credits.Select(ToCredit).ToList(),
-                changes.Select(ToScheduleChange).ToList()));
+                changes.Select(ToScheduleChange).ToList(),
+                calls.Select(ToCall).ToList()));
         });
 
         // ------------------------------------------------------------- excuses
@@ -1223,6 +1352,7 @@ public static class LessonOperationsEndpoints
         {
             var hours = await db.TeacherHours.Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
+                .Include(x => x.Lesson).ThenInclude(x => x!.Series)
                 .FirstOrDefaultAsync(x => x.Id == id, ct);
             if (hours?.Lesson is null) return Results.NotFound();
             var approved = Math.Clamp(input.ApprovedMinutes ?? hours.ProposedPayableMinutes, 0, hours.ScheduledMinutes);
@@ -1232,7 +1362,7 @@ public static class LessonOperationsEndpoints
             hours.ApprovedAt = DateTimeOffset.UtcNow;
             hours.UpdatedAt = DateTimeOffset.UtcNow;
             hours.AdjustmentReason = (input.Note ?? "").Trim() is { Length: > 0 } note ? note[..Math.Min(note.Length, 500)] : null;
-            var body = $"Your payable time for the lesson on {hours.Lesson.StartsAt:ddd, MMM d} was approved at {approved} minutes.";
+            var body = $"Your payable time for the lesson on {LessonOpsMessaging.When(hours.Lesson.StartsAt, hours.Lesson.Series?.TimeZoneId)} was approved at {approved} minutes.";
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 hours.TeacherId, "Teacher hours approved", body, "payment",
                 $"/lesson/{hours.LessonId}", $"hours-approved:{hours.Id}"));

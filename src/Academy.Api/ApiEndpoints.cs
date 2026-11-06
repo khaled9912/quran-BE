@@ -519,8 +519,6 @@ public static class ApiEndpoints
             if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
             return Results.Ok((await q.OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToChangeRequest));
         });
-        admin.MapPost("/change-requests/{id:guid}/approve", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime) => await ApproveChangeRequestAsync(id, db, realtime));
-        admin.MapPost("/change-requests/{id:guid}/reject", async (Guid id, RejectChangeRequestInput? input, AcademyDbContext db, RealtimeNotifier realtime) => await RejectChangeRequestAsync(id, input?.Note, db, realtime));
         admin.MapGet("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, AcademyDbContext db) =>
             await db.Users.AnyAsync(x => x.Id == teacherId)
                 ? Results.Ok(await WeeklyRulesAsync(db, teacherId, null))
@@ -913,12 +911,17 @@ public static class ApiEndpoints
             var teacherName = savedSeries[0].Teacher?.FullName ?? "your teacher";
             var bookingKey = $"booking:{savedSeries[0].Id}";
             var timeWord = savedSeries.Count == 1 ? "weekly time" : "weekly times";
+            var firstAt = savedLessons.Count > 0
+                ? LessonOpsMessaging.When(savedLessons[0].StartsAt, savedSeries[0].TimeZoneId)
+                : null;
             db.Notifications.AddRange(
                 new AppNotification
                 {
                     UserId = teacherId,
                     Title = "New weekly booking",
-                    Body = $"{studentName} booked {savedSeries.Count} {timeWord} with you. The first lesson is on the way.",
+                    Body = firstAt is null
+                        ? $"{studentName} booked {savedSeries.Count} {timeWord} with you. The first lesson is on the way."
+                        : $"{studentName} booked {savedSeries.Count} {timeWord} with you. First lesson {firstAt}.",
                     Kind = "booking",
                     Link = "/schedule",
                     DedupeKey = bookingKey,
@@ -927,7 +930,9 @@ public static class ApiEndpoints
                 {
                     UserId = studentId,
                     Title = "Weekly lessons booked",
-                    Body = $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. Open your schedule to see the first lesson.",
+                    Body = firstAt is null
+                        ? $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. Open your schedule to see the first lesson."
+                        : $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. First lesson {firstAt}.",
                     Kind = "booking",
                     Link = "/schedule",
                     DedupeKey = $"{bookingKey}:student",
@@ -974,15 +979,6 @@ public static class ApiEndpoints
                 lesson.CancelledAt = now;
             }
 
-            var pendingRequests = await db.LessonChangeRequests
-                .Where(x => x.SeriesId == series.Id && x.Status == "pending").ToListAsync();
-            foreach (var request in pendingRequests)
-            {
-                request.Status = "rejected";
-                request.AdminNote = "The student ended this weekly time, so the change is no longer needed.";
-                request.AdminRespondedAt = now;
-            }
-
             var keepsTeacher = await db.LessonSeries.AnyAsync(x =>
                 x.StudentId == studentId && x.TeacherId == series.TeacherId && x.IsActive && x.Id != series.Id);
             if (!keepsTeacher)
@@ -993,7 +989,7 @@ public static class ApiEndpoints
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 series.TeacherId,
                 "Weekly lessons ended",
-                $"{studentName} ended the weekly lessons with you. The time is now open for other students to book.",
+                $"{studentName} ended the weekly lessons with you on {LessonOpsMessaging.WeeklyAt(series.DayOfWeek, series.StartsAtTime, series.TimeZoneId)}. The time is now open for other students to book.",
                 "booking",
                 "/schedule",
                 $"series-ended:{series.Id}"));
@@ -1017,43 +1013,32 @@ public static class ApiEndpoints
         api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
-            var series = await db.LessonSeries.FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId && x.IsActive);
+            var series = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
+                .FirstOrDefaultAsync(x => x.Id == id && x.StudentId == studentId && x.IsActive);
             if (series is null) return Results.NotFound();
-            if (await db.LessonChangeRequests.AnyAsync(x => x.SeriesId == id && x.Status == "pending"))
-                return Results.Conflict(new { message = "You already have a pending time-change request for this slot." });
+            var note = input.Note?.Trim();
+            if (note is { Length: > 500 })
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["note"] = ["Keep the note under 500 characters."] });
             var rule = await db.TeacherAvailabilityRules.FirstOrDefaultAsync(x => x.Id == input.RequestedRuleId && x.TeacherId == series.TeacherId);
             if (rule is null) return Results.NotFound();
             if (rule.Id == series.AvailabilityRuleId) return Results.Conflict(new { message = "That is already your booked time." });
-            if (await db.LessonSeries.AnyAsync(x => x.IsActive && x.AvailabilityRuleId == rule.Id))
-                return Results.Conflict(new { message = "That time is no longer available." });
-            var otherSeries = await db.LessonSeries.Where(x => x.StudentId == studentId && x.IsActive && x.Id != series.Id).ToListAsync();
-            if (otherSeries.Any(x => Overlaps(x.DayOfWeek, x.StartsAtTime, x.EndsAtTime, rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime)))
-                return Results.Conflict(new { message = "That time overlaps another lesson you have." });
+
+            var now = DateTimeOffset.UtcNow;
             var request = new LessonChangeRequest
             {
                 SeriesId = series.Id,
                 StudentId = studentId,
                 TeacherId = series.TeacherId,
                 RequestedRuleId = rule.Id,
-                StudentNote = input.Note?.Trim(),
+                StudentNote = note is { Length: > 0 } ? note : null,
             };
-            db.LessonChangeRequests.Add(request);
-            try { await db.SaveChangesAsync(); }
-            catch (DbUpdateException) { return Results.Conflict(new { message = "You already have a pending time-change request for this slot." }); }
-            var saved = await ChangeRequestsWithDetails(db).FirstAsync(x => x.Id == request.Id);
-            var studentName = await db.Users.Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync() ?? "A student";
-            db.Notifications.Add(LessonOpsMessaging.Notice(
-                series.TeacherId,
-                "Time change requested",
-                $"{studentName} asked to move a weekly lesson. The academy will confirm the new time with you.",
-                "request",
-                "/schedule",
-                $"change-request:{request.Id}"));
-            try { await db.SaveChangesAsync(); }
-            catch (DbUpdateException) { /* The request is saved; a repeated notice is harmless. */ }
+            if (await RecordTimeChangeAsync(db, series, rule, request, now) is { } blocked)
+                return Results.Conflict(new { message = blocked });
+
+            await realtime.ToParticipantsAsync(series.TeacherId, studentId, RealtimeScopes.Lessons);
+            await realtime.ToUsersAsync([series.TeacherId, studentId], RealtimeScopes.Notifications);
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
-            await realtime.ToUserAsync(series.TeacherId, RealtimeScopes.Lessons);
-            await realtime.ToUserAsync(series.TeacherId, RealtimeScopes.Notifications);
+            var saved = await ChangeRequestsWithDetails(db).FirstAsync(x => x.Id == request.Id);
             return Results.Created($"/api/student/change-requests/{request.Id}", ToChangeRequest(saved));
         }).RequireAuthorization("StudentOnly");
         api.MapPost("/lesson-requests", async (RequestSlotInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
@@ -1079,9 +1064,9 @@ public static class ApiEndpoints
             {
                 UserId = slot.TeacherId,
                 Title = "New lesson request",
-                Body = $"{requesterName} requested a lesson time with you. Open your requests to respond.",
+                Body = $"{requesterName} requested one of your lesson times. It appears on your schedule once the academy confirms it.",
                 Kind = "request",
-                Link = "/requests",
+                Link = "/schedule",
                 DedupeKey = $"request:{request.Id}",
             });
             try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
@@ -1426,7 +1411,7 @@ public static class ApiEndpoints
             // Direct time edits are an academy override. Teachers and students
             // move lessons through the accept/decline reschedule workflow.
             if (!IsAdmin(p)) return Results.Forbid();
-            var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);
+            var lesson = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Series).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);
             if (lesson is null) return Results.NotFound();
             if (input.Status == "cancelled")
                 return Results.Conflict(new { message = "Use the cancellation endpoint so the policy and notifications are applied." });
@@ -1455,9 +1440,10 @@ public static class ApiEndpoints
                 var pending = await db.LessonRescheduleRequests
                     .Where(x => x.LessonId == id && x.Status == "pending").ToListAsync();
                 foreach (var item in pending) item.Status = "expired";
+                var movedTo = LessonOpsMessaging.When(startsAt, lesson.Series?.TimeZoneId);
                 db.Notifications.AddRange(
-                    new AppNotification { UserId = lesson.TeacherId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {startsAt:ddd, MMM d 'at' h:mm tt}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" },
-                    new AppNotification { UserId = lesson.StudentId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {startsAt:ddd, MMM d 'at' h:mm tt}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" });
+                    new AppNotification { UserId = lesson.TeacherId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {movedTo}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" },
+                    new AppNotification { UserId = lesson.StudentId, Title = "Lesson time updated", Body = $"The academy moved the lesson to {movedTo}.", Kind = "lesson", Link = $"/lesson/{lesson.Id}", DedupeKey = $"lesson-time:{lesson.Id}:{startsAt:O}" });
             }
             lesson.StartsAt = startsAt; lesson.EndsAt = endsAt;
             if (input.Status is not null) lesson.Status = input.Status;
@@ -1822,7 +1808,7 @@ public static class ApiEndpoints
         if (await db.LessonSeries.AnyAsync(x => x.AvailabilityRuleId == ruleId))
             return Results.Conflict(new { message = "A slot that a student has booked cannot be removed." });
         if (await db.LessonChangeRequests.AnyAsync(x => x.RequestedRuleId == ruleId))
-            return Results.Conflict(new { message = "This slot is part of a pending time-change request." });
+            return Results.Conflict(new { message = "This slot is recorded in a weekly time change, so it cannot be removed." });
         db.TeacherAvailabilityRules.Remove(rule);
         await db.SaveChangesAsync();
         return Results.NoContent();
@@ -1873,23 +1859,46 @@ public static class ApiEndpoints
         catch (DbUpdateException) { db.ChangeTracker.Clear(); }
     }
 
-    private static async Task<IResult> ApproveChangeRequestAsync(Guid id, AcademyDbContext db, RealtimeNotifier realtime)
+    /// <summary>
+    /// The checks a weekly-time move must pass before anything is written. The
+    /// student only ever picks a slot the teacher already published, so there is
+    /// nothing to approve; what remains is making sure the slot is still free.
+    /// </summary>
+    private static async Task<string?> CheckTimeChangeAsync(
+        LessonSeries series, TeacherAvailabilityRule rule, AcademyDbContext db, DateTimeOffset now)
     {
-        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
-        if (request is null) return Results.NotFound();
-        if (request.Status != "pending") return Results.Conflict(new { message = "This change request has already been handled." });
-        var series = request.Series!;
-        var rule = request.RequestedRule!;
-        if (!series.IsActive) return Results.Conflict(new { message = "This booking is no longer active." });
+        if (!series.IsActive) return "This booking is no longer active.";
         if (await db.LessonSeries.AnyAsync(x => x.IsActive && x.AvailabilityRuleId == rule.Id && x.Id != series.Id))
-            return Results.Conflict(new { message = "The requested slot is no longer available." });
-        var now = DateTimeOffset.UtcNow;
+            return "That time is no longer available.";
+        var otherSeries = await db.LessonSeries
+            .Where(x => x.StudentId == series.StudentId && x.IsActive && x.Id != series.Id).ToListAsync();
+        if (otherSeries.Any(x => Overlaps(x.DayOfWeek, x.StartsAtTime, x.EndsAtTime, rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime)))
+            return "That time overlaps another lesson you have.";
         foreach (var (start, end) in NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 8))
             if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.SeriesId != series.Id && x.StartsAt < end && x.EndsAt > start
                 && (x.TeacherId == series.TeacherId || x.StudentId == series.StudentId)))
-                return Results.Conflict(new { message = "The requested time conflicts with an existing lesson." });
+                return "The requested time conflicts with an existing lesson.";
+        return null;
+    }
 
+    /// <summary>
+    /// Applies a weekly-time move and returns the reason it could not be
+    /// applied, or null once it is written. The checks run inside a serializable
+    /// transaction because two students choosing the same free slot at the same
+    /// moment must not both win.
+    /// </summary>
+    private static async Task<string?> RecordTimeChangeAsync(
+        AcademyDbContext db, LessonSeries series, TeacherAvailabilityRule rule,
+        LessonChangeRequest request, DateTimeOffset now)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
+        if (await CheckTimeChangeAsync(series, rule, db, now) is { } blocked)
+        {
+            await tx.RollbackAsync();
+            return blocked;
+        }
+        if (db.Entry(request).State == EntityState.Detached) db.LessonChangeRequests.Add(request);
+        request.Status = "applied";
         try
         {
             await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt > now).ExecuteDeleteAsync();
@@ -1898,65 +1907,83 @@ public static class ApiEndpoints
             series.StartsAtTime = rule.StartsAtTime;
             series.EndsAtTime = rule.EndsAtTime;
             series.TimeZoneId = rule.TimeZoneId;
-            request.Status = "approved";
-            request.AdminRespondedAt = now;
-            db.Notifications.AddRange(
-                new AppNotification
-                {
-                    UserId = series.StudentId,
-                    Title = "Weekly time changed",
-                    Body = $"Your weekly time with {request.Teacher?.FullName ?? "your teacher"} has moved. The new time is now on your schedule.",
-                    Kind = "request",
-                    Link = "/schedule",
-                    DedupeKey = $"change-approved:{request.Id}:student",
-                },
-                new AppNotification
-                {
-                    UserId = series.TeacherId,
-                    Title = "Weekly time changed",
-                    Body = $"{request.Student?.FullName ?? "Your student"}'s weekly time has moved. Check your schedule for the new slot.",
-                    Kind = "request",
-                    Link = "/schedule",
-                    DedupeKey = $"change-approved:{request.Id}:teacher",
-                });
+            await AddTimeChangeNoticesAsync(db, series, request);
             await db.SaveChangesAsync();
             await BuildSeriesLessonsAsync(db, series, now);
             await db.SaveChangesAsync();
             await tx.CommitAsync();
+            return null;
         }
         catch (Exception ex) when (ex is DbUpdateException or PostgresException)
         {
             await tx.RollbackAsync();
-            return Results.Conflict(new { message = "This change could not be applied. Refresh and try again." });
+            db.ChangeTracker.Clear();
+            return "That time was just taken. Pick another slot.";
         }
-        await realtime.ToParticipantsAsync(series.TeacherId, series.StudentId, RealtimeScopes.Lessons);
-        await realtime.ToUsersAsync([series.TeacherId, series.StudentId], RealtimeScopes.Notifications);
-        await realtime.ToStaffAsync(RealtimeScopes.Admin);
-        return Results.Ok(ToChangeRequest(request));
     }
 
-    private static async Task<IResult> RejectChangeRequestAsync(Guid id, string? note, AcademyDbContext db, RealtimeNotifier realtime)
+    /// <summary>
+    /// The student and the teacher get the new time. The academy is copied for
+    /// the record only: it no longer decides anything, but a weekly time moving
+    /// under its roof is worth seeing.
+    /// </summary>
+    private static async Task AddTimeChangeNoticesAsync(
+        AcademyDbContext db, LessonSeries series, LessonChangeRequest request)
     {
-        var request = await ChangeRequestsWithDetails(db).FirstOrDefaultAsync(x => x.Id == id);
-        if (request is null) return Results.NotFound();
-        if (request.Status != "pending") return Results.Conflict(new { message = "This change request has already been handled." });
-        request.Status = "rejected";
-        request.AdminNote = note?.Trim();
-        request.AdminRespondedAt = DateTimeOffset.UtcNow;
-        db.Notifications.Add(new AppNotification
+        var studentName = series.Student?.FullName ?? "A student";
+        var teacherName = series.Teacher?.FullName ?? "your teacher";
+        var newAt = LessonOpsMessaging.WeeklyAt(series.DayOfWeek, series.StartsAtTime, series.TimeZoneId);
+        db.Notifications.AddRange(
+            LessonOpsMessaging.Notice(series.StudentId, "Weekly time changed",
+                $"Your weekly time with {teacherName} moved to {newAt}.",
+                "request", "/schedule", $"change-applied:{request.Id}:student"),
+            LessonOpsMessaging.Notice(series.TeacherId, "Weekly time changed",
+                $"{studentName}'s weekly time moved to {newAt}.",
+                "request", "/schedule", $"change-applied:{request.Id}:teacher"));
+        foreach (var adminId in await LessonOpsMessaging.AdminUserIdsAsync(db))
+            db.Notifications.Add(LessonOpsMessaging.Notice(adminId, "Weekly time changed",
+                $"{studentName} moved their weekly time with {teacherName} to {newAt}.",
+                "request", "/requests", $"change-applied:{request.Id}:admin:{adminId}"));
+    }
+
+    /// <summary>
+    /// Weekly time changes stopped needing an admin decision, so anything still
+    /// sitting in the old approval queue is applied here — or closed with the
+    /// reason it no longer works, so the student can simply ask again.
+    /// </summary>
+    internal static async Task ApplyPendingTimeChangesAsync(AcademyDbContext db)
+    {
+        var ids = await db.LessonChangeRequests.Where(x => x.Status == "pending")
+            .OrderBy(x => x.CreatedAt).Select(x => x.Id).ToListAsync();
+        if (ids.Count == 0) return;
+        var now = DateTimeOffset.UtcNow;
+        foreach (var id in ids)
         {
-            UserId = request.StudentId,
-            Title = "Weekly time change declined",
-            Body = note?.Trim() ?? "The academy kept your current weekly time. Message us if you need another slot.",
-            Kind = "request",
-            Link = "/schedule",
-            DedupeKey = $"change-rejected:{request.Id}:student",
-        });
-        await db.SaveChangesAsync();
-        await realtime.ToParticipantsAsync(request.TeacherId, request.StudentId, RealtimeScopes.Lessons);
-        await realtime.ToUserAsync(request.StudentId, RealtimeScopes.Notifications);
-        await realtime.ToStaffAsync(RealtimeScopes.Admin);
-        return Results.Ok(ToChangeRequest(request));
+            var request = await db.LessonChangeRequests
+                .Include(x => x.Series).ThenInclude(x => x!.Teacher)
+                .Include(x => x.Series).ThenInclude(x => x!.Student)
+                .Include(x => x.RequestedRule)
+                .FirstOrDefaultAsync(x => x.Id == id && x.Status == "pending");
+            if (request?.Series is null) continue;
+            var rule = request.RequestedRule is not null && request.RequestedRule.TeacherId == request.TeacherId
+                ? request.RequestedRule
+                : null;
+            var error = rule is null
+                ? "That time is no longer published by this teacher."
+                : await RecordTimeChangeAsync(db, request.Series, rule, request, now);
+            if (error is null) continue;
+
+            // A rejected write clears the tracker, so reload the row before closing it.
+            var open = await db.LessonChangeRequests.FirstOrDefaultAsync(x => x.Id == id && x.Status == "pending");
+            if (open is null) continue;
+            open.Status = "rejected";
+            open.AdminNote = error;
+            open.AdminRespondedAt = now;
+            db.Notifications.Add(LessonOpsMessaging.Notice(open.StudentId, "Weekly time change closed",
+                "Weekly times now move as soon as you ask, so this older request was closed. Ask again to move to a new time.",
+                "request", "/schedule", $"change-closed:{open.Id}"));
+            await db.SaveChangesAsync();
+        }
     }
 
     private static async Task<LessonRequestDto?> RequestById(AcademyDbContext db, Guid id)

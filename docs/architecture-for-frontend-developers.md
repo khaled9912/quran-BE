@@ -1,8 +1,20 @@
 # Backend architecture and .NET guide
 
 **Audience:** frontend engineers who know React/Next.js/TypeScript and want to understand this backend end to end.
-**Scope:** every source file in `Rayan-Academy-Backend`, how a request flows through it, how the data model works, and how the Next.js app consumes it.
+**Scope:** every source file in `Ana-Quran-Academy-Backend`, how a request flows through it, how the data model works, and how the Next.js app consumes it.
 **Snapshot date:** 2026-10-31. The code is the source of truth; this document explains it.
+
+> **Part of this document is superseded.** It predates weekly recurring
+> availability, instant booking, lesson operations, monthly payments,
+> transcripts, notifications, and SignalR. Business rules — what the academy
+> asked for and what is actually built — live in
+> [`../../docs/business-requirements/README.md`](../../docs/business-requirements/README.md),
+> and the current route list is
+> [`api-reference.md`](api-reference.md). Treat these sections as describing the
+> legacy one-off approval flow, which is still registered but used by no client:
+> §5 "Trace: a student requests a teacher's slot" and "Trace: an admin approves",
+> §6 "Status values" for `LessonRequest`, and §8 in full (Flows A and B). The
+> .NET explanations in §3–§5, §7 and §10 are still accurate.
 
 ---
 
@@ -59,8 +71,8 @@
 ## 2. Repository map
 
 ```text
-Rayan-Academy-Backend/
-├── Rayan.Academy.sln              Solution file (a container for projects; ~ package.json workspace)
+Ana-Quran-Academy-Backend/
+├── AnaQuranAcademy.sln              Solution file (a container for projects; ~ package.json workspace)
 ├── Dockerfile                     Multi-stage build: .NET SDK build → .NET runtime image
 ├── docker-compose.yml             Local Postgres 17 + API (host port 5001 → container 8080)
 ├── .env.example                   Template for compose variables (safe to commit)
@@ -95,7 +107,7 @@ There is **no `Migrations/` folder yet**. Schema creation currently uses `Ensure
 
 ### 3.1 Solution and `.csproj`
 
-- `Rayan.Academy.sln` groups projects. It is like a workspace manifest.
+- `AnaQuranAcademy.sln` groups projects. It is like a workspace manifest.
 - `Academy.Api.csproj` is the project definition: target framework, nullable settings, NuGet packages. It plays the role of `package.json` + `tsconfig.json`.
 - `net10.0` means .NET 10. `Nullable` and `ImplicitUsings` are on: nullability is checked by the compiler (like `strictNullChecks`), and common namespaces are imported automatically.
 - NuGet packages here: ASP.NET Core Identity EF, EF Core Design, Npgsql EF provider, Swashbuckle (Swagger).
@@ -267,7 +279,7 @@ This is why building the API is `docker compose up --build`, not `npm run dev`.
    1. `DATABASE_URL` (Neon/production),
    2. `ConnectionStrings:Academy` (local Docker),
    3. a hard-coded `localhost:5432` fallback.
-   URI-style `postgres://user:pass@host/db` strings are converted into Npgsql key/value form, with `SslMode=Require`, `ApplicationName=RayanAcademy`, and `MaxPoolSize=20`.
+   URI-style `postgres://user:pass@host/db` strings are converted into Npgsql key/value form, with `SslMode=Require`, `ApplicationName=AnaQuranAcademy`, and `MaxPoolSize=20`.
 3. **Register services**:
    - `AcademyDbContext` using Npgsql.
    - Identity core with password/lockout rules, roles, EF stores, sign-in manager.
@@ -785,7 +797,7 @@ Send ISO-8601 with an offset (or `Z`). The server converts availability times wi
 | Listen URL | `ASPNETCORE_URLS` | `http://+:8080` in image | |
 | Postgres password (compose) | `POSTGRES_PASSWORD` | `change-this-db-password` | Local only |
 
-Precedence: environment variables > `appsettings.json` > code defaults. Compose reads interpolated values from `Rayan-Academy-Backend/.env`; that file is gitignored. `.env.example` documents the variable names without secrets.
+Precedence: environment variables > `appsettings.json` > code defaults. Compose reads interpolated values from `Ana-Quran-Academy-Backend/.env`; that file is gitignored. `.env.example` documents the variable names without secrets.
 
 Because EF migrations are not set up yet, startup also runs an idempotent `CREATE TABLE IF NOT EXISTS "UserAvatars"` after `EnsureCreated`. It adds avatar storage to existing databases without deleting data; replace it with a real migration when the project adopts migrations.
 
@@ -810,7 +822,7 @@ Production (Neon):
 - Accepts `postgres://` and `postgresql://` URIs.
 - Uses `NpgsqlConnectionStringBuilder` to set host, port, database, user, password.
 - Forces `SslMode.Require` (Neon requires TLS).
-- Sets `ApplicationName=RayanAcademy` and `MaxPoolSize=20`.
+- Sets `ApplicationName=AnaQuranAcademy` and `MaxPoolSize=20`.
 - Maps query parameters `sslmode`, `application_name`, `connect_timeout`.
 
 The Neon project/branch metadata lives **outside** this repository (workspace root `.neon`, `neon.ts`, `.env.local`). The backend only consumes `DATABASE_URL`.
@@ -822,7 +834,7 @@ The Neon project/branch metadata lives **outside** this repository (workspace ro
 ### With Docker (recommended)
 
 ```bash
-cd Rayan-Academy-Backend
+cd Ana-Quran-Academy-Backend
 cp .env.example .env      # then edit passwords
 docker compose up --build
 ```

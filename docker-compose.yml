@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: rayan-academy-db
+    container_name: ana-quran-academy-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: academy
@@ -19,7 +19,7 @@ services:
 
   api:
     build: .
-    container_name: rayan-academy-api
+    container_name: ana-quran-academy-api
     restart: unless-stopped
     depends_on:
       postgres:
@@ -31,7 +31,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       DATABASE_URL_UNPOOLED: ${DATABASE_URL_UNPOOLED:-}
       AllowedOrigins: ${ALLOWED_ORIGINS:-http://localhost:3000}
-      BootstrapAdmin__Email: ${BOOTSTRAP_ADMIN_EMAIL:-admin@rayanacademy.local}
+      BootstrapAdmin__Email: ${BOOTSTRAP_ADMIN_EMAIL:-admin@anaquranacademy.local}
       BootstrapAdmin__Password: ${BOOTSTRAP_ADMIN_PASSWORD:-ChangeMe123}
       Database__EnsureCreated: "true"
       Otp__DevMode: ${OTP_DEV_MODE:-true}

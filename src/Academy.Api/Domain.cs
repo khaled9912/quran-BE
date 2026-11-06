@@ -72,9 +72,10 @@ public sealed class LessonSeries
 }
 
 /// <summary>
-/// A student's request to move their recurring series to another weekly slot.
-/// Admins see the full request; the teacher is notified that a change is being
-/// reviewed but only learns the new time after the admin confirms it.
+/// A student moving their recurring series to another weekly slot the teacher
+/// already published. The move is applied as it is requested, so the row is the
+/// record of what happened: applied, or one of the older pending/approved/
+/// rejected rows left by the approval queue this replaced.
 /// </summary>
 public sealed class LessonChangeRequest
 {
@@ -87,10 +88,12 @@ public sealed class LessonChangeRequest
     public AcademyUser? Teacher { get; set; }
     public Guid RequestedRuleId { get; set; }
     public TeacherAvailabilityRule? RequestedRule { get; set; }
-    [MaxLength(20)] public string Status { get; set; } = "pending";
+    [MaxLength(20)] public string Status { get; set; } = "applied";
     [MaxLength(500)] public string? StudentNote { get; set; }
+    /// <summary>Only ever written for rows the old approval queue left behind.</summary>
     [MaxLength(500)] public string? AdminNote { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    /// <summary>Only ever written for rows the old approval queue left behind.</summary>
     public DateTimeOffset? AdminRespondedAt { get; set; }
 }
 

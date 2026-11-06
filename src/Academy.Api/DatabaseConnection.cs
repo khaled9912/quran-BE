@@ -36,7 +36,7 @@ public static class DatabaseConnection
             Username = Uri.UnescapeDataString(userInfo[0]),
             Password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "",
             SslMode = SslMode.Require,
-            ApplicationName = "RayanAcademy",
+            ApplicationName = "AnaQuranAcademy",
             MaxPoolSize = 20
         };
 

@@ -310,3 +310,28 @@ public sealed class DeviceToken
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset LastSeenAt { get; set; } = DateTimeOffset.UtcNow;
 }
+
+/// <summary>
+/// One in-app "call me now" ring between lesson participants, or from staff to
+/// a participant. The row outlives the notification, so a call nobody answered
+/// is still on the lesson record when staff review a no-show.
+/// </summary>
+public sealed class LessonCall
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public Guid CallerId { get; set; }
+    public AcademyUser? Caller { get; set; }
+    // teacher | student | support | admin
+    [MaxLength(20)] public string CallerRole { get; set; } = "teacher";
+    public Guid CalleeId { get; set; }
+    public AcademyUser? Callee { get; set; }
+    // teacher | student
+    [MaxLength(20)] public string CalleeRole { get; set; } = "student";
+    // room: pressed by a participant | monitor: pressed by staff
+    [MaxLength(20)] public string Origin { get; set; } = "room";
+    /// <summary>Attendance status of the callee when the ring was sent.</summary>
+    [MaxLength(20)] public string CalleeStatus { get; set; } = "not_joined";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}

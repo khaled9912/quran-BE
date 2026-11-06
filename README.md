@@ -1,27 +1,29 @@
-# Rayan Academy — ASP.NET Core backend
+# Ana Quran Academy — ASP.NET Core backend
 
-A lean .NET 10 Web API for the Next.js App Router frontend. It uses ASP.NET Core Identity cookie authentication, PostgreSQL, and EF Core. The backend owns authorization, teacher/student assignments, availability, booking approvals, and lesson persistence.
+A lean .NET 10 Web API for the Next.js App Router frontend and the Expo mobile app. It uses ASP.NET Core Identity cookie authentication, PostgreSQL, and EF Core. The backend owns authorization, teacher/student assignments, weekly availability, instant booking, lesson operations, payments, transcripts, and notifications.
+
+**Product and business rules:** [`../docs/business-requirements/`](../docs/business-requirements/README.md). Read it before changing an endpoint; it states which flows are live, which are API-only, and which are mock UI.
 
 > New to .NET or joining from the frontend? Read [docs/architecture-for-frontend-developers.md](docs/architecture-for-frontend-developers.md) first — it explains the repo, the request pipeline, the data model, and production readiness end to end.
 
 ## Included
 
-- Student-only public registration; admins create teacher/admin accounts.
-- Cookie-based login/logout/current-user endpoints, plus self-service password change from the profile page (admins can still reset teacher/student passwords).
-- Email password reset with a one-time code (requires the `Email__*` SMTP settings; uses the dev code `8888` only in Development).
-- Admin management of teachers, student/teacher assignments, and booking approvals.
-- Teacher-published availability for students to select.
-- Student-facing teacher directory with self-service slot booking; choosing a teacher assigns them.
-- Student/teacher profiles with name, email, mobile, and avatar editing.
-- Post-lesson class reports (summary, student feedback, progress) that complete the lesson.
-- One 1–5 star review per completed lesson, aggregated on public teacher profiles.
-- Public teacher directory with reviews, plus report history on the profile page.
-- Student-preferred availability for teachers to select (the reverse workflow).
-- One active lesson request per student at a time.
-- Teacher/student confirmation followed by final admin approval.
-- Transactional slot claiming, partial unique indexes, and final calendar-conflict checks.
+- Student-only public registration, email/password login, phone OTP sign-in, email password reset, and self-service password change.
+- Admin provisioning and soft deactivation of teachers, students, support reviewers, and admins.
+- Teacher onboarding through a public application (CV + Quran recitation + optional intro) with admin review and invite code.
+- Profiles, avatars, and teacher directory with ratings and reviews.
+- Teacher-published **weekly availability rules** and instant student booking of any number of times; one active teacher per student.
+- Permanent weekly series with 8 weeks of lessons materialized ahead and rolled forward; the first lesson is a trial.
+- Open student offers (one-off times claimed by the first accepting teacher) and admin-mediated weekly time changes.
+- Lesson list/detail, post-lesson teacher reports, and one 1–5 star student review per lesson.
+- Lesson operations: policy-driven cancellations, credits, reschedules, make-up lessons, attendance beacons, excuses, incidents, reliability events, penalties, teacher hours, and salary periods.
+- Monthly student billing in USD (claims and admin confirmation) and teacher earnings in EGP with payout details.
+- In-app notifications, Expo push, transactional email, and SignalR change hints.
+- Lesson pen (ephemeral ink over the live room) and transcript storage with off-platform flags and a support review rubric.
 - Public contact submission stored and emailed to a server-configured receiver.
 - Docker Compose for API + PostgreSQL.
+
+Live lessons run on self-hosted Jitsi, not in this repo. Transcript audio capture is not implemented: the Jitsi deployment needs a bot that posts segments to `/api/lessons/{id}/transcript`.
 
 ## Run locally
 
@@ -86,11 +88,15 @@ The first-run setup uses `EnsureCreated` to create the initial schema and seed r
 
 ## Scheduling workflows
 
-**Student chooses a teacher slot:** teacher publishes → student requests → teacher confirms/rejects → admin approves/rejects.
+**Normal booking:** teacher publishes weekly rules → student selects any number of open rules → the API books them instantly, creates permanent series, and materializes 8 weeks of lessons. There is no teacher confirmation and no admin approval; publishing a rule is consent. The student's first-ever lesson is the trial.
 
-**Teacher chooses a student preference:** student submits preferred time → teacher selects it → student confirms/rejects → admin approves/rejects.
+**No teacher yet:** a student without an active teacher publishes one-off open offers; the first teacher to accept books one and becomes their teacher.
 
-Each request represents one lesson. Students repeat the process for every lesson. There is no recurring-series booking in this MVP.
+**Moving a weekly time:** the student requests another open rule of the same teacher → the admin queue handles it. The teacher is notified that a review is happening but does not see the requested time until the admin approves.
+
+**Ending a series:** the student ends it themselves; future lessons are cancelled and the slot becomes bookable again.
+
+Legacy one-off availability and `/api/lesson-requests` approval endpoints are still mounted for compatibility but are not used by the current web or mobile clients.
 
 ## Important production notes
 
@@ -98,8 +104,10 @@ Each request represents one lesson. Students repeat the process for every lesson
 - Configure `AllowedOrigins` with exact production frontend origins.
 - Keep `Cookie:SameSite=Lax` for same-site deployments. For truly cross-site deployments, use `SameSite=None` with HTTPS and `Secure` cookies.
 - Use secrets management for database and bootstrap admin credentials. Do not commit `.env`.
-- `EnsureCreated` is intended for a fresh MVP database. Before deploying schema changes to production, introduce and apply EF Core migrations. The `UserAvatars` table is currently added by an idempotent startup SQL statement as a temporary bridge for existing databases.
-- Email verification, invitation emails, audit history, automated request expiry, and LiveKit are not included yet.
+- `EnsureCreated` is intended for a fresh MVP database. Before deploying schema changes to production, introduce and apply EF Core migrations. Additive `CREATE TABLE IF NOT EXISTS` statements run at boot as a bridge for existing databases.
+- Data Protection keys are stored in Postgres so API redeploys do not sign users out.
+- Not built: email verification, EF Core migrations, transcript audio capture, Jitsi JWT/lobby enforcement, and automatic payouts. Invitation emails and password-reset email require `Email__*`; without SMTP the teacher invite code is returned to the admin and password reset returns `503`.
+- Audit data exists (`TranscriptAccessLogs`, lesson operations, credit ledger, reliability events, salary periods), but the transcript access log has no UI yet.
 
 ## Deploy to MonsterASP.NET (IIS)
 

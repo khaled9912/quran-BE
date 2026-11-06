@@ -148,7 +148,7 @@ public sealed class TextBeeOtpSender : IOtpSender
         var payload = new Dictionary<string, object?>
         {
             ["recipients"] = new[] { phone },
-            ["message"] = $"Your Rayan Academy verification code is {code}. It expires in 5 minutes."
+            ["message"] = $"Your Ana Quran Academy verification code is {code}. It expires in 5 minutes."
         };
         if (!string.IsNullOrWhiteSpace(_deviceId)) payload["deviceId"] = _deviceId;
 

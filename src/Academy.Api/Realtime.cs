@@ -15,6 +15,8 @@ public static class RealtimeScopes
     public const string Billing = "billing";
     public const string Policy = "policy";
     public const string Support = "support";
+    /// <summary>An in-app call ring arrived for one of the lesson participants.</summary>
+    public const string Calls = "calls";
 }
 
 public static class RealtimeGroups

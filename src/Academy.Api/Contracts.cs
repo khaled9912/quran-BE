@@ -24,7 +24,6 @@ public sealed record PublishOpenOfferRequest(DateTimeOffset StartsAt, DateTimeOf
 public sealed record CreateAvailabilityRulesRequest(List<int>? DaysOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
 public sealed record BookWeeklySlotsRequest(List<Guid>? RuleIds);
 public sealed record CreateLessonChangeRequestInput(Guid RequestedRuleId, string? Note);
-public sealed record RejectChangeRequestInput(string? Note);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);
 public sealed record ReviewTeacherApplicationRequest(string Status, string? Reason);
@@ -323,6 +322,22 @@ public sealed record UpdateSalaryPeriodRequest(decimal? ManualAdjustmentEgp, dec
 
 public sealed record RegisterDeviceTokenRequest(string? Token, string? Platform);
 
+/// <summary>Ring the other participant of a live lesson. Staff may name a side.</summary>
+public sealed record CallLessonRequest(string? TargetRole);
+
+public sealed record LessonCallDto(
+    Guid Id,
+    Guid LessonId,
+    Guid CallerId,
+    string CallerName,
+    string CallerRole,
+    Guid CalleeId,
+    string CalleeName,
+    string CalleeRole,
+    string Origin,
+    string CalleeStatus,
+    DateTimeOffset CreatedAt);
+
 public sealed record LessonOperationsDto(
     Guid LessonId,
     CancellationPreviewDto Cancellation,
@@ -334,7 +349,8 @@ public sealed record LessonOperationsDto(
     ExcuseRequestDto? Excuse,
     LessonIncidentDto? Incident,
     LessonDto? ReplacementLesson,
-    LessonDto? OriginalLesson);
+    LessonDto? OriginalLesson,
+    IReadOnlyList<LessonCallDto> Calls);
 
 public sealed record LessonOpsSummaryDto(
     int Lessons,
@@ -371,7 +387,8 @@ public sealed record AdminLessonOpsDetailDto(
     IReadOnlyList<LessonIncidentDto> Incidents,
     ExcuseRequestDto? Excuse,
     IReadOnlyList<LessonCreditTransactionDto> Credits,
-    IReadOnlyList<LessonScheduleChangeDto> ScheduleChanges);
+    IReadOnlyList<LessonScheduleChangeDto> ScheduleChanges,
+    IReadOnlyList<LessonCallDto> Calls);
 
 public sealed record LessonScheduleChangeDto(
     Guid Id,

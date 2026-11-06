@@ -72,7 +72,7 @@ jobs:
         run: |
           for attempt in $(seq 1 15); do
             body=$(curl -s https://anaquran.runasp.net/health || true)
-            if [[ "$body" == *rayan-academy-api* ]]; then
+            if [[ "$body" == *ana-quran-academy-api* ]]; then
               echo "API healthy after $attempt attempt(s)."
               exit 0
             fi

@@ -122,7 +122,7 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
         // Live lessons: flag a missing participant once the grace period passes.
         var graceCutoff = now.AddMinutes(-policy.NoShowGraceMinutes);
         var live = await db.Lessons
-            .Include(x => x.Teacher).Include(x => x.Student)
+            .Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Series)
             .Where(x => x.Status == "scheduled"
                 && x.StartsAt <= graceCutoff
                 && x.EndsAt > now)
@@ -208,12 +208,12 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
                     "potential_teacher_no_show" => "Possible teacher no-show",
                     _ => "Possible student no-show",
                 };
+                var body = LessonOpsMessaging.LessonSummary(lesson, incident.Detail);
+                var link = LessonOpsMessaging.LessonLink(lesson);
                 foreach (var adminId in adminIds)
                     db.Notifications.Add(LessonOpsMessaging.Notice(
-                        adminId, title,
-                        $"{lesson.Teacher?.FullName ?? "Teacher"} / {lesson.Student?.FullName ?? "Student"} on {lesson.StartsAt:ddd, MMM d 'at' h:mm tt}: {incident.Detail}",
-                        "system", "/admin/lesson-ops", $"incident-admin:{incident.Id}:{adminId}"));
-                pushJobs.AddRange(adminIds.Select(adminId => (adminId, title, incident.Detail, "/admin/lesson-ops")));
+                        adminId, title, body, "lesson", link, $"incident-admin:{incident.Id}:{adminId}"));
+                pushJobs.AddRange(adminIds.Select(adminId => (adminId, title, body, link)));
             }
         }
 
