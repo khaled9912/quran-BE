@@ -100,7 +100,8 @@ public static class PaymentEndpoints
         CreatePaymentClaimRequest input,
         ClaimsPrincipal principal,
         AcademyDbContext db,
-        RealtimeNotifier realtime)
+        RealtimeNotifier realtime,
+        AcademyPushSender push)
     {
         if (!TryParseMonth(input.Month, out var month))
             return Results.ValidationProblem(new Dictionary<string, string[]>() { ["month"] = ["Choose a valid month (YYYY-MM)."] });
@@ -156,12 +157,16 @@ public static class PaymentEndpoints
             where roleRow.Name == "admin" || roleRow.Name == "super_admin"
             select userRole.UserId
         ).Distinct().ToListAsync();
+        // One message for every admin: the claim waits on a person, so the
+        // reviewers are told on their phones and not only in the feed.
+        var reviewTitle = "Payment marked as sent";
+        var reviewBody = $"{claim.Student.FullName} marked {key} as paid (${claim.AmountUsd:0.00}). Review the claim when you can.";
         foreach (var adminId in adminIds)
             db.Notifications.Add(new AppNotification
             {
                 UserId = adminId,
-                Title = "Payment marked as sent",
-                Body = $"{claim.Student.FullName} marked {key} as paid (${claim.AmountUsd:0.00}). Review the claim when you can.",
+                Title = reviewTitle,
+                Body = reviewBody,
                 Kind = "payment",
                 Link = "/people",
                 DedupeKey = $"payment-claim:{claim.Id}:{claim.ClaimedAt.UtcTicks}",
@@ -171,6 +176,8 @@ public static class PaymentEndpoints
         await realtime.ToStaffAsync(RealtimeScopes.Admin);
         await realtime.ToUserAsync(studentId, RealtimeScopes.Billing);
         await realtime.ToUsersAsync(adminIds, RealtimeScopes.Notifications);
+        if (adminIds.Count > 0)
+            await LessonOpsMessaging.PushAsync(db, push, adminIds, reviewTitle, reviewBody, "/people");
         return Results.Ok(ToClaim(claim, claim.Student));
     }
 
@@ -419,7 +426,8 @@ public static class PaymentEndpoints
         Guid id,
         ClaimsPrincipal principal,
         AcademyDbContext db,
-        RealtimeNotifier realtime)
+        RealtimeNotifier realtime,
+        AcademyPushSender push)
     {
         var claim = await db.MonthlyPaymentClaims
             .Include(x => x.Student)
@@ -432,11 +440,13 @@ public static class PaymentEndpoints
         claim.ReviewedAt = DateTimeOffset.UtcNow;
         claim.ReviewedBy = ApiEndpoints.UserId(principal);
         claim.AdminNote = null;
+        var confirmTitle = "Payment confirmed";
+        var confirmBody = $"The academy confirmed your payment for {claim.Month} (${claim.AmountUsd:0.00}).";
         db.Notifications.Add(new AppNotification
         {
             UserId = claim.StudentId,
-            Title = "Payment confirmed",
-            Body = $"The academy confirmed your payment for {claim.Month} (${claim.AmountUsd:0.00}).",
+            Title = confirmTitle,
+            Body = confirmBody,
             Kind = "payment",
             Link = "/payments",
             DedupeKey = $"payment-confirmed:{claim.Id}",
@@ -445,6 +455,7 @@ public static class PaymentEndpoints
         await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Billing);
         await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Notifications);
         await realtime.ToStaffAsync(RealtimeScopes.Billing);
+        await LessonOpsMessaging.PushAsync(db, push, [claim.StudentId], confirmTitle, confirmBody, "/payments");
 
         return Results.Ok(ToClaim(claim, claim.Student));
     }
@@ -454,7 +465,8 @@ public static class PaymentEndpoints
         ReviewPaymentClaimRequest input,
         ClaimsPrincipal principal,
         AcademyDbContext db,
-        RealtimeNotifier realtime)
+        RealtimeNotifier realtime,
+        AcademyPushSender push)
     {
         var claim = await db.MonthlyPaymentClaims
             .Include(x => x.Student)
@@ -467,13 +479,15 @@ public static class PaymentEndpoints
         claim.ReviewedAt = DateTimeOffset.UtcNow;
         claim.ReviewedBy = ApiEndpoints.UserId(principal);
         claim.AdminNote = Clean(input.Note, 500);
+        var rejectTitle = "Payment needs attention";
+        var rejectBody = string.IsNullOrWhiteSpace(claim.AdminNote)
+            ? $"The academy could not confirm your payment for {claim.Month}. Open payments for details."
+            : $"The academy could not confirm your {claim.Month} payment: {claim.AdminNote}";
         db.Notifications.Add(new AppNotification
         {
             UserId = claim.StudentId,
-            Title = "Payment needs attention",
-            Body = string.IsNullOrWhiteSpace(claim.AdminNote)
-                ? $"The academy could not confirm your payment for {claim.Month}. Open payments for details."
-                : $"The academy could not confirm your {claim.Month} payment: {claim.AdminNote}",
+            Title = rejectTitle,
+            Body = rejectBody,
             Kind = "payment",
             Link = "/payments",
             DedupeKey = $"payment-rejected:{claim.Id}:{claim.ReviewedAt.Value.UtcTicks}",
@@ -482,6 +496,7 @@ public static class PaymentEndpoints
         await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Billing);
         await realtime.ToUserAsync(claim.StudentId, RealtimeScopes.Notifications);
         await realtime.ToStaffAsync(RealtimeScopes.Billing);
+        await LessonOpsMessaging.PushAsync(db, push, [claim.StudentId], rejectTitle, rejectBody, "/payments");
 
         return Results.Ok(ToClaim(claim, claim.Student));
     }

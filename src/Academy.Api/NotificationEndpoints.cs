@@ -14,12 +14,12 @@ public static class NotificationEndpoints
     {
         var api = app.MapGroup("/api/notifications").RequireAuthorization();
 
-        api.MapGet("", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapGet("", async (ClaimsPrincipal p, AcademyDbContext db, AcademyPushSender push) =>
         {
             var userId = ApiEndpoints.UserId(p);
             var role = RoleOf(p);
             if (role is "teacher" or "student")
-                await SyncLessonNoticesAsync(db, userId, role, DateTimeOffset.UtcNow);
+                await SyncLessonNoticesAsync(db, push, userId, role, DateTimeOffset.UtcNow);
 
             var items = await db.Notifications.AsNoTracking()
                 .Where(x => x.UserId == userId)
@@ -66,6 +66,7 @@ public static class NotificationEndpoints
 
     private static async Task SyncLessonNoticesAsync(
         AcademyDbContext db,
+        AcademyPushSender push,
         Guid userId,
         string role,
         DateTimeOffset now)
@@ -173,6 +174,13 @@ public static class NotificationEndpoints
         {
             // Another poll inserted the same notices first; the next read sees them.
             db.ChangeTracker.Clear();
+            return;
         }
+
+        // These reminders are written while the app is already open, so without a
+        // push they would only ever be seen inside it. Dedupe keys make a repeat
+        // impossible, so one alert per reminder is all a phone gets.
+        foreach (var notice in fresh)
+            await LessonOpsMessaging.PushAsync(db, push, [userId], notice.Title, notice.Body, notice.Link);
     }
 }

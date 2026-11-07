@@ -13,7 +13,11 @@ public static class ApiEndpoints
     internal static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
     private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
     private static bool IsAdmin(ClaimsPrincipal p) => p.IsInRole("admin") || p.IsInRole("super_admin");
-    private static UserDto ToUser(AcademyUser u, string role) => new(u.Id, u.FullName, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, u.FullName, u.IsActive, u.FullName, u.PhoneNumber, $"/api/users/{u.Id}/avatar");
+    private static UserDto ToUser(AcademyUser u, string role)
+    {
+        var name = DisplayName(u.FullName);
+        return new(u.Id, name, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, name, u.IsActive, name, u.PhoneNumber, $"/api/users/{u.Id}/avatar");
+    }
 
     // What the other side of a lesson is allowed to see: who they are, never how
     // to reach them. Contact details stay inside staff and self-service responses.
@@ -22,13 +26,22 @@ public static class ApiEndpoints
     // A name field is for a person, so an email address in it is a mistake even
     // when the address is valid, and it would leak into every listing.
     internal static bool NameContainsContact(string? fullName) => fullName is not null && fullName.Contains('@');
+
+    /// <summary>
+    /// The guard above only covers writes, so accounts created before it can still
+    /// hold an address in the name column. Reads report no name for those rows:
+    /// null means "unknown" and lets the fallback a caller already has — a client's
+    /// `?? email`, a sentence's `?? "your student"` — take over rather than print
+    /// an address where a person's name belongs.
+    /// </summary>
+    internal static string? DisplayName(string? fullName) => NameContainsContact(fullName) ? null : fullName;
     private static async Task<string> RoleOf(UserManager<AcademyUser> users, AcademyUser user)
         => (await users.GetRolesAsync(user)).FirstOrDefault() ?? "student";
     private static LessonRequestDto ToRequest(LessonRequest r)
     {
         var startsAt = r.AvailabilitySlot?.StartsAt ?? r.StudentAvailability!.StartsAt;
         var endsAt = r.AvailabilitySlot?.EndsAt ?? r.StudentAvailability!.EndsAt;
-        return new(r.Id, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "", r.AvailabilitySlotId, r.StudentAvailabilityId, r.AvailabilitySlotId.HasValue ? "student" : "teacher", startsAt, endsAt, r.Status, r.CreatedAt, r.RejectionReason);
+        return new(r.Id, r.TeacherId, DisplayName(r.Teacher?.FullName) ?? "Teacher", r.StudentId, DisplayName(r.Student?.FullName) ?? "Student", r.AvailabilitySlotId, r.StudentAvailabilityId, r.AvailabilitySlotId.HasValue ? "student" : "teacher", startsAt, endsAt, r.Status, r.CreatedAt, r.RejectionReason);
     }
     /// <summary>
     /// Identity reports a duplicate sign-in name and a duplicate email as two
@@ -43,8 +56,36 @@ public static class ApiEndpoints
             .GroupBy(e => e.Code)
             .ToDictionary(g => g.Key, g => g.Select(e => e.Description).Distinct().ToArray());
     }
+    /// <summary>
+    /// The sign-in answer is read by whoever typed the credentials, so it is
+    /// product copy. Both apps display ProblemDetails `detail` and treat `title`
+    /// as infrastructure wording, which is why the message goes in `detail`.
+    /// </summary>
+    internal static IResult SignInFailure() =>
+        Results.Problem(title: "Sign in failed", detail: "Invalid email or password.", statusCode: StatusCodes.Status401Unauthorized);
+
+    /// <summary>
+    /// Identity remembers the moment a locked account opens again, so the wait a
+    /// caller is told about is the one actually remaining, not the full window.
+    /// </summary>
+    internal static IResult SignInLockedOut(HttpResponse response, AcademyUser user)
+    {
+        var remaining = user.LockoutEnd is { } until ? until - DateTimeOffset.UtcNow : TimeSpan.Zero;
+        if (remaining < TimeSpan.Zero) remaining = TimeSpan.Zero;
+        response.Headers.RetryAfter = ((int)Math.Ceiling(remaining.TotalSeconds)).ToString();
+        // Whole minutes, rounded up: "about 1 minute" must not expire early.
+        var minutes = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
+        return Results.Problem(
+            title: "Sign in locked",
+            detail: $"Too many failed attempts. Sign in is locked for about {minutes} minute{(minutes == 1 ? "" : "s")}.",
+            statusCode: StatusCodes.Status429TooManyRequests);
+    }
+
     private static string PublicStudentName(string? fullName)
     {
+        // Splitting on spaces alone would hand back an address whole, since it has
+        // no space in it.
+        if (NameContainsContact(fullName)) return "Student";
         var parts = (fullName ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
         return parts.Length switch
         {
@@ -53,12 +94,12 @@ public static class ApiEndpoints
             _ => $"{parts[0]} {parts[^1][0]}."
         };
     }
-    private static LessonReportDto ToReport(LessonReport r, Lesson l) => new(r.Id, l.Id, l.StartsAt, l.EndsAt, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", r.ClassSummary, r.StudentFeedback, r.Progress, r.CreatedAt, r.UpdatedAt);
-    private static TeacherReviewDto ToReview(TeacherReview r, Lesson l) => new(r.Id, l.Id, l.StartsAt, r.TeacherId, r.Teacher?.FullName ?? l.Teacher?.FullName ?? "", r.StudentId, PublicStudentName(r.Student?.FullName ?? l.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt);
+    private static LessonReportDto ToReport(LessonReport r, Lesson l) => new(r.Id, l.Id, l.StartsAt, l.EndsAt, l.TeacherId, DisplayName(l.Teacher?.FullName) ?? "Teacher", l.StudentId, DisplayName(l.Student?.FullName) ?? "Student", r.ClassSummary, r.StudentFeedback, r.Progress, r.CreatedAt, r.UpdatedAt);
+    private static TeacherReviewDto ToReview(TeacherReview r, Lesson l) => new(r.Id, l.Id, l.StartsAt, r.TeacherId, DisplayName(r.Teacher?.FullName ?? l.Teacher?.FullName) ?? "Teacher", r.StudentId, PublicStudentName(r.Student?.FullName ?? l.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt);
     private static TeacherReviewDto ToReview(TeacherReview r) => r.Lesson is null
-        ? new(r.Id, r.LessonId, default, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, PublicStudentName(r.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt)
+        ? new(r.Id, r.LessonId, default, r.TeacherId, DisplayName(r.Teacher?.FullName) ?? "Teacher", r.StudentId, PublicStudentName(r.Student?.FullName), r.Rating, r.Comment, r.CreatedAt, r.UpdatedAt)
         : ToReview(r, r.Lesson);
-    internal static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, l.Teacher?.FullName ?? "", l.StudentId, l.Student?.FullName ?? "", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l), l.SeriesId, l.IsTrial, l.CancellationOutcome, l.CancelReason, l.CancelledAt, l.CancelledById, l.IsMakeup, l.OriginalLessonId);
+    internal static LessonDto ToLesson(Lesson l) => new(l.Id, l.TeacherId, DisplayName(l.Teacher?.FullName) ?? "Teacher", l.StudentId, DisplayName(l.Student?.FullName) ?? "Student", l.StartsAt, l.EndsAt, l.Status, l.ActualStartedAt, l.ActualEndedAt, l.Report is null ? null : ToReport(l.Report, l), l.Review is null ? null : ToReview(l.Review, l), l.SeriesId, l.IsTrial, l.CancellationOutcome, l.CancelReason, l.CancelledAt, l.CancelledById, l.IsMakeup, l.OriginalLessonId);
     private static async Task<(double? Average, int Count)> TeacherRatingAsync(AcademyDbContext db, Guid teacherId)
     {
         var count = await db.TeacherReviews.CountAsync(x => x.TeacherId == teacherId);
@@ -85,14 +126,18 @@ public static class ApiEndpoints
             await users.AddToRoleAsync(user, "student");
             await signIn.SignInAsync(user, isPersistent: true);
             return Results.Created("/api/auth/me", new { user = ToUser(user, "student") });
-        });
-        auth.MapPost("/login", async (LoginRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        }).RequireRateLimiting("signup");
+        auth.MapPost("/login", async (LoginRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, HttpContext http) =>
         {
-            if (string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password)) return Results.Problem("Invalid email or password.", statusCode: 401);
+            if (string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password)) return SignInFailure();
             var user = await users.FindByEmailAsync(input.Email.Trim());
-            if (user is null || !user.IsActive) return Results.Problem("Invalid email or password.", statusCode: 401);
+            if (user is null || !user.IsActive) return SignInFailure();
+            // lockoutOnFailure records the miss and, at the fifth one, locks the
+            // account for the configured window. The result says which happened, so
+            // a locked account must not keep answering "invalid credentials".
             var check = await signIn.CheckPasswordSignInAsync(user, input.Password, lockoutOnFailure: true);
-            if (!check.Succeeded) return Results.Problem("Invalid email or password.", statusCode: 401);
+            if (check.IsLockedOut) return SignInLockedOut(http.Response, user);
+            if (!check.Succeeded) return SignInFailure();
             await signIn.SignInAsync(user, isPersistent: true);
             return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         }).RequireRateLimiting("login");
@@ -1032,7 +1077,7 @@ public static class ApiEndpoints
                 .OrderByDescending(x => x.CreatedAt).ToListAsync();
             return Results.Ok(list.Select(ToChangeRequest));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
         {
             var studentId = UserId(p);
             var series = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
@@ -1054,7 +1099,7 @@ public static class ApiEndpoints
                 RequestedRuleId = rule.Id,
                 StudentNote = note is { Length: > 0 } ? note : null,
             };
-            if (await RecordTimeChangeAsync(db, series, rule, request, now) is { } blocked)
+            if (await RecordTimeChangeAsync(db, series, rule, request, now, push) is { } blocked)
                 return Results.Conflict(new { message = blocked });
 
             await realtime.ToParticipantsAsync(series.TeacherId, studentId, RealtimeScopes.Lessons);
@@ -1911,7 +1956,7 @@ public static class ApiEndpoints
     /// </summary>
     private static async Task<string?> RecordTimeChangeAsync(
         AcademyDbContext db, LessonSeries series, TeacherAvailabilityRule rule,
-        LessonChangeRequest request, DateTimeOffset now)
+        LessonChangeRequest request, DateTimeOffset now, AcademyPushSender? push = null)
     {
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
         if (await CheckTimeChangeAsync(series, rule, db, now) is { } blocked)
@@ -1921,6 +1966,8 @@ public static class ApiEndpoints
         }
         if (db.Entry(request).State == EntityState.Detached) db.LessonChangeRequests.Add(request);
         request.Status = "applied";
+        var notices = new List<AppNotification>();
+        string? conflict = null;
         try
         {
             await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt > now).ExecuteDeleteAsync();
@@ -1929,43 +1976,59 @@ public static class ApiEndpoints
             series.StartsAtTime = rule.StartsAtTime;
             series.EndsAtTime = rule.EndsAtTime;
             series.TimeZoneId = rule.TimeZoneId;
-            await AddTimeChangeNoticesAsync(db, series, request);
+            notices = await AddTimeChangeNoticesAsync(db, series, request);
             await db.SaveChangesAsync();
             await BuildSeriesLessonsAsync(db, series, now);
             await db.SaveChangesAsync();
             await tx.CommitAsync();
-            return null;
         }
         catch (Exception ex) when (ex is DbUpdateException or PostgresException)
         {
             await tx.RollbackAsync();
             db.ChangeTracker.Clear();
-            return "That time was just taken. Pick another slot.";
+            conflict = "That time was just taken. Pick another slot.";
         }
+        if (conflict is not null) return conflict;
+
+        // Only announce a move that committed, and only to the pair whose week
+        // changed; the academy's copy stays a feed item nobody has to be woken for.
+        if (push is not null)
+            foreach (var notice in notices.Where(x => x.UserId == series.StudentId || x.UserId == series.TeacherId))
+                await LessonOpsMessaging.PushAsync(db, push, [notice.UserId], notice.Title, notice.Body, notice.Link);
+        return null;
     }
 
     /// <summary>
     /// The student and the teacher get the new time. The academy is copied for
     /// the record only: it no longer decides anything, but a weekly time moving
-    /// under its roof is worth seeing.
+    /// under its roof is worth seeing. Returns every row written, so the caller can
+    /// announce the ones that matter once the change is committed.
     /// </summary>
-    private static async Task AddTimeChangeNoticesAsync(
+    private static async Task<List<AppNotification>> AddTimeChangeNoticesAsync(
         AcademyDbContext db, LessonSeries series, LessonChangeRequest request)
     {
         var studentName = series.Student?.FullName ?? "A student";
         var teacherName = series.Teacher?.FullName ?? "your teacher";
         var newAt = LessonOpsMessaging.WeeklyAt(series.DayOfWeek, series.StartsAtTime, series.TimeZoneId);
-        db.Notifications.AddRange(
+        var notices = new List<AppNotification>
+        {
             LessonOpsMessaging.Notice(series.StudentId, "Weekly time changed",
                 $"Your weekly time with {teacherName} moved to {newAt}.",
                 "request", "/schedule", $"change-applied:{request.Id}:student"),
             LessonOpsMessaging.Notice(series.TeacherId, "Weekly time changed",
                 $"{studentName}'s weekly time moved to {newAt}.",
-                "request", "/schedule", $"change-applied:{request.Id}:teacher"));
+                "request", "/schedule", $"change-applied:{request.Id}:teacher")
+        };
+        db.Notifications.AddRange(notices);
         foreach (var adminId in await LessonOpsMessaging.AdminUserIdsAsync(db))
-            db.Notifications.Add(LessonOpsMessaging.Notice(adminId, "Weekly time changed",
+        {
+            var copy = LessonOpsMessaging.Notice(adminId, "Weekly time changed",
                 $"{studentName} moved their weekly time with {teacherName} to {newAt}.",
-                "request", "/requests", $"change-applied:{request.Id}:admin:{adminId}"));
+                "request", "/requests", $"change-applied:{request.Id}:admin:{adminId}");
+            db.Notifications.Add(copy);
+            notices.Add(copy);
+        }
+        return notices;
     }
 
     /// <summary>

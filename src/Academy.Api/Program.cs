@@ -83,8 +83,11 @@ builder.Services.AddIdentityCore<AcademyUser>(options =>
     options.Password.RequireLowercase = true;
     options.Password.RequireNonAlphanumeric = false;
     options.Lockout.AllowedForNewUsers = true;
-    options.Lockout.MaxFailedAccessAttempts = 8;
-    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(10);
+    // Five wrong passwords close the account for three minutes: long enough that
+    // guessing is pointless, short enough that a forgetful student is back in
+    // before they need to contact support. A successful sign-in resets the count.
+    options.Lockout.MaxFailedAccessAttempts = 5;
+    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(3);
 })
 .AddRoles<IdentityRole<Guid>>()
 .AddEntityFrameworkStores<AcademyDbContext>()
@@ -140,9 +143,30 @@ builder.Services.AddCors(options => options.AddPolicy("Frontend", policy => poli
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    // A rejection with an empty body looks like a server failure to both apps and
+    // tells the student nothing. They read ProblemDetails `detail` as product copy,
+    // and Retry-After lets a client count the wait down instead of retrying blind.
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        var response = context.HttpContext.Response;
+        response.StatusCode = StatusCodes.Status429TooManyRequests;
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out TimeSpan retryAfter))
+            response.Headers.RetryAfter = ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+        await response.WriteAsJsonAsync(
+            new
+            {
+                title = "Too Many Requests",
+                status = StatusCodes.Status429TooManyRequests,
+                detail = "Too many attempts from your connection. Please wait a few minutes and try again."
+            },
+            cancellationToken);
+    };
     options.AddPolicy("contact", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
+    options.AddPolicy("signup", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(30), QueueLimit = 0, AutoReplenishment = true }));
     options.AddPolicy("login", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(5), QueueLimit = 0, AutoReplenishment = true }));
