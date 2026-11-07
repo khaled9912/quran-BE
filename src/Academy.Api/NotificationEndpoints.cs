@@ -91,9 +91,8 @@ public static class NotificationEndpoints
         {
             var started = lesson.StartsAt <= now;
             var withinHour = lesson.StartsAt - now <= TimeSpan.FromHours(1);
-            var otherName = isTeacher
-                ? lesson.Student?.FullName ?? "your student"
-                : lesson.Teacher?.FullName ?? "your teacher";
+            var otherName = ApiEndpoints.DisplayName(isTeacher ? lesson.Student?.FullName : lesson.Teacher?.FullName)
+                ?? (isTeacher ? "your student" : "your teacher");
             if (started)
             {
                 pending.Add(new AppNotification
@@ -147,7 +146,7 @@ public static class NotificationEndpoints
                 {
                     UserId = userId,
                     Title = "Lesson report due",
-                    Body = $"Your lesson with {lesson.Student?.FullName ?? "your student"} has ended. Submit the report to complete it.",
+                    Body = $"Your lesson with {ApiEndpoints.DisplayName(lesson.Student?.FullName) ?? "your student"} has ended. Submit the report to complete it.",
                     Kind = "report",
                     Link = $"/lesson/{lesson.Id}",
                     DedupeKey = $"lesson-report:{lesson.Id}",

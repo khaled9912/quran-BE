@@ -21,7 +21,15 @@ public static class ApiEndpoints
 
     // What the other side of a lesson is allowed to see: who they are, never how
     // to reach them. Contact details stay inside staff and self-service responses.
-    private static UserDto ToPerson(AcademyUser u, string role) => ToUser(u, role) with { Email = "", PhoneNumber = null };
+    private static UserDto ToPerson(AcademyUser u, string role)
+    {
+        var person = ToUser(u, role) with { Email = "", PhoneNumber = null };
+        if (person.FullName is not null) return person;
+        // This caller has no address to fall back to, so a missing name leaves only
+        // the role to label the person with.
+        var label = role == "teacher" ? "Teacher" : "Student";
+        return person with { FullName = label, FullNameSnake = label, Name = label };
+    }
 
     // A name field is for a person, so an email address in it is a mistake even
     // when the address is valid, and it would leak into every listing.
@@ -736,7 +744,7 @@ public static class ApiEndpoints
                 var average = teacherReviews.Count == 0 ? (double?)null : teacherReviews.Average(x => x.Rating);
                 return new PublicTeacherDto(
                     teacher.Id,
-                    teacher.FullName,
+                    DisplayName(teacher.FullName) ?? "Teacher",
                     $"/api/users/{teacher.Id}/avatar",
                     average,
                     teacherReviews.Count,
@@ -757,7 +765,7 @@ public static class ApiEndpoints
                 .ToListAsync();
             var reviewCount = await db.TeacherReviews.CountAsync(x => x.TeacherId == id);
             var average = reviewCount == 0 ? (double?)null : await db.TeacherReviews.Where(x => x.TeacherId == id).AverageAsync(x => (double)x.Rating);
-            return Results.Ok(new PublicTeacherDto(teacher.Id, teacher.FullName, $"/api/users/{teacher.Id}/avatar", average, reviewCount, reviews.Select(ToReview).ToList()));
+            return Results.Ok(new PublicTeacherDto(teacher.Id, DisplayName(teacher.FullName) ?? "Teacher", $"/api/users/{teacher.Id}/avatar", average, reviewCount, reviews.Select(ToReview).ToList()));
         }).AllowAnonymous();
         api.MapGet("/students", async (bool? includeInactive, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
@@ -1773,9 +1781,9 @@ public static class ApiEndpoints
             .Join(db.Users.Where(u => u.IsActive), x => x.UserId, u => u.Id, (x, u) => u.Id)
             .Distinct().ToListAsync(ct);
     }
-    private static LessonSeriesDto ToSeries(LessonSeries s) => new(s.Id, s.TeacherId, s.Teacher?.FullName ?? "", s.StudentId, s.Student?.FullName ?? "", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt);
+    private static LessonSeriesDto ToSeries(LessonSeries s) => new(s.Id, s.TeacherId, DisplayName(s.Teacher?.FullName) ?? "Teacher", s.StudentId, DisplayName(s.Student?.FullName) ?? "Student", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt);
     private static LessonChangeRequestDto ToChangeRequest(LessonChangeRequest r) => new(
-        r.Id, r.SeriesId, r.TeacherId, r.Teacher?.FullName ?? "", r.StudentId, r.Student?.FullName ?? "",
+        r.Id, r.SeriesId, r.TeacherId, DisplayName(r.Teacher?.FullName) ?? "Teacher", r.StudentId, DisplayName(r.Student?.FullName) ?? "Student",
         r.Series?.DayOfWeek ?? 0, FormatTime(r.Series?.StartsAtTime ?? TimeOnly.MinValue), FormatTime(r.Series?.EndsAtTime ?? TimeOnly.MinValue),
         r.RequestedRule?.DayOfWeek ?? 0, FormatTime(r.RequestedRule?.StartsAtTime ?? TimeOnly.MinValue), FormatTime(r.RequestedRule?.EndsAtTime ?? TimeOnly.MinValue),
         r.RequestedRule?.TimeZoneId ?? "UTC", r.Status, r.StudentNote, r.AdminNote, r.CreatedAt, r.AdminRespondedAt);

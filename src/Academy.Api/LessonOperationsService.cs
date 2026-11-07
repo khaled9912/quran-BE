@@ -514,8 +514,8 @@ public static class LessonPolicyService
             lesson.EndsAt,
             now,
             [
-                Participant(lesson.TeacherId, lesson.Teacher?.FullName ?? "Teacher", "teacher"),
-                Participant(lesson.StudentId, lesson.Student?.FullName ?? "Student", "student"),
+                Participant(lesson.TeacherId, ApiEndpoints.DisplayName(lesson.Teacher?.FullName) ?? "Teacher", "teacher"),
+                Participant(lesson.StudentId, ApiEndpoints.DisplayName(lesson.Student?.FullName) ?? "Student", "student"),
             ]);
     }
 
