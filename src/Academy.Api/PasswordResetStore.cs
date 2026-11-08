@@ -18,8 +18,9 @@ public sealed class PasswordResetStore
 
     public PasswordResetStore(IConfiguration configuration, IHostEnvironment environment)
     {
-        // A fixed code is only acceptable on a developer machine.
-        _devMode = environment.IsDevelopment() && configuration.GetValue("PasswordReset:DevMode", true);
+        // A fixed code is only acceptable on a developer machine with an explicit
+        // opt-in; both the environment name and the flag must allow it.
+        _devMode = environment.IsDevelopment() && configuration.GetValue("PasswordReset:DevMode", false);
         _devCode = configuration["PasswordReset:DevCode"] is { Length: > 0 } code ? code : "8888";
     }
 
@@ -31,9 +32,18 @@ public sealed class PasswordResetStore
         if (_devMode) return _devCode;
         var now = DateTimeOffset.UtcNow;
         if (_entries.TryGetValue(email, out var existing) && existing.SentAt.AddSeconds(60) > now) return null;
+        // Entries only leave on a verify or consume, so an attacker requesting
+        // codes for many addresses would grow this dictionary without bound.
+        if (_entries.Count >= 500) PurgeExpired(now);
         var code = RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6");
         _entries[email] = new Entry(Hash(email, code), 0, now.AddMinutes(15), now);
         return code;
+    }
+
+    private void PurgeExpired(DateTimeOffset now)
+    {
+        foreach (var pair in _entries)
+            if (pair.Value.ExpiresAt < now) _entries.TryRemove(pair.Key, out _);
     }
 
     public bool Check(string email, string code)

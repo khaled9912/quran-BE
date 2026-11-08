@@ -1,13 +1,47 @@
+using System.Diagnostics;
+using System.Security.Claims;
 using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 
 namespace Academy.Api;
 
-public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
+public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options, IHttpContextAccessor http)
     : IdentityDbContext<AcademyUser, IdentityRole<Guid>, Guid>(options), IDataProtectionKeyContext
 {
+    // Every audit row carries who, from where and under which request, so an entry
+    // can be lined up with the hosting access log during an incident. Rows written
+    // outside a request (the lesson monitor) keep the values the caller set.
+    private void StampAuditTrail()
+    {
+        var context = http.HttpContext;
+        if (context is null) return;
+        var role = context.User?.FindFirst(ClaimTypes.Role)?.Value;
+        var ip = context.Connection.RemoteIpAddress?.ToString();
+        var correlation = Activity.Current?.Id ?? context.TraceIdentifier;
+        foreach (var entry in ChangeTracker.Entries<AuditLog>())
+        {
+            if (entry.State != EntityState.Added) continue;
+            var row = entry.Entity;
+            row.ActorRole ??= role;
+            row.SourceIp ??= ip;
+            row.CorrelationId ??= correlation;
+        }
+    }
+
+    public override int SaveChanges(bool acceptAllChangesOnSuccess)
+    {
+        StampAuditTrail();
+        return base.SaveChanges(acceptAllChangesOnSuccess);
+    }
+
+    public override Task<int> SaveChangesAsync(bool acceptAllChangesOnSuccess, CancellationToken cancellationToken = default)
+    {
+        StampAuditTrail();
+        return base.SaveChangesAsync(acceptAllChangesOnSuccess, cancellationToken);
+    }
     public DbSet<DataProtectionKey> DataProtectionKeys => Set<DataProtectionKey>();
     public DbSet<TeacherStudentAssignment> Assignments => Set<TeacherStudentAssignment>();
     public DbSet<AvailabilitySlot> AvailabilitySlots => Set<AvailabilitySlot>();
@@ -203,6 +237,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options)
         b.Entity<SalaryPeriod>().HasIndex(x => new { x.TeacherId, x.Month }).IsUnique();
         b.Entity<AuditLog>().HasIndex(x => new { x.EntityType, x.EntityId, x.CreatedAt });
         b.Entity<AuditLog>().HasIndex(x => new { x.ActorId, x.CreatedAt });
+        b.Entity<AuditLog>().HasIndex(x => x.CorrelationId);
         b.Entity<LessonExcuseRequest>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LessonExcuseRequest>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<LessonExcuseRequest>().HasIndex(x => x.LessonId).IsUnique().HasFilter("\"Status\" = 'pending'");

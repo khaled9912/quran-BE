@@ -270,6 +270,15 @@ public static class PaymentEndpoints
         details.BankAccountHolder = holder ?? "";
         details.BankIban = iban ?? "";
         details.UpdatedAt = DateTimeOffset.UtcNow;
+        // Record which methods were set, never the account identifiers themselves.
+        db.AuditLogs.Add(new AuditLog
+        {
+            ActorId = teacherId,
+            Action = "payout_details_updated",
+            EntityType = "TeacherPayoutDetail",
+            EntityId = teacherId,
+            Detail = $"methods={string.Join(",", new[] { instapay is not null ? "instapay" : null, vodafone is not null ? "vodafone" : null, bankName is not null || holder is not null || iban is not null ? "bank" : null }.Where(x => x is not null))}",
+        });
         await db.SaveChangesAsync();
         await realtime.ToUserAsync(teacherId, RealtimeScopes.Billing);
         await realtime.ToStaffAsync(RealtimeScopes.Billing);
@@ -383,6 +392,15 @@ public static class PaymentEndpoints
         account.Notes = Clean(input.Notes, 500) ?? "";
         account.UpdatedAt = DateTimeOffset.UtcNow;
         account.UpdatedBy = ApiEndpoints.UserId(principal);
+        // The receiving bank details are payment credentials: log the event only.
+        // The academy account row is a fixed singleton, so it has no entity id.
+        db.AuditLogs.Add(new AuditLog
+        {
+            ActorId = account.UpdatedBy,
+            Action = "academy_account_updated",
+            EntityType = "AcademyBankAccount",
+            Detail = "receiving-account changed",
+        });
         await db.SaveChangesAsync();
         await realtime.ToAllAsync(RealtimeScopes.Billing);
 
@@ -392,6 +410,7 @@ public static class PaymentEndpoints
     private static async Task<IResult> SaveRateAsync(
         Guid teacherId,
         UpdateTeacherBillingRateRequest input,
+        ClaimsPrincipal principal,
         AcademyDbContext db,
         UserManager<AcademyUser> users,
         RealtimeNotifier realtime)
@@ -410,9 +429,19 @@ public static class PaymentEndpoints
             db.TeacherBillingRates.Add(rate);
         }
 
+        var previousPrice = rate.StudentPriceUsd;
+        var previousPayout = rate.PayoutEgp;
         rate.StudentPriceUsd = decimal.Round(input.StudentPriceUsd, 2);
         rate.PayoutEgp = decimal.Round(input.PayoutEgp, 2);
         rate.UpdatedAt = DateTimeOffset.UtcNow;
+        db.AuditLogs.Add(new AuditLog
+        {
+            ActorId = ApiEndpoints.UserId(principal),
+            Action = "teacher_rate_updated",
+            EntityType = "TeacherBillingRate",
+            EntityId = teacherId,
+            Detail = $"studentPriceUsd={previousPrice:0.00}->{rate.StudentPriceUsd:0.00}; payoutEgp={previousPayout:0.00}->{rate.PayoutEgp:0.00}",
+        });
         await db.SaveChangesAsync();
         await realtime.ToUserAsync(teacherId, RealtimeScopes.Billing);
         await realtime.ToStaffAsync(RealtimeScopes.Billing);

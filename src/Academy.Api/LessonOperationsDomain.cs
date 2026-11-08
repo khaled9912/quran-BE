@@ -255,10 +255,13 @@ public sealed class AuditLog
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid? ActorId { get; set; }
+    [MaxLength(20)] public string? ActorRole { get; set; }
     [MaxLength(80)] public string Action { get; set; } = "";
     [MaxLength(60)] public string EntityType { get; set; } = "";
     public Guid? EntityId { get; set; }
     [MaxLength(2000)] public string Detail { get; set; } = "";
+    [MaxLength(45)] public string? SourceIp { get; set; }
+    [MaxLength(64)] public string? CorrelationId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 

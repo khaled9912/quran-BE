@@ -27,9 +27,11 @@ public sealed class PhoneOtpStore
 
     public PhoneOtpStore(IConfiguration configuration, IHostEnvironment environment)
     {
-        // A fixed code is only ever acceptable on a developer machine. Even if a
-        // hosted environment accidentally sets Otp:DevMode=true, it is ignored.
-        _devMode = environment.IsDevelopment() && configuration.GetValue("Otp:DevMode", true);
+        // A fixed code is only ever acceptable on a developer machine, and only
+        // when explicitly opted in. Both gates must hold: a Development environment
+        // name AND Otp:DevMode=true. Defaulting the flag to false means a mislabeled
+        // or compose-launched "Development" deployment cannot silently accept 8888.
+        _devMode = environment.IsDevelopment() && configuration.GetValue("Otp:DevMode", false);
         _devCode = configuration["Otp:DevCode"] is { Length: > 0 } code ? code : "8888";
     }
 
@@ -42,9 +44,18 @@ public sealed class PhoneOtpStore
         if (_devMode) return _devCode;
         var now = DateTimeOffset.UtcNow;
         if (_entries.TryGetValue(phone, out var existing) && existing.SentAt.AddSeconds(60) > now) return null;
+        // Entries only leave on a verify or consume, so an attacker issuing codes
+        // to many numbers would grow this dictionary without bound.
+        if (_entries.Count >= 500) PurgeExpired(now);
         var code = RandomNumberGenerator.GetInt32(0, 1_000_000).ToString("D6");
         _entries[phone] = new Entry(Hash(phone, code), 0, now.AddMinutes(5), now);
         return code;
+    }
+
+    private void PurgeExpired(DateTimeOffset now)
+    {
+        foreach (var pair in _entries)
+            if (pair.Value.ExpiresAt < now) _entries.TryRemove(pair.Key, out _);
     }
 
     public bool Check(string phone, string code)

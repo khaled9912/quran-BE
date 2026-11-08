@@ -6,6 +6,7 @@ namespace Academy.Api;
 public sealed class AcademyUser : IdentityUser<Guid>
 {
     [MaxLength(160)] public string FullName { get; set; } = "";
+    [MaxLength(20)] public string? Grade { get; set; }
     public bool IsActive { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
