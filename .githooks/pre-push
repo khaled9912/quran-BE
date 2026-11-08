@@ -1,0 +1,12 @@
+#!/bin/sh
+# Install once per clone:  git config core.hooksPath .githooks
+# The full security suite runs in CI; this is the fast local version of it.
+set -e
+
+dotnet build AnaQuranAcademy.sln -c Release --nologo -v q /p:UseAppHost=false
+
+if dotnet list AnaQuranAcademy.sln package --vulnerable --include-transitive \
+  | grep -q "has the following vulnerable packages"; then
+  echo "A referenced package has a security advisory. Bump it before pushing." >&2
+  exit 1
+fi
