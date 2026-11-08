@@ -13,10 +13,26 @@ public static class ApiEndpoints
     internal static Guid UserId(ClaimsPrincipal p) => Guid.Parse(p.FindFirstValue(ClaimTypes.NameIdentifier)!);
     private static bool HasRole(ClaimsPrincipal p, string role) => p.IsInRole(role);
     private static bool IsAdmin(ClaimsPrincipal p) => p.IsInRole("admin") || p.IsInRole("super_admin");
+    private static void Audit(AcademyDbContext db, Guid? actorId, string action, string entityType, Guid? entityId, string detail) =>
+        db.AuditLogs.Add(new AuditLog
+        {
+            ActorId = actorId,
+            Action = action,
+            EntityType = entityType,
+            EntityId = entityId,
+            Detail = detail.Length > 2000 ? detail[..2000] : detail,
+        });
+    // The school-grade dropdown values shared by the web and mobile forms.
+    public static readonly string[] StudentGrades = new[]
+    {
+        "Kindergarten", "Grade 1", "Grade 2", "Grade 3", "Grade 4", "Grade 5", "Grade 6",
+        "Grade 7", "Grade 8", "Grade 9", "Grade 10", "Grade 11", "Grade 12",
+    };
+
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
-        return new(u.Id, name, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, name, u.IsActive, name, u.PhoneNumber, $"/api/users/{u.Id}/avatar");
+        return new(u.Id, name, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, name, u.IsActive, name, u.PhoneNumber, $"/api/users/{u.Id}/avatar", u.Grade);
     }
 
     // What the other side of a lesson is allowed to see: who they are, never how
@@ -159,7 +175,7 @@ public static class ApiEndpoints
 
         // Self-service password change. Mapped on the root group so the auth
         // group's AllowAnonymous flag cannot bypass authorization.
-        api.MapPost("/auth/change-password", async (ChangePasswordRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        api.MapPost("/auth/change-password", async (ChangePasswordRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, AcademyDbContext db) =>
         {
             var user = await users.GetUserAsync(principal);
             if (user is null || !user.IsActive) return Results.Unauthorized();
@@ -180,11 +196,13 @@ public static class ApiEndpoints
             }
             // Rotate the cookie for this device; other devices are signed out by the
             // security stamp change inside ChangePasswordAsync.
+            Audit(db, user.Id, "password_changed", "User", user.Id, "self-service");
+            await db.SaveChangesAsync();
             await signIn.RefreshSignInAsync(user);
             return Results.NoContent();
         }).RequireAuthorization().RequireRateLimiting("login");
 
-        auth.MapPost("/password/request", async (PasswordResetRequestInput input, PasswordResetStore resets, AcademyEmailSender email, UserManager<AcademyUser> users, HttpContext http) =>
+        auth.MapPost("/password/request", async (PasswordResetRequestInput input, PasswordResetStore resets, AcademyEmailSender email, UserManager<AcademyUser> users, HttpContext http, Microsoft.Extensions.Logging.ILoggerFactory loggerFactory) =>
         {
             var address = input.Email?.Trim() ?? "";
             if (!System.Net.Mail.MailAddress.TryCreate(address, out _))
@@ -194,29 +212,31 @@ public static class ApiEndpoints
 
             var key = address.ToLowerInvariant();
             var user = await users.FindByEmailAsync(address);
-            // The response is identical whether or not the account exists.
-            if (user is null || !user.IsActive)
-                return Results.Accepted(value: new { message = "If an account uses this email, a reset code has been sent." });
-
-            var code = resets.TryIssue(key);
-            if (code is null) return Results.Problem("Please wait a minute before requesting another code.", statusCode: 429);
-            if (!resets.DevMode)
+            // The response must not reveal whether the account exists, whether a
+            // code was recently issued (cooldown), or whether delivery succeeded.
+            // Every outcome below returns the same 202; failures are logged server-side.
+            string? issued = null;
+            if (user is not null && user.IsActive)
             {
-                var sent = await email.SendPasswordResetCodeAsync(user.Email!, code, 15, http.RequestAborted);
-                if (!sent)
+                issued = resets.TryIssue(key);
+                if (issued is not null && !resets.DevMode)
                 {
-                    resets.Consume(key);
-                    return Results.Problem("Could not send the reset email. Please try again.", statusCode: 502);
+                    var sent = await email.SendPasswordResetCodeAsync(user.Email!, issued, 15, http.RequestAborted);
+                    if (!sent)
+                    {
+                        resets.Consume(key);
+                        loggerFactory.CreateLogger("PasswordReset").LogError("Password reset email delivery failed for a registered account.");
+                    }
                 }
             }
             return Results.Accepted(value: new
             {
                 message = "If an account uses this email, a reset code has been sent.",
-                devCode = resets.DevMode ? code : null,
+                devCode = resets.DevMode ? issued : null,
             });
         }).RequireRateLimiting("otp");
 
-        auth.MapPost("/password/reset", async (PasswordResetInput input, PasswordResetStore resets, UserManager<AcademyUser> users) =>
+        auth.MapPost("/password/reset", async (PasswordResetInput input, PasswordResetStore resets, UserManager<AcademyUser> users, AcademyDbContext db) =>
         {
             var address = input.Email?.Trim() ?? "";
             var code = input.Code?.Trim() ?? "";
@@ -236,7 +256,13 @@ public static class ApiEndpoints
             var token = await users.GeneratePasswordResetTokenAsync(user);
             var result = await users.ResetPasswordAsync(user, token, input.NewPassword);
             if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
+            // A victim who resets a stolen account's password must also lose the
+            // attacker's existing session.
+            await users.UpdateSecurityStampAsync(user);
+            await users.UpdateAsync(user);
             resets.Consume(key);
+            Audit(db, user.Id, "password_reset_completed", "User", user.Id, "email-code");
+            await db.SaveChangesAsync();
             return Results.NoContent();
         }).RequireRateLimiting("otp");
 
@@ -249,7 +275,7 @@ public static class ApiEndpoints
                 : Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
         });
 
-        profile.MapPatch("", async (UpdateProfileRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
+        profile.MapPatch("", async (UpdateProfileRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, PhoneOtpStore otp, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var user = await users.GetUserAsync(principal);
             if (user is null || !user.IsActive) return Results.Unauthorized();
@@ -272,19 +298,42 @@ public static class ApiEndpoints
             }
             if (errors.Count > 0) return Results.ValidationProblem(errors);
 
-            if (email is not null && !string.Equals(email, user.Email, StringComparison.OrdinalIgnoreCase))
+            // Changing a sign-in identifier is a sensitive operation: a stolen
+            // session must not be able to rebind the account to an attacker's
+            // email/phone and turn transient access into a permanent takeover.
+            // Require step-up proof against an existing credential first.
+            var emailChanged = email is not null && !string.Equals(email, user.Email, StringComparison.OrdinalIgnoreCase);
+            var phoneChanged = phone is not null && !string.Equals(phone, user.PhoneNumber, StringComparison.Ordinal);
+            if (emailChanged || phoneChanged)
             {
-                var emailOwner = await users.FindByEmailAsync(email);
+                var verified = false;
+                if (!string.IsNullOrWhiteSpace(input.CurrentPassword) && await users.HasPasswordAsync(user))
+                    verified = await users.CheckPasswordAsync(user, input.CurrentPassword);
+                if (!verified && !string.IsNullOrWhiteSpace(input.PhoneCode) && user.PhoneNumberConfirmed && user.PhoneNumber is not null)
+                {
+                    if (otp.Check(user.PhoneNumber, input.PhoneCode.Trim()))
+                    {
+                        otp.Consume(user.PhoneNumber);
+                        verified = true;
+                    }
+                }
+                if (!verified)
+                    return Results.Problem("Confirm your identity with your current password or a code sent to your current mobile number before changing contact details.", statusCode: 403);
+            }
+
+            if (emailChanged)
+            {
+                var emailOwner = await users.FindByEmailAsync(email!);
                 if (emailOwner is not null && emailOwner.Id != user.Id)
                     return Results.Conflict(new { message = "An account with this email already exists." });
-                var nameOwner = await users.FindByNameAsync(email);
+                var nameOwner = await users.FindByNameAsync(email!);
                 if (nameOwner is not null && nameOwner.Id != user.Id)
                     return Results.Conflict(new { message = "That email is already in use." });
                 user.Email = email;
                 user.UserName = email;
                 user.EmailConfirmed = true;
             }
-            if (phone is not null && !string.Equals(phone, user.PhoneNumber, StringComparison.Ordinal))
+            if (phoneChanged)
             {
                 if (await users.Users.AnyAsync(x => x.PhoneNumber == phone && x.Id != user.Id))
                     return Results.Conflict(new { message = "That mobile number is already in use." });
@@ -296,6 +345,16 @@ public static class ApiEndpoints
             var updated = await users.UpdateAsync(user);
             if (!updated.Succeeded)
                 return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            if (emailChanged || phoneChanged)
+                db.AuditLogs.Add(new AuditLog
+                {
+                    ActorId = user.Id,
+                    Action = "profile_identifier_changed",
+                    EntityType = "User",
+                    EntityId = user.Id,
+                    Detail = $"{(emailChanged ? "email " : "")}{(phoneChanged ? "phone" : "")}".Trim(),
+                });
+            await db.SaveChangesAsync();
             await realtime.ToUserAsync(user.Id, RealtimeScopes.Self);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Ok(new { user = ToUser(user, await RoleOf(users, user)) });
@@ -465,7 +524,7 @@ public static class ApiEndpoints
         }).AllowAnonymous().RequireRateLimiting("contact");
 
         var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
-        admin.MapPost("/users", async (CreateUserRequest input, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
+        admin.MapPost("/users", async (CreateUserRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || string.IsNullOrWhiteSpace(input.Role)) return Results.BadRequest(new { message = "Full name, email, password and role are required." });
             var role = input.Role.Trim().ToLowerInvariant();
@@ -474,10 +533,12 @@ public static class ApiEndpoints
             var created = await users.CreateAsync(user, input.Password);
             if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, role);
+            Audit(db, UserId(principal), "admin_user_created", "User", user.Id, $"role={role}");
+            await db.SaveChangesAsync();
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/{role}s/{user.Id}", new { user = ToUser(user, role) });
         });
-        admin.MapPatch("/users/{id:guid}", async (Guid id, UpdateUserRequest input, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
+        admin.MapPatch("/users/{id:guid}", async (Guid id, UpdateUserRequest input, ClaimsPrincipal principal, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
@@ -505,14 +566,30 @@ public static class ApiEndpoints
                 var token = await users.GeneratePasswordResetTokenAsync(user);
                 var reset = await users.ResetPasswordAsync(user, token, input.Password);
                 if (!reset.Succeeded) return Results.ValidationProblem(reset.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+                // An admin password reset is how a compromised account is taken back,
+                // so every session issued before it has to stop working.
+                await users.UpdateSecurityStampAsync(user);
+                await users.UpdateAsync(user);
             }
-            if (input.IsActive == false) await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            if (input.IsActive == false)
+            {
+                // Switching the stamp invalidates every cookie already issued to this
+                // account; IsActive alone would not, because the session cookie is only
+                // re-checked against the database when the stamp is validated.
+                // UpdateSecurityStampAsync changes the value on the user, UpdateAsync writes it.
+                await users.UpdateSecurityStampAsync(user);
+                await users.UpdateAsync(user);
+                await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+            }
+            var changedFields = string.Join(",", new[] { email is not null ? "email" : null, name is not null ? "name" : null, input.IsActive is not null ? "isActive" : null, input.Password is not null ? "password" : null }.Where(x => x is not null));
+            Audit(db, UserId(principal), "admin_user_updated", "User", id, $"fields={changedFields}");
+            await db.SaveChangesAsync();
             await realtime.ToUserAsync(id, RealtimeScopes.Self);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Ok(ToUser(user, role));
         });
         // Deletes are soft: lessons keep their historical teacher/student owners.
-        admin.MapDelete("/users/{id:guid}", async (Guid id, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
+        admin.MapDelete("/users/{id:guid}", async (Guid id, ClaimsPrincipal principal, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
@@ -531,8 +608,10 @@ public static class ApiEndpoints
                 if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
             }
             user.IsActive = false;
+            await users.UpdateSecurityStampAsync(user);
             var updated = await users.UpdateAsync(user);
             if (!updated.Succeeded) return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
+            Audit(db, UserId(principal), "admin_user_deactivated", "User", id, $"role={role}; pendingRequestsRejected={pending.Count}");
             await db.SaveChangesAsync();
             await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
             await db.AvailabilitySlots.Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > now).ExecuteDeleteAsync();
@@ -779,10 +858,13 @@ public static class ApiEndpoints
         }).RequireAuthorization();
         api.MapPost("/students", async (CreateStudentRequest input, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
+            var grade = string.IsNullOrWhiteSpace(input.Grade) ? null : input.Grade.Trim();
             if (string.IsNullOrWhiteSpace(input.FullName) || !System.Net.Mail.MailAddress.TryCreate(input.Email, out _) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["student"] = ["Full name, a valid email and a password of at least 8 characters are required."] });
+            if (grade is not null && Array.IndexOf(StudentGrades, grade) < 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["grade"] = ["Grade must be Kindergarten or one of Grade 1 to Grade 12."] });
             if (await users.FindByEmailAsync(input.Email.Trim()) is not null) return Results.Conflict(new { message = "An account with this email already exists." });
-            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
+            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), Grade = grade, EmailConfirmed = true };
             var created = await users.CreateAsync(user, input.Password);
             if (!created.Succeeded) return Results.ValidationProblem(IdentityErrors(created));
             await users.AddToRoleAsync(user, "student");
@@ -1433,12 +1515,17 @@ public static class ApiEndpoints
             var q = db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).AsQueryable();
             if (HasRole(p, "student")) q = q.Where(x => x.StudentId == UserId(p));
             else if (HasRole(p, "teacher")) q = q.Where(x => x.TeacherId == UserId(p));
+            else if (!IsAdmin(p)) return Results.Forbid();
             return Results.Ok((await q.OrderBy(x => x.StartsAt).ToListAsync()).Select(ToLesson));
         }).RequireAuthorization();
         api.MapGet("/lessons/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db) =>
         {
             var l = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).FirstOrDefaultAsync(x => x.Id == id);
-            if (l is null) return Results.NotFound(); if (HasRole(p, "student") && l.StudentId != UserId(p) || HasRole(p, "teacher") && l.TeacherId != UserId(p)) return Results.Forbid();
+            if (l is null) return Results.NotFound();
+            // Allow-list: admins and the two participants only. Support reviews
+            // lessons through the dedicated reviewer endpoints, which never expose
+            // the student's private report/review feedback.
+            if (!IsAdmin(p) && l.StudentId != UserId(p) && l.TeacherId != UserId(p)) return Results.Forbid();
             return Results.Ok(ToLesson(l));
         }).RequireAuthorization();
 
@@ -1453,6 +1540,11 @@ public static class ApiEndpoints
             if (incoming.Count == 0) return Results.BadRequest(new { message = "No segments supplied." });
             if (incoming.Count > 200) return Results.BadRequest(new { message = "Send at most 200 segments per request." });
             if (!await db.Lessons.AsNoTracking().AnyAsync(x => x.Id == id)) return Results.NotFound();
+            // Bound the stored transcript per lesson so a replayed or leaked
+            // ingest key cannot grow the table without limit.
+            var stored = await db.LessonTranscriptSegments.CountAsync(x => x.LessonId == id);
+            if (stored >= MaxTranscriptSegmentsPerLesson)
+                return Results.Conflict(new { message = "This lesson already has the maximum number of transcript segments." });
 
             var now = DateTimeOffset.UtcNow;
             var accepted = 0;
@@ -1479,7 +1571,7 @@ public static class ApiEndpoints
             }
             await db.SaveChangesAsync();
             return Results.Ok(new { accepted, flagged });
-        }).AllowAnonymous();
+        }).AllowAnonymous().RequireRateLimiting("transcripts");
 
         api.MapPatch("/lessons/{id:guid}", async (Guid id, UpdateLessonRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
@@ -2090,6 +2182,9 @@ public static class ApiEndpoints
         => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.Id == id).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).FirstOrDefaultAsync();
 
     private const long MaxAvatarBytes = 2 * 1024 * 1024;
+    // Generous ceiling for a transcripted lesson; bounds what a leaked ingest key
+    // can store per lesson regardless of how many requests it makes.
+    private const int MaxTranscriptSegmentsPerLesson = 5000;
 
     private static bool SecretsMatch(string provided, string expected)
     {

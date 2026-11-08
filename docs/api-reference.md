@@ -69,7 +69,7 @@ Avatars accept PNG/JPEG/WebP up to 2 MB, checked by content type and magic bytes
 | GET | `/teachers[?includeInactive=true]` | Admin |
 | GET | `/teachers/{id}` | Admin |
 | GET | `/students[?includeInactive=true]` | Any; admin sees all, a teacher only assigned students |
-| POST | `/students` | Admin; `{ fullName, email, password, grade? }` — `grade` is accepted and ignored |
+| POST | `/students` | Admin; `{ fullName, email, password, grade? }` — `grade` must be `Kindergarten` or `Grade 1` to `Grade 12`; persisted and returned on `UserDto` |
 | GET | `/students/{id}` | Admin, the assigned teacher, or that student |
 | GET | `/admin/assignments` | Admin |
 | POST | `/teacher-student-assignments` | Admin; `{ teacherId, studentId }` |

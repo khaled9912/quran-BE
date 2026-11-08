@@ -73,6 +73,7 @@ var connectionString = DatabaseConnection.Resolve(builder.Configuration);
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
+builder.Services.AddHttpContextAccessor();
 builder.Services.AddDbContext<AcademyDbContext>(options => options.UseNpgsql(connectionString));
 builder.Services.AddIdentityCore<AcademyUser>(options =>
 {
@@ -91,6 +92,10 @@ builder.Services.AddIdentityCore<AcademyUser>(options =>
 })
 .AddRoles<IdentityRole<Guid>>()
 .AddEntityFrameworkStores<AcademyDbContext>()
+// Password-reset tokens come from the "Default" token provider. AddIdentityCore
+// does not register it, so without this line every reset — and the admin's
+// set-password path — threw NotSupportedException and returned 500.
+.AddDefaultTokenProviders()
 .AddSignInManager();
 
 builder.Services.RemoveAll<IUserValidator<AcademyUser>>();
@@ -117,12 +122,25 @@ builder.Services.AddAuthentication(IdentityConstants.ApplicationScheme)
         options.ExpireTimeSpan = TimeSpan.FromDays(7);
         options.Events = new CookieAuthenticationEvents
         {
+            // Without this callback the cookie is trusted for its whole 7 days and a
+            // password reset or a deactivation leaves the old session working.
+            OnValidatePrincipal = SecurityStampValidator.ValidatePrincipalAsync,
             OnRedirectToLogin = context => { context.Response.StatusCode = StatusCodes.Status401Unauthorized; return Task.CompletedTask; },
             OnRedirectToAccessDenied = context => { context.Response.StatusCode = StatusCodes.Status403Forbidden; return Task.CompletedTask; }
         };
     })
     .AddScheme<AuthenticationSchemeOptions, RealtimeTicketAuthenticationHandler>(
-        RealtimeTicketDefaults.Scheme, null);
+        RealtimeTicketDefaults.Scheme, null)
+    // Two-factor is not used, but stamp validation signs the user out of every
+    // Identity cookie scheme, and an unregistered one throws instead of being
+    // skipped — every revoked session would have failed with a 500.
+    .AddCookie(IdentityConstants.TwoFactorRememberMeScheme)
+    .AddCookie(IdentityConstants.TwoFactorUserIdScheme);
+// Identity skips the stamp comparison for the first hour of a session, which
+// would leave a reset password or a deactivation powerless for that hour. Every
+// authenticated request now pays one user lookup, which is what the apps already
+// do per call anyway.
+builder.Services.Configure<SecurityStampValidatorOptions>(options => options.ValidationInterval = TimeSpan.Zero);
 builder.Services.AddAuthorization(options =>
 {
     // Fail closed. Every endpoint is private unless it declares its own policy, so a
@@ -176,6 +194,11 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("applications", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
+    // The transcript relay posts with a shared server key, so this is the only
+    // thing standing between a leaked key and an unbounded insert loop.
+    options.AddPolicy("transcripts", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
@@ -215,6 +238,20 @@ app.UseExceptionHandler(handler => handler.Run(async context =>
     await context.Response.WriteAsJsonAsync(new { title = "An unexpected server error occurred.", status = 500 });
 }));
 app.UseCors("Frontend");
+// Sent only on HTTPS responses, so it is inert behind a host that terminates
+// TLS without forwarding the scheme.
+if (!app.Environment.IsDevelopment()) app.UseHsts();
+// Baseline browser hardening for every response, including error pages. IIS
+// appends its own Server/X-Powered-By headers after the app runs, so those are
+// removed in web.config on the host, not here.
+app.Use(async (context, next) =>
+{
+    var headers = context.Response.Headers;
+    headers["X-Content-Type-Options"] = "nosniff";
+    headers["X-Frame-Options"] = "DENY";
+    headers["Referrer-Policy"] = "no-referrer";
+    await next();
+});
 app.UseRateLimiter();
 // Reject browser-originated state changes from origins outside the configured frontend origins.
 app.Use(async (context, next) =>
@@ -569,7 +606,17 @@ await using (var scope = app.Services.CreateAsyncScope())
             "UpdatedBy" uuid,
             CONSTRAINT "PK_AcademyPolicies" PRIMARY KEY ("Id")
         );
-        INSERT INTO "AcademyPolicies" ("Id", "UpdatedAt") VALUES (1, now()) ON CONFLICT ("Id") DO NOTHING;
+        -- Every NOT NULL column is supplied: on a database built by EnsureCreated these
+        -- columns exist without the DEFAULT clauses below, so a partial insert fails.
+        INSERT INTO "AcademyPolicies" (
+            "Id", "StudentFreeCancelHours", "TeacherFreeCancelHours", "NoShowGraceMinutes",
+            "RescheduleResponseHours", "StudentGraceCancellationsPerMonth",
+            "StudentWarningStrikeThreshold", "StudentAdminReviewStrikeThreshold",
+            "TeacherAdminReviewStrikeThreshold", "TrialNoShowThreshold",
+            "PayScheduledDurationWhenAttended", "UpdatedAt"
+        )
+        VALUES (1, 24, 24, 10, 12, 1, 3, 4, 2, 2, TRUE, now())
+        ON CONFLICT ("Id") DO NOTHING;
 
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancellationOutcome" character varying(40);
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancelReason" character varying(1000);
@@ -578,6 +625,7 @@ await using (var scope = app.Services.CreateAsyncScope())
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "IsMakeup" boolean NOT NULL DEFAULT FALSE;
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "OriginalLessonId" uuid;
         CREATE INDEX IF NOT EXISTS "IX_Lessons_OriginalLessonId" ON "Lessons" ("OriginalLessonId");
+        ALTER TABLE "AspNetUsers" ADD COLUMN IF NOT EXISTS "Grade" character varying(20);
 
         CREATE TABLE IF NOT EXISTS "LessonCancellations" (
             "Id" uuid NOT NULL,
@@ -800,6 +848,10 @@ await using (var scope = app.Services.CreateAsyncScope())
         );
         CREATE INDEX IF NOT EXISTS "IX_AuditLogs_EntityType_EntityId_CreatedAt" ON "AuditLogs" ("EntityType", "EntityId", "CreatedAt");
         CREATE INDEX IF NOT EXISTS "IX_AuditLogs_ActorId_CreatedAt" ON "AuditLogs" ("ActorId", "CreatedAt");
+        ALTER TABLE "AuditLogs" ADD COLUMN IF NOT EXISTS "ActorRole" character varying(20);
+        ALTER TABLE "AuditLogs" ADD COLUMN IF NOT EXISTS "SourceIp" character varying(45);
+        ALTER TABLE "AuditLogs" ADD COLUMN IF NOT EXISTS "CorrelationId" character varying(64);
+        CREATE INDEX IF NOT EXISTS "IX_AuditLogs_CorrelationId" ON "AuditLogs" ("CorrelationId");
 
         CREATE TABLE IF NOT EXISTS "LessonExcuseRequests" (
             "Id" uuid NOT NULL,

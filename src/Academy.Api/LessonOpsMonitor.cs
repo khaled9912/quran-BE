@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace Academy.Api;
 
@@ -233,7 +234,10 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
             {
                 // A concurrent poll may have inserted the same reminder first.
                 db.ChangeTracker.Clear();
-                logger.LogDebug(ex, "Lesson operations monitor skipped a duplicate notification.");
+                if (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+                    logger.LogDebug(ex, "Lesson operations monitor skipped a duplicate notification.");
+                else
+                    logger.LogError(ex, "Lesson operations monitor could not save its notifications.");
                 changedLessonIds.Clear();
             }
 

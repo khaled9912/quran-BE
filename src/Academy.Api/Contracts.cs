@@ -12,7 +12,7 @@ public sealed record OtpVerifyRequest(string Phone, string Code, string? FullNam
 public sealed record CreateUserRequest(string FullName, string Email, string Password, string Role);
 public sealed record CreateStudentRequest(string FullName, string Email, string Password, string? Grade);
 public sealed record UpdateUserRequest(string? FullName, string? Email, string? Password, bool? IsActive);
-public sealed record UpdateProfileRequest(string? FullName, string? Email, string? PhoneNumber);
+public sealed record UpdateProfileRequest(string? FullName, string? Email, string? PhoneNumber, string? CurrentPassword, string? PhoneCode);
 public sealed record UpdateLessonRequest(DateTimeOffset? StartsAt, DateTimeOffset? EndsAt, string? Status);
 public sealed record AssignStudentRequest(Guid TeacherId, Guid StudentId);
 public sealed record PublishAvailabilityRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt);
@@ -39,7 +39,7 @@ public sealed record LessonQualityReviewInput(
     string? StudentAction,
     string? Status);
 
-public sealed record UserDto(Guid Id, string? FullName, string Email, string Role, bool IsActive, [property: JsonPropertyName("full_name")] string? FullNameSnake, [property: JsonPropertyName("is_active")] bool IsActiveSnake, string? Name, string? PhoneNumber, string? AvatarUrl);
+public sealed record UserDto(Guid Id, string? FullName, string Email, string Role, bool IsActive, [property: JsonPropertyName("full_name")] string? FullNameSnake, [property: JsonPropertyName("is_active")] bool IsActiveSnake, string? Name, string? PhoneNumber, string? AvatarUrl, string? Grade = null);
 public sealed record AssignmentDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset CreatedAt, bool IsActive, string Status);
 public sealed record AvailabilityDto(Guid Id, Guid TeacherId, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status);
 public sealed record OpenStudentOfferDto(Guid Id, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, Guid? ClaimedByTeacherId, string? ClaimedByTeacherName, Guid? LessonId, DateTimeOffset CreatedAt, DateTimeOffset? ClaimedAt);

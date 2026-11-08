@@ -1291,6 +1291,10 @@ public static class LessonOperationsEndpoints
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["action"] = ["Choose student_no_show, teacher_no_show, both_absent, or dismissed."] });
 
             var lesson = incident.Lesson;
+            // A lesson that was already cancelled has settled its credit, strike,
+            // and payable outcome. Resolving an incident on it must not apply a
+            // second credit/strike adjustment (the dedupe keys differ per outcome).
+            var alreadyCancelled = lesson.Status == "cancelled";
             var now = DateTimeOffset.UtcNow;
             var policy = await LessonPolicyService.GetPolicyAsync(db, ct);
             incident.Status = action == "dismissed" ? "dismissed" : "resolved";
@@ -1302,7 +1306,7 @@ public static class LessonOperationsEndpoints
             {
                 var scheduled = LessonPolicyService.ScheduledMinutes(lesson);
                 var payable = Math.Clamp(input.TeacherPayableMinutes ?? (action == "student_no_show" ? scheduled : 0), 0, scheduled);
-                if (lesson.Status != "cancelled")
+                if (!alreadyCancelled)
                 {
                     lesson.Status = "cancelled";
                     lesson.CancellationOutcome = action;
@@ -1351,35 +1355,38 @@ public static class LessonOperationsEndpoints
                     LessonOpsMessaging.Notice(lesson.TeacherId, "Attendance issue resolved", teacherBody, "lesson",
                         $"/lesson/{lesson.Id}", $"incident-teacher:{incident.Id}"));
 
-                if (action == "student_no_show")
+                if (!alreadyCancelled)
                 {
-                    if (!lesson.IsTrial)
-                        LessonPolicyService.AddCredit(db, lesson.StudentId, lesson.Id, "student_no_show", -1,
-                            "Student no-show confirmed by the academy", UserId(p), "admin", $"no-show:{lesson.Id}");
-                    await LessonPolicyService.AddReliabilityEventAsync(db, lesson.StudentId, "student",
-                        lesson.Id, "student_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
-                    var trialNoShows = await LessonPolicyService.CountTrialStudentNoShowsAsync(db, lesson.StudentId, ct);
-                    if (lesson.IsTrial && trialNoShows >= policy.TrialNoShowThreshold)
-                        await LessonOpsMessaging.EmailAdminsAsync(db, email, "Trial student no-show threshold reached",
-                            $"{lesson.Student?.FullName ?? "A student"} reached {trialNoShows} trial no-shows.", ct);
-                }
-                else if (action == "teacher_no_show")
-                {
-                    if (!lesson.IsTrial)
-                        LessonPolicyService.AddCredit(db, lesson.StudentId, lesson.Id, "teacher_no_show", 1,
-                            "Teacher no-show confirmed by the academy", UserId(p), "admin", $"teacher-no-show:{lesson.Id}");
-                    await LessonPolicyService.AddReliabilityEventAsync(db, lesson.TeacherId, "teacher",
-                        lesson.Id, "teacher_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
-                }
-                else if (action == "both_absent")
-                {
-                    await LessonPolicyService.AddReliabilityEventAsync(db, lesson.StudentId, "student",
-                        lesson.Id, "student_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
-                    await LessonPolicyService.AddReliabilityEventAsync(db, lesson.TeacherId, "teacher",
-                        lesson.Id, "teacher_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
-                }
+                    if (action == "student_no_show")
+                    {
+                        if (!lesson.IsTrial)
+                            LessonPolicyService.AddCredit(db, lesson.StudentId, lesson.Id, "student_no_show", -1,
+                                "Student no-show confirmed by the academy", UserId(p), "admin", $"no-show:{lesson.Id}");
+                        await LessonPolicyService.AddReliabilityEventAsync(db, lesson.StudentId, "student",
+                            lesson.Id, "student_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
+                        var trialNoShows = await LessonPolicyService.CountTrialStudentNoShowsAsync(db, lesson.StudentId, ct);
+                        if (lesson.IsTrial && trialNoShows >= policy.TrialNoShowThreshold)
+                            await LessonOpsMessaging.EmailAdminsAsync(db, email, "Trial student no-show threshold reached",
+                                $"{lesson.Student?.FullName ?? "A student"} reached {trialNoShows} trial no-shows.", ct);
+                    }
+                    else if (action == "teacher_no_show")
+                    {
+                        if (!lesson.IsTrial)
+                            LessonPolicyService.AddCredit(db, lesson.StudentId, lesson.Id, "teacher_no_show", 1,
+                                "Teacher no-show confirmed by the academy", UserId(p), "admin", $"teacher-no-show:{lesson.Id}");
+                        await LessonPolicyService.AddReliabilityEventAsync(db, lesson.TeacherId, "teacher",
+                            lesson.Id, "teacher_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
+                    }
+                    else if (action == "both_absent")
+                    {
+                        await LessonPolicyService.AddReliabilityEventAsync(db, lesson.StudentId, "student",
+                            lesson.Id, "student_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
+                        await LessonPolicyService.AddReliabilityEventAsync(db, lesson.TeacherId, "teacher",
+                            lesson.Id, "teacher_no_show", incident.ResolutionNote, UserId(p), policy, now, ct);
+                    }
 
-                await LessonPolicyService.EnsureTeacherHoursAsync(db, lesson, policy, now, payable, ct);
+                    await LessonPolicyService.EnsureTeacherHoursAsync(db, lesson, policy, now, payable, ct);
+                }
                 Audit(db, UserId(p), "incident_resolved", "Lesson", lesson.Id,
                     $"{action}. {incident.ResolutionNote}".Trim());
             }

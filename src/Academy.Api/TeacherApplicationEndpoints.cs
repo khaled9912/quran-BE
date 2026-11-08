@@ -190,10 +190,11 @@ public static class TeacherApplicationEndpoints
 
         if (errors.Count > 0) return Results.ValidationProblem(errors);
 
-        if (await db.TeacherApplications.AnyAsync(x => x.Email == email && x.Status == "pending", http.RequestAborted))
-            return Results.Conflict(new { message = "You already have an application in review. We will contact you soon." });
-        if (await users.FindByEmailAsync(email) is not null)
-            return Results.Conflict(new { message = "An account with this email already exists. Sign in or contact us if you need help." });
+        // One message for both cases: this anonymous form must not confirm
+        // whether an email already belongs to a registered account.
+        if (await db.TeacherApplications.AnyAsync(x => x.Email == email && x.Status == "pending", http.RequestAborted)
+            || await users.FindByEmailAsync(email) is not null)
+            return Results.Conflict(new { message = "We already have an application or an account for this email. Sign in or contact us if you need help." });
 
         var application = new TeacherApplication
         {
