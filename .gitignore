@@ -2,6 +2,7 @@
 **/obj/
 /publish/
 /deploy/
+/backups/
 .vs/
 .idea/
 .vscode/

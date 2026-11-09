@@ -19,6 +19,27 @@ public static class LessonOperationsEndpoints
         return "admin";
     }
 
+    /// <summary>
+    /// The push services browsers actually hand out endpoints from. Every
+    /// other host is refused: the server POSTs to this URL with its VAPID
+    /// signature attached, so an unvalidated endpoint would turn the API into a
+    /// relay an attacker aims at anything reachable from the hosting box.
+    /// </summary>
+    private static readonly string[] PushServiceHosts =
+    [
+        "fcm.googleapis.com", // Chrome, Edge, Opera on every platform
+        "web.push.apple.com", // Safari
+        "updates.push.services.mozilla.com", // Firefox
+    ];
+
+    private static bool IsPushServiceEndpoint(string endpoint)
+    {
+        if (endpoint.Length is 0 or > 600) return false;
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri)) return false;
+        if (uri.Scheme != Uri.UriSchemeHttps || uri.UserInfo.Length > 0 || uri.Port is not (-1 or 443)) return false;
+        return PushServiceHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase);
+    }
+
     private static Task<Lesson?> LoadLessonAsync(AcademyDbContext db, Guid id, CancellationToken ct) =>
         db.Lessons
             .Include(x => x.Teacher)
@@ -312,7 +333,12 @@ public static class LessonOperationsEndpoints
             };
             db.LessonRescheduleRequests.Add(request);
 
-            var otherId = isMakeup || role == "teacher" ? lesson.StudentId : lesson.TeacherId;
+            // The proposal goes to whoever has to reply to it — the student for a
+            // make-up, unless the student is the one asking — so nobody is notified
+            // about a request they just made themselves.
+            var askTheTeacher = role == "student" || (!isMakeup && role != "teacher");
+            var otherId = askTheTeacher ? lesson.TeacherId : lesson.StudentId;
+            var otherUser = askTheTeacher ? lesson.Teacher : lesson.Student;
             var requesterName = role == "teacher"
                 ? lesson.Teacher?.FullName ?? "Your teacher"
                 : role == "student" ? lesson.Student?.FullName ?? "Your student" : "The academy";
@@ -329,7 +355,7 @@ public static class LessonOperationsEndpoints
                 $"{(isMakeup ? "Proposed make-up" : "Proposed")} {proposedStarts:u} to {proposedEnds:u}.");
             await db.SaveChangesAsync(ct);
 
-            await LessonOpsMessaging.EmailAsync(email, isMakeup || role == "teacher" ? lesson.Student : lesson.Teacher,
+            await LessonOpsMessaging.EmailAsync(email, otherUser,
                 isMakeup ? "Make-up lesson proposal" : "Lesson reschedule request", body, ct);
             await LessonOpsMessaging.PushAsync(db, push, [otherId], noticeTitle, body, $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
@@ -842,24 +868,24 @@ public static class LessonOperationsEndpoints
             };
             db.LessonCalls.Add(call);
 
-            var callerName = callerId == lesson.TeacherId ? lesson.Teacher?.FullName
+            var callerName = (callerId == lesson.TeacherId ? lesson.Teacher?.FullName
                 : callerId == lesson.StudentId ? lesson.Student?.FullName
-                : (await db.Users.AsNoTracking().Where(x => x.Id == callerId).Select(x => x.FullName).FirstOrDefaultAsync(ct));
-            var detail = callerRole == "student" ? "is calling you. Open the lesson room."
-                : callerRole == "teacher" ? "is calling you. Join the lesson now."
-                : "is calling you from the academy. Join the lesson now.";
-            var body = LessonOpsMessaging.LessonSummary(lesson, $"{callerName ?? "The other participant"} {detail}");
-            var title = callerRole switch
-            {
-                "student" => "Call from your student",
-                "teacher" => "Call from your teacher",
-                _ => "The academy is calling you",
-            };
+                : await db.Users.AsNoTracking().Where(x => x.Id == callerId)
+                    .Select(x => x.FullName).FirstOrDefaultAsync(ct))
+                ?? (callerRole == "student" ? "Your student"
+                    : callerRole == "teacher" ? "Your teacher" : "The academy");
+            var join = callerRole == "student" ? "Open the lesson room." : "Join now.";
+            // Only the caller is named: the callee must never read their own name.
+            var body = $"{callerName} is calling you for your lesson on " +
+                $"{LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId)}. {join}";
+            var title = callerRole is "student" or "teacher"
+                ? $"Call from {callerName}"
+                : "The academy is calling you";
             var link = LessonOpsMessaging.LessonLink(lesson);
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 target.UserId, title, body, "lesson", link, $"call:{call.Id}"));
             Audit(db, callerId, "lesson_called", "Lesson", id,
-                $"{callerName ?? "A user"} ({callerRole}) called {target.Name} ({target.Role}). Status: {target.Status}.");
+                $"{callerName} ({callerRole}) called {target.Name} ({target.Role}). Status: {target.Status}.");
             await db.SaveChangesAsync(ct);
 
             await LessonOpsMessaging.PushAsync(
@@ -957,6 +983,67 @@ public static class LessonOperationsEndpoints
             return Results.NoContent();
         });
 
+        // ------------------------------------------------------- browser push
+        // The public half of the VAPID pair. It is not a secret — it tells a
+        // push service which application server is allowed to ring this
+        // subscription — so an unauthenticated page could read it too, but the
+        // apps only ever ask while signed in.
+        api.MapGet("/web-push/key", (WebPushSender web) =>
+            web.PublicKey is { Length: > 0 } key
+                ? Results.Ok(new { key })
+                : Results.Problem(
+                    "Browser notifications are not configured on this server.",
+                    statusCode: StatusCodes.Status503ServiceUnavailable));
+
+        api.MapPost("/web-push/subscribe", async (
+            WebPushSubscriptionRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+        {
+            var endpoint = (input.Endpoint ?? "").Trim();
+            if (!IsPushServiceEndpoint(endpoint))
+                return Results.ValidationProblem(new Dictionary<string, string[]>
+                {
+                    ["endpoint"] = ["This browser's notification service is not recognised."]
+                });
+            var p256dh = (input.P256Dh ?? "").Trim();
+            var auth = (input.Auth ?? "").Trim();
+            if (p256dh.Length is < 20 or > 200 || auth.Length is < 10 or > 100)
+                return Results.ValidationProblem(new Dictionary<string, string[]>
+                {
+                    ["p256dh"] = ["The subscription keys are incomplete."]
+                });
+
+            var now = DateTimeOffset.UtcNow;
+            // The endpoint is per browser profile, not per account, so signing
+            // in as someone else moves it rather than leaving the old account a
+            // second subscription to the same laptop.
+            var existing = await db.BrowserSubscriptions.FirstOrDefaultAsync(x => x.Endpoint == endpoint, ct);
+            if (existing is null)
+                db.BrowserSubscriptions.Add(new BrowserSubscription
+                {
+                    UserId = UserId(p), Endpoint = endpoint, P256Dh = p256dh, Auth = auth,
+                });
+            else
+            {
+                existing.UserId = UserId(p);
+                existing.P256Dh = p256dh;
+                existing.Auth = auth;
+                existing.LastSeenAt = now;
+            }
+            await db.SaveChangesAsync(ct);
+            return Results.NoContent();
+        });
+
+        api.MapPost("/web-push/unsubscribe", async (
+            WebPushSubscriptionRequest input, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+        {
+            var endpoint = (input.Endpoint ?? "").Trim();
+            if (endpoint.Length == 0) return Results.NoContent();
+            await db.BrowserSubscriptions
+                .Where(x => x.Endpoint == endpoint && x.UserId == UserId(p))
+                .ExecuteDeleteAsync(ct);
+            return Results.NoContent();
+        });
+
         MapAdminOperations(app);
     }
 
@@ -1012,8 +1099,8 @@ public static class LessonOperationsEndpoints
             await db.SaveChangesAsync(ct);
         }
 
-        // Every notice below names whoever actually cancelled, so a student never
-        // reads their own name in "… cancelled your lesson".
+        // Every reader gets a copy addressed to them: it names whoever cancelled and,
+        // for the academy's own cancellation, the other participant — never the reader.
         var actorName = role switch
         {
             "teacher" => lesson.Teacher?.FullName ?? "Your teacher",
@@ -1021,38 +1108,43 @@ public static class LessonOperationsEndpoints
             _ => "The academy",
         };
         var when = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
-        var (title, body) = role switch
+        var title = role is "teacher" or "student" ? "Lesson cancelled" : "Lesson cancelled by the academy";
+        var summary = $"{actorName} cancelled the lesson on {when}.";
+        var forTeacher = role is "teacher" or "student"
+            ? summary
+            : $"The academy cancelled your lesson with {lesson.Student?.FullName ?? "your student"} on {when}.";
+        var forStudent = role switch
         {
-            "student" => ("Lesson cancelled", $"{actorName} cancelled the lesson on {when}."),
-            "teacher" => ("Lesson cancelled", $"{actorName} cancelled your lesson on {when}."),
-            _ => ("Lesson cancelled by the academy", $"The lesson on {when} was cancelled. Your teacher/student has been notified."),
+            "teacher" => $"{actorName} cancelled your lesson on {when}.",
+            "student" => summary,
+            _ => $"The academy cancelled your lesson with {lesson.Teacher?.FullName ?? "your teacher"} on {when}.",
         };
 
-        var notifyIds = new List<Guid>();
+        var pushes = new List<(Guid UserId, string Body)>();
         if (role == "student")
         {
-            notifyIds.Add(lesson.TeacherId);
+            pushes.Add((lesson.TeacherId, forTeacher));
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                lesson.TeacherId, title, body, "lesson", $"/lesson/{lesson.Id}", $"cancel-teacher:{lesson.Id}"));
+                lesson.TeacherId, title, forTeacher, "lesson", $"/lesson/{lesson.Id}", $"cancel-teacher:{lesson.Id}"));
             await LessonOpsMessaging.EmailAsync(email, lesson.Teacher,
-                "Lesson cancelled by student", body, ct);
+                "Lesson cancelled by student", forTeacher, ct);
         }
         else if (role == "teacher")
         {
-            notifyIds.Add(lesson.StudentId);
+            pushes.Add((lesson.StudentId, forStudent));
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                lesson.StudentId, title, body, "lesson", $"/lesson/{lesson.Id}", $"cancel-student:{lesson.Id}"));
+                lesson.StudentId, title, forStudent, "lesson", $"/lesson/{lesson.Id}", $"cancel-student:{lesson.Id}"));
             await LessonOpsMessaging.EmailAsync(email, lesson.Student,
-                "Your lesson was cancelled", body, ct);
+                "Your lesson was cancelled", forStudent, ct);
         }
         else
         {
-            notifyIds.AddRange([lesson.TeacherId, lesson.StudentId]);
+            pushes.AddRange([(lesson.TeacherId, forTeacher), (lesson.StudentId, forStudent)]);
             db.Notifications.AddRange(
-                LessonOpsMessaging.Notice(lesson.TeacherId, title, body, "lesson", $"/lesson/{lesson.Id}", $"cancel-teacher:{lesson.Id}"),
-                LessonOpsMessaging.Notice(lesson.StudentId, title, body, "lesson", $"/lesson/{lesson.Id}", $"cancel-student:{lesson.Id}"));
-            await LessonOpsMessaging.EmailAsync(email, lesson.Teacher, "Lesson cancelled by the academy", body, ct);
-            await LessonOpsMessaging.EmailAsync(email, lesson.Student, "Lesson cancelled by the academy", body, ct);
+                LessonOpsMessaging.Notice(lesson.TeacherId, title, forTeacher, "lesson", $"/lesson/{lesson.Id}", $"cancel-teacher:{lesson.Id}"),
+                LessonOpsMessaging.Notice(lesson.StudentId, title, forStudent, "lesson", $"/lesson/{lesson.Id}", $"cancel-student:{lesson.Id}"));
+            await LessonOpsMessaging.EmailAsync(email, lesson.Teacher, "Lesson cancelled by the academy", forTeacher, ct);
+            await LessonOpsMessaging.EmailAsync(email, lesson.Student, "Lesson cancelled by the academy", forStudent, ct);
         }
 
         if (reliability?.WarningIssued == true)
@@ -1072,11 +1164,12 @@ public static class LessonOperationsEndpoints
                     adminId, "Cancellation needs review", reviewBody, "lesson", reviewLink,
                     $"cancel-review:{lesson.Id}:{adminId}"));
             await LessonOpsMessaging.EmailAdminsAsync(db, email,
-                "Late cancellation needs review", body, ct);
+                "Late cancellation needs review", summary, ct);
         }
 
         await db.SaveChangesAsync(ct);
-        await LessonOpsMessaging.PushAsync(db, push, notifyIds, title, body, $"/lesson/{lesson.Id}", ct);
+        foreach (var (userId, pushBody) in pushes)
+            await LessonOpsMessaging.PushAsync(db, push, [userId], title, pushBody, $"/lesson/{lesson.Id}", ct);
         await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
 
         return Results.Ok(new { preview = decision, lesson = ApiEndpoints.ToLesson(lesson) });

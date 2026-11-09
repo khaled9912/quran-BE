@@ -5,13 +5,18 @@ namespace Academy.Api;
 /// <summary>
 /// Ephemeral ink layer for a live lesson. Strokes stay in memory, never touch
 /// the database, and are dropped once the room has been idle for a while.
-/// Coordinates are normalized to the shared view (0..1) so every screen can
-/// scale them to its own viewport.
+/// Coordinates are normalized inside the lesson's annotation frame (0..1), the
+/// box each screen places over the shared picture, so marks land on the page
+/// rather than on the caller's own viewport.
 /// </summary>
 public sealed class LessonPenBoard
 {
     public const int MaxStrokes = 400;
     public const int MaxPointsPerStroke = 4000;
+    public const int MaxStrokeIdLength = 64;
+
+    /// <summary>Aspect of the frame before anyone fits it to the share.</summary>
+    public const double DefaultFrameAspect = 16.0 / 9.0;
 
     private static readonly TimeSpan IdleTtl = TimeSpan.FromHours(6);
     private static readonly TimeSpan SweepInterval = TimeSpan.FromHours(1);
@@ -30,18 +35,26 @@ public sealed class LessonPenBoard
     public static bool IsAllowedColor(string? color) =>
         color is not null && Palette.Contains(color);
 
-    public IReadOnlyList<PenStroke> Snapshot(Guid lessonId)
+    public static double SafeFrameAspect(double aspect) =>
+        double.IsFinite(aspect) ? Math.Clamp(aspect, 0.3, 4.0) : DefaultFrameAspect;
+
+    public static bool IsAllowedStrokeId(string? strokeId) =>
+        strokeId is { Length: > 0 and <= MaxStrokeIdLength }
+        && strokeId.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
+
+    public PenSnapshot Snapshot(Guid lessonId)
     {
         Sweep();
-        if (!_lessons.TryGetValue(lessonId, out var state)) return [];
+        if (!_lessons.TryGetValue(lessonId, out var state))
+            return new PenSnapshot([], DefaultFrameAspect);
         lock (state.Gate)
         {
             state.TouchedAt = DateTimeOffset.UtcNow;
-            return state.Strokes.Select(Clone).ToList();
+            return new PenSnapshot(state.Strokes.Select(Clone).ToList(), state.FrameAspect);
         }
     }
 
-    public bool Start(Guid lessonId, Guid strokeId, string color, double width, double x, double y)
+    public bool Start(Guid lessonId, string strokeId, string color, double width, double x, double y)
     {
         Sweep();
         var state = _lessons.GetOrAdd(lessonId, _ => new LessonState());
@@ -65,7 +78,7 @@ public sealed class LessonPenBoard
         }
     }
 
-    public bool Append(Guid lessonId, Guid strokeId, IReadOnlyList<double> points)
+    public bool Append(Guid lessonId, string strokeId, IReadOnlyList<double> points)
     {
         if (!_lessons.TryGetValue(lessonId, out var state)) return false;
         lock (state.Gate)
@@ -91,6 +104,20 @@ public sealed class LessonPenBoard
         {
             state.Strokes.Clear();
             state.TouchedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    /// <summary>Fits the lesson's annotation frame to the shared picture.</summary>
+    public double SetFrame(Guid lessonId, double aspect)
+    {
+        Sweep();
+        var safe = SafeFrameAspect(aspect);
+        var state = _lessons.GetOrAdd(lessonId, _ => new LessonState());
+        lock (state.Gate)
+        {
+            state.FrameAspect = safe;
+            state.TouchedAt = DateTimeOffset.UtcNow;
+            return safe;
         }
     }
 
@@ -123,22 +150,25 @@ public sealed class LessonPenBoard
     {
         public readonly object Gate = new();
         public readonly List<PenStroke> Strokes = new();
+        public double FrameAspect = DefaultFrameAspect;
         public DateTimeOffset TouchedAt = DateTimeOffset.UtcNow;
     }
 }
 
 public sealed record PenStroke
 {
-    public Guid Id { get; init; }
+    public string Id { get; init; } = "";
     public string Color { get; init; } = "";
     public double Width { get; init; }
     public List<double> Points { get; init; } = new();
 }
 
-public sealed record PenStrokeStart(Guid Id, string Color, double Width, double X, double Y);
+public sealed record PenStrokeStart(string Id, string Color, double Width, double X, double Y);
 
-public sealed record PenStrokeAppend(Guid Id, double[] Points);
+public sealed record PenStrokeAppend(string Id, double[] Points);
 
-public sealed record PenStrokeEnd(Guid Id);
+public sealed record PenStrokeEnd(string Id);
 
-public sealed record PenSnapshot(IReadOnlyList<PenStroke> Strokes);
+public sealed record PenSnapshot(IReadOnlyList<PenStroke> Strokes, double Frame);
+
+public sealed record PenFrameChanged(double Frame);

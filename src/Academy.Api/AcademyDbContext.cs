@@ -84,6 +84,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
     public DbSet<LessonExcuseRequest> LessonExcuseRequests => Set<LessonExcuseRequest>();
     public DbSet<LessonIncident> LessonIncidents => Set<LessonIncident>();
     public DbSet<DeviceToken> DeviceTokens => Set<DeviceToken>();
+    public DbSet<BrowserSubscription> BrowserSubscriptions => Set<BrowserSubscription>();
     public DbSet<LessonCall> LessonCalls => Set<LessonCall>();
 
     protected override void OnModelCreating(ModelBuilder b)
@@ -248,6 +249,9 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         b.Entity<DeviceToken>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<DeviceToken>().HasIndex(x => x.Token).IsUnique();
         b.Entity<DeviceToken>().HasIndex(x => x.UserId);
+        b.Entity<BrowserSubscription>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<BrowserSubscription>().HasIndex(x => x.Endpoint).IsUnique();
+        b.Entity<BrowserSubscription>().HasIndex(x => x.UserId);
         b.Entity<LessonCall>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LessonCall>().HasOne(x => x.Caller).WithMany().HasForeignKey(x => x.CallerId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<LessonCall>().HasOne(x => x.Callee).WithMany().HasForeignKey(x => x.CalleeId).OnDelete(DeleteBehavior.Restrict);

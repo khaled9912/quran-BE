@@ -1,3 +1,5 @@
+name: ana-quran-academy
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -45,6 +47,10 @@ services:
       Email__Password: ${EMAIL_PASSWORD:-}
       Email__From: ${EMAIL_FROM:-}
       Email__To: ${CONTACT_RECEIVER_EMAIL:-}
+      # Browser notifications: inert until both halves of a VAPID pair exist.
+      WebPush__PublicKey: ${WEBPUSH_PUBLIC_KEY:-}
+      WebPush__PrivateKey: ${WEBPUSH_PRIVATE_KEY:-}
+      WebPush__Subject: ${WEBPUSH_SUBJECT:-mailto:support@anaquran.com}
       # Observability: both are inert unless set (Sentry is also production-only).
       SENTRY_DSN: ${SENTRY_DSN:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -59,3 +65,8 @@ services:
 
 volumes:
   academy-postgres:
+    name: ana-quran-academy-postgres
+
+networks:
+  default:
+    name: ana-quran-academy-network

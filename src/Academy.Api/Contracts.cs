@@ -321,6 +321,12 @@ public sealed record UpdateSalaryPeriodRequest(decimal? ManualAdjustmentEgp, dec
 
 public sealed record RegisterDeviceTokenRequest(string? Token, string? Platform);
 
+/// <summary>
+/// A browser's Web Push subscription: the queue the push service gave it, plus
+/// the two keys needed to seal a message for that queue alone.
+/// </summary>
+public sealed record WebPushSubscriptionRequest(string? Endpoint, string? P256Dh, string? Auth);
+
 /// <summary>Ring the other participant of a live lesson. Staff may name a side.</summary>
 public sealed record CallLessonRequest(string? TargetRole);
 

@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Ana Quran Academy API — one entry point for everyday backend work.
+#
+#   ./dev run [--no-build] start the API and its own Postgres (up is an alias)
+#   ./dev api              run the API on the host (:5001) against local Postgres
+#   ./dev db               start only Compose Postgres (:5432)
+#   ./dev logs [api|db]    follow container logs
+#   ./dev check            show what owns :5001/:5432 and whether the API answers
+#   ./dev down             stop the Compose stack (volume and data are kept)
+#   ./dev build            dotnet build
+#   ./dev test             dotnet test (the security suite needs a running Postgres)
+#
+# `up` is the production-shaped stack; `api` is the fast loop for source edits:
+# it recompiles and restarts in seconds against the Postgres already on :5432.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+API_PORT=5001
+DB_PORT=5432
+FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-http://localhost:3000}"
+
+log() { printf '\n==> %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+compose() {
+  docker compose "$@"
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed or not on PATH."
+  docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop."
+}
+
+# The container currently publishing a host port, whatever project it came from.
+container_on_port() {
+  docker ps --format '{{.Names}}\t{{.Ports}}' \
+    | awk -F'\t' -v port="$1" '$2 ~ (":" port "->") { print $1; exit }'
+}
+
+# Credentials of the Postgres publishing :5432, read from the live container so
+# the host run never guesses a password or points at a stale compose .env value.
+local_connection_string() {
+  local ctr user db pass
+  # DATABASE_URL wins over ConnectionStrings:Academy inside the app, so a Neon
+  # URL left in the shell silently redirects a "local" run at that database.
+  # Refuse rather than guess: that URL is production data.
+  if [ -n "${DATABASE_URL:-}" ]; then
+    printf 'error: DATABASE_URL is exported; the API would use it instead of local Postgres.\n' >&2
+    printf '       unset DATABASE_URL to run locally, or use ./dev up for the Compose stack.\n' >&2
+    return 2
+  fi
+  ctr="$(container_on_port "$DB_PORT")"
+  if [ -z "$ctr" ]; then
+    printf 'error: nothing publishes :%s.\n' "$DB_PORT" >&2
+    printf '       run ./dev db for Compose Postgres, or start your own on :%s.\n' "$DB_PORT" >&2
+    return 1
+  fi
+  user="$(docker exec "$ctr" printenv POSTGRES_USER 2>/dev/null || echo academy)"
+  db="$(docker exec "$ctr" printenv POSTGRES_DB 2>/dev/null || echo academy)"
+  pass="$(docker exec "$ctr" printenv POSTGRES_PASSWORD 2>/dev/null || echo "")"
+  printf 'Host=localhost;Port=%s;Database=%s;Username=%s;Password=%s\n' \
+    "$DB_PORT" "$db" "$user" "$pass"
+}
+
+do_up() {
+  require_docker
+  local args=(up -d --build)
+  if [ "${1:-}" = "--no-build" ]; then
+    args=(up -d)
+  elif [ -n "${1:-}" ]; then
+    die "Unknown option for up: $1. Use --no-build to skip the image rebuild."
+  fi
+  log "docker compose ${args[*]}"
+  compose "${args[@]}"
+  log "waiting for the API"
+  for _ in $(seq 1 30); do
+    if curl -fsS "http://localhost:$API_PORT/health" >/dev/null 2>&1; then
+      log "API ready at http://localhost:$API_PORT (swagger: /swagger)"
+      return 0
+    fi
+    sleep 2
+  done
+  log "health did not answer — showing the last errors"
+  compose logs --tail 30 api || true
+  do_check || true
+  return 1
+}
+
+do_api() {
+  command -v dotnet >/dev/null 2>&1 || die "The .NET SDK is not installed (needs .NET 10)."
+  require_docker
+  local conn
+  if ! conn="$(local_connection_string)"; then
+    exit 1
+  fi
+
+  # Host runs keep login codes local: 8888 for OTP and password reset, and the
+  # contact form stores its row without sending mail. Compose uses .env instead.
+  export ASPNETCORE_ENVIRONMENT=Development
+  export ASPNETCORE_URLS="http://localhost:$API_PORT"
+  export ConnectionStrings__Academy="$conn"
+  export AllowedOrigins="$FRONTEND_ORIGIN"
+  export Database__EnsureCreated=true
+  export Otp__DevMode=true
+  export Otp__Sender=""
+  export Email__Enabled=false
+
+  log "dotnet run on http://localhost:$API_PORT"
+  printf '    db: %s\n' "${conn%%;*}"
+  printf '    dev codes: OTP 8888, email disabled (Compose mode reads .env)\n'
+  # launchSettings pins :5000, so skip the profile and honour ASPNETCORE_URLS.
+  exec dotnet run --project src/Academy.Api --no-launch-profile
+}
+
+do_logs() {
+  require_docker
+  compose logs -f --tail 100 "${1:-api}"
+}
+
+do_check() {
+  require_docker
+  local ok=0
+
+  log "port owners"
+  local api_ctr db_ctr
+  api_ctr="$(container_on_port "$API_PORT")"
+  db_ctr="$(container_on_port "$DB_PORT")"
+  printf '  :%s  %s\n' "$API_PORT" "${api_ctr:-<nothing listening>}"
+  printf '  :%s  %s\n' "$DB_PORT" "${db_ctr:-<nothing listening>}"
+
+  # A container the compose project does not own is the usual reason the new
+  # build appears to 404: the host port belongs to the old project.
+  if [ -n "$api_ctr" ] && \
+     ! compose ps --format '{{.Name}}' 2>/dev/null | grep -qx "$api_ctr"; then
+    printf '  WARN  :%s is served by %s, which is not in this compose project.\n' \
+      "$API_PORT" "$api_ctr" >&2
+    printf '        Stop it yourself, then run ./dev up:\n' >&2
+    printf '          docker stop %s\n' "$api_ctr" >&2
+    ok=1
+  fi
+
+  log "endpoints on http://localhost:$API_PORT"
+  local path code
+  for path in /health /api/calls/recent /api/student/open-offers /api/teacher/open-offers; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X GET "http://localhost:$API_PORT$path" || echo 000)"
+    printf '  %-28s %s\n' "$path" "$code"
+  done
+  printf '  %s\n' "401 = authentication required; sign in to confirm route availability. 404 = not found."
+
+  log "containers in this compose project"
+  compose ps --format '  {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || echo "  none"
+  # Compose can leave a container running with no network when its host port was
+  # taken; the API then crash-loops with "Resource temporarily unavailable".
+  local ctr nets
+  for ctr in ana-quran-academy-api ana-quran-academy-db; do
+    docker inspect "$ctr" >/dev/null 2>&1 || continue
+    nets="$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$ctr")"
+    if [ "$nets" = "{}" ]; then
+      printf '  WARN  %s has no network attached — ./dev down then ./dev up\n' "$ctr" >&2
+      ok=1
+    fi
+  done
+
+  return "$ok"
+}
+
+do_down() {
+  require_docker
+  log "docker compose down (volume kept)"
+  compose down "$@"
+}
+
+do_test() {
+  command -v dotnet >/dev/null 2>&1 || die "The .NET SDK is not installed."
+  log "dotnet test"
+  dotnet test AnaQuranAcademy.sln --nologo
+}
+
+case "${1:-}" in
+  run | up) shift || true; do_up "${1:-}" ;;
+  api) do_api ;;
+  db) require_docker; log "starting Postgres"; compose up -d postgres; compose ps --format '  {{.Name}}\t{{.Status}}\t{{.Ports}}' ;;
+  logs) do_logs "${2:-api}" ;;
+  check) do_check ;;
+  down) shift || true; do_down "$@" ;;
+  build) log "dotnet build"; dotnet build AnaQuranAcademy.sln --nologo ;;
+  test) do_test ;;
+  -h | --help | help | "") usage ;;
+  *) die "Unknown command: $1. Run ./dev help." ;;
+esac
