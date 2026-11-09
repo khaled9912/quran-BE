@@ -158,15 +158,12 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
         foreach (var lesson in upcoming)
         {
             var started = lesson.StartsAt <= now;
-            var withinHour = lesson.StartsAt - now <= TimeSpan.FromHours(1);
-            var (key, title, body) = started
-                ? ($"lesson-start:{lesson.Id}", "Lesson starting now",
-                    $"Your lesson with {{0}} is starting now. Tap to open the room.")
-                : withinHour
-                    ? ($"lesson-reminder-1h:{lesson.Id}", "Lesson in 1 hour",
-                        $"Your lesson with {{0}} starts in 1 hour. Tap to review the details.")
-                    : ($"lesson-reminder-24h:{lesson.Id}", "Lesson tomorrow",
-                        $"Your lesson with {{0}} starts in 24 hours. Tap to review the details.");
+            // One dedupe key per lead window, so a lesson crossing from the
+            // day-ahead window into the hour-ahead window notifies twice, never more.
+            var leadKey = lesson.StartsAt - now <= TimeSpan.FromHours(1)
+                ? $"lesson-reminder-1h:{lesson.Id}"
+                : $"lesson-reminder-24h:{lesson.Id}";
+            var link = LessonOpsMessaging.LessonLink(lesson);
 
             foreach (var (userId, otherName) in new[]
             {
@@ -174,11 +171,23 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
                 (lesson.StudentId, lesson.Teacher?.FullName ?? "your teacher"),
             })
             {
+                string key, title, message;
+                if (started)
+                {
+                    key = $"lesson-start:{lesson.Id}";
+                    title = "Lesson starting now";
+                    message = $"Your lesson with {otherName} is starting now. Tap to open the room.";
+                }
+                else
+                {
+                    var lead = LessonOpsMessaging.LeadReminder(lesson.StartsAt, now, otherName);
+                    if (lead is null) continue;
+                    (key, title, message) = (leadKey, lead.Value.Title, lead.Value.Body);
+                }
+
                 if (await db.Notifications.AnyAsync(x => x.UserId == userId && x.DedupeKey == key, ct)) continue;
-                var message = body.Replace("{0}", otherName);
-                db.Notifications.Add(LessonOpsMessaging.Notice(
-                    userId, title, message, "lesson", $"/lesson/{lesson.Id}", key));
-                pushJobs.Add((userId, title, message, $"/lesson/{lesson.Id}"));
+                db.Notifications.Add(LessonOpsMessaging.Notice(userId, title, message, "lesson", link, key));
+                pushJobs.Add((userId, title, message, link));
             }
         }
 
