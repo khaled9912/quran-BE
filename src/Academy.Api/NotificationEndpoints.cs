@@ -107,25 +107,17 @@ public static class NotificationEndpoints
                 continue;
             }
 
-            pending.Add(withinHour
-                ? new AppNotification
-                {
-                    UserId = userId,
-                    Title = "Lesson in 1 hour",
-                    Body = $"Your lesson with {otherName} starts in 1 hour. Tap to review the details.",
-                    Kind = "lesson",
-                    Link = $"/lesson/{lesson.Id}",
-                    DedupeKey = $"lesson-reminder-1h:{lesson.Id}",
-                }
-                : new AppNotification
-                {
-                    UserId = userId,
-                    Title = "Lesson tomorrow",
-                    Body = $"Your lesson with {otherName} starts in 24 hours. Tap to review the details.",
-                    Kind = "lesson",
-                    Link = $"/lesson/{lesson.Id}",
-                    DedupeKey = $"lesson-reminder-24h:{lesson.Id}",
-                });
+            var lead = LessonOpsMessaging.LeadReminder(lesson.StartsAt, now, otherName);
+            if (lead is null) continue;
+            pending.Add(new AppNotification
+            {
+                UserId = userId,
+                Title = lead.Value.Title,
+                Body = lead.Value.Body,
+                Kind = "lesson",
+                Link = $"/lesson/{lesson.Id}",
+                DedupeKey = withinHour ? $"lesson-reminder-1h:{lesson.Id}" : $"lesson-reminder-24h:{lesson.Id}",
+            });
         }
 
         if (isTeacher)

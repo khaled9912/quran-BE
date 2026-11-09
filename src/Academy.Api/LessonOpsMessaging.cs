@@ -189,6 +189,38 @@ public static class LessonOpsMessaging
         };
 
     /// <summary>
+    /// Copy for a lesson that has not started yet. The text is frozen into the
+    /// notification row when it is written, so it has to describe the real gap at
+    /// that moment. <c>null</c> means the lesson is too close to its start for a
+    /// lead notice to add anything the "starting now" notice will not say a
+    /// minute later.
+    /// </summary>
+    public static (string Title, string Body)? LeadReminder(
+        DateTimeOffset startsAt,
+        DateTimeOffset now,
+        string otherName)
+    {
+        var remaining = startsAt - now;
+        // Inside five minutes the "starting now" notice lands shortly and says it
+        // better, so a lead reminder would only be noise.
+        if (remaining < TimeSpan.FromMinutes(5)) return null;
+
+        if (remaining >= TimeSpan.FromHours(22))
+            return ("Lesson tomorrow",
+                $"Your lesson with {otherName} is tomorrow. Tap to review the details.");
+
+        var minutes = (int)remaining.TotalMinutes;
+        var startsIn = minutes < 60
+            ? Plural(minutes, "minute")
+            : $"about {Plural((int)Math.Round(remaining.TotalHours), "hour")}";
+        return ($"Lesson in {startsIn}",
+            $"Your lesson with {otherName} starts in {startsIn}. Tap to review the details.");
+    }
+
+    private static string Plural(int count, string noun) =>
+        $"{Math.Max(count, 1)} {(count == 1 ? noun : noun + "s")}";
+
+    /// <summary>
     /// The line staff need before they can act on a lesson notice: who the
     /// lesson was between, when it ran, and what happened. Pair it with
     /// <see cref="LessonLink"/> so the notification opens that exact lesson.
