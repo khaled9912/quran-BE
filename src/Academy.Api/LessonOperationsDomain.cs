@@ -315,6 +315,24 @@ public sealed class DeviceToken
 }
 
 /// <summary>
+/// One browser tab set aside by the Web Push service for this installation.
+/// The endpoint is the queue the push service owns; the two keys say who may
+/// write to it and how the message is sealed, so all three travel together and
+/// none of them works on another device.
+/// </summary>
+public sealed class BrowserSubscription
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public AcademyUser? User { get; set; }
+    [MaxLength(600)] public string Endpoint { get; set; } = "";
+    [MaxLength(200)] public string P256Dh { get; set; } = "";
+    [MaxLength(100)] public string Auth { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset LastSeenAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
 /// One in-app "call me now" ring between lesson participants, or from staff to
 /// a participant. The row outlives the notification, so a call nobody answered
 /// is still on the lesson record when staff review a no-show.

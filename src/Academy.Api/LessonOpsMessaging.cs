@@ -5,10 +5,64 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Academy.Api;
 
-/// <summary>Server-side Expo push delivery for lesson notifications.</summary>
-public sealed class AcademyPushSender(IHttpClientFactory factory, ILogger<AcademyPushSender> logger)
+/// <summary>
+/// Server-side push delivery for lesson notifications, across both transports a
+/// user can have: Expo push to the mobile app, and Web Push to subscribed
+/// browser tabs. Delivery is best-effort on both — the in-app notice is already
+/// stored before anything here runs.
+/// </summary>
+public sealed class AcademyPushSender(
+    IHttpClientFactory factory, WebPushSender webPush, ILogger<AcademyPushSender> logger)
 {
     private const string ExpoEndpoint = "https://exp.host/--/api/v2/push/send";
+
+    /// <summary>
+    /// Rings every device these accounts registered. A user with a phone and a
+    /// laptop hears once, because the two transports are different machines,
+    /// not two copies of the same one.
+    ///
+    /// The DbContext is the caller's: this class is a singleton and the devices
+    /// belong to the request that asked for the ring.
+    /// </summary>
+    public async Task SendToUsersAsync(
+        AcademyDbContext db,
+        IReadOnlyCollection<Guid> userIds,
+        string title,
+        string body,
+        string? link,
+        PushOptions? options = null,
+        CancellationToken ct = default)
+    {
+        if (userIds.Count == 0) return;
+
+        // The badge is the reader's unread count, so the icon matches the tray
+        // even when the app is closed. iOS applies the number itself; Android
+        // shows a dot from the channel, and the app keeps the count in step.
+        var unread = await db.Notifications.AsNoTracking()
+            .Where(x => userIds.Contains(x.UserId) && x.ReadAt == null)
+            .GroupBy(x => x.UserId)
+            .Select(g => new { UserId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.UserId, x => x.Count, ct);
+
+        var messageOptions = options ?? new PushOptions();
+
+        var tokens = await db.DeviceTokens.AsNoTracking()
+            .Where(x => userIds.Contains(x.UserId))
+            .Select(x => new { x.UserId, x.Token })
+            .ToListAsync(ct);
+        foreach (var group in tokens.GroupBy(x => x.UserId))
+            await SendAsync(
+                group.Select(x => x.Token).ToList(), title, body, link,
+                messageOptions with { Badge = unread.GetValueOrDefault(group.Key) }, ct);
+
+        var browsers = await db.BrowserSubscriptions.AsNoTracking()
+            .Where(x => userIds.Contains(x.UserId))
+            .ToListAsync(ct);
+        foreach (var group in browsers.GroupBy(x => x.UserId))
+            await webPush.SendAsync(
+                db, group.ToList(), title, body, link,
+                messageOptions with { Badge = unread.GetValueOrDefault(group.Key) }, ct);
+    }
 
     public async Task SendAsync(
         IReadOnlyCollection<string> tokens,
@@ -199,31 +253,8 @@ public static class LessonOpsMessaging
         string body,
         string? link,
         CancellationToken ct = default,
-        PushOptions? options = null)
-    {
-        var ids = userIds.Distinct().ToList();
-        if (ids.Count == 0) return;
-        var tokens = await db.DeviceTokens.AsNoTracking()
-            .Where(x => ids.Contains(x.UserId))
-            .Select(x => new { x.UserId, x.Token })
-            .ToListAsync(ct);
-        if (tokens.Count == 0) return;
-
-        // The badge is the reader's unread count, so the icon matches the tray
-        // even when the app is closed. iOS applies the number itself; Android
-        // shows a dot from the channel, and the app keeps the count in step.
-        var unread = await db.Notifications.AsNoTracking()
-            .Where(x => ids.Contains(x.UserId) && x.ReadAt == null)
-            .GroupBy(x => x.UserId)
-            .Select(g => new { UserId = g.Key, Count = g.Count() })
-            .ToDictionaryAsync(x => x.UserId, x => x.Count, ct);
-
-        var messageOptions = options ?? new PushOptions();
-        foreach (var group in tokens.GroupBy(x => x.UserId))
-            await push.SendAsync(
-                group.Select(x => x.Token).ToList(), title, body, link,
-                messageOptions with { Badge = unread.GetValueOrDefault(group.Key) }, ct);
-    }
+        PushOptions? options = null) =>
+        await push.SendToUsersAsync(db, userIds.Distinct().ToList(), title, body, link, options, ct);
 
     public static async Task EmailAsync(
         AcademyEmailSender email,

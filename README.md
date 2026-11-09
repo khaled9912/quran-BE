@@ -29,16 +29,18 @@ Live lessons run on self-hosted Jitsi, not in this repo. Transcript audio captur
 
 Requirements: Docker Desktop (or Docker Engine + Compose). The .NET SDK is optional if you run through Docker.
 
-1. Copy `.env.example` to `.env`.
-2. Change `POSTGRES_PASSWORD` and `BOOTSTRAP_ADMIN_PASSWORD`.
-3. Run:
+1. On a fresh checkout, copy `.env.example` to `.env`; keep an existing `.env`.
+2. Before first startup, change `POSTGRES_PASSWORD` and `BOOTSTRAP_ADMIN_PASSWORD`.
+3. From this backend directory, run:
 
    ```bash
-   docker compose up --build
+   ./dev run
    ```
 
+   This builds and starts the stack. Use `./dev logs` for API logs, `./dev check` for health and port diagnostics, and `./dev down` to stop it without deleting data.
+
 4. API health: http://localhost:5001/health
-5. Swagger (Development only): http://localhost:5001/swagger
+5. Swagger (Development only, sign-in required): http://localhost:5001/swagger
 6. Set the frontend `.env.local`:
 
    ```env
@@ -47,7 +49,7 @@ Requirements: Docker Desktop (or Docker Engine + Compose). The .NET SDK is optio
 
 7. Start Next.js on http://localhost:3000.
 
-The seeded administrator is configured through `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` in `.env`. Change the defaults before first startup. The database is persisted in the `academy-postgres` Docker volume.
+The seeded administrator is configured through `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` in `.env`. Change the defaults before first startup. The database is persisted in the `ana-quran-academy-postgres` Docker volume. The Compose project (`ana-quran-academy`), containers and network have explicit names, so renaming the checkout folder does not switch databases.
 
 ### Contact form email
 

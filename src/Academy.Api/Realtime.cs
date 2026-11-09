@@ -26,6 +26,8 @@ public static class RealtimeGroups
     public static string User(Guid userId) => $"user:{userId}";
     /// <summary>Ink is only shared with the people already inside that lesson.</summary>
     public static string LessonPen(Guid lessonId) => $"lesson-pen:{lessonId}";
+    /// <summary>The one-share-at-a-time lock for a live lesson.</summary>
+    public static string LessonShare(Guid lessonId) => $"lesson-share:{lessonId}";
 }
 
 public static class RealtimeTicketDefaults

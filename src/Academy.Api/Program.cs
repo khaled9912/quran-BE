@@ -204,8 +204,12 @@ builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
 builder.Services.AddSingleton<AcademyEmailSender>();
 builder.Services.AddSingleton<AcademyPushSender>();
+builder.Services.AddSingleton<WebPushSender>();
 builder.Services.AddHttpClient("otp", client => client.Timeout = TimeSpan.FromSeconds(15));
 builder.Services.AddHttpClient("expo", client => client.Timeout = TimeSpan.FromSeconds(10));
+// Browser push services are internet-facing queues; a stalled one must not hold
+// a request open, and the ring it carries is worthless a minute later.
+builder.Services.AddHttpClient("webpush", client => client.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
 if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
@@ -217,6 +221,7 @@ builder.Services.AddSignalR();
 builder.Services.AddSingleton<RealtimeTicketService>();
 builder.Services.AddSingleton<RealtimeNotifier>();
 builder.Services.AddSingleton<LessonPenBoard>();
+builder.Services.AddSingleton<LessonShareBoard>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
@@ -900,6 +905,20 @@ await using (var scope = app.Services.CreateAsyncScope())
         );
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_DeviceTokens_Token" ON "DeviceTokens" ("Token");
         CREATE INDEX IF NOT EXISTS "IX_DeviceTokens_UserId" ON "DeviceTokens" ("UserId");
+
+        CREATE TABLE IF NOT EXISTS "BrowserSubscriptions" (
+            "Id" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "Endpoint" character varying(600) NOT NULL,
+            "P256Dh" character varying(200) NOT NULL,
+            "Auth" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "LastSeenAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_BrowserSubscriptions" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_BrowserSubscriptions_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_BrowserSubscriptions_Endpoint" ON "BrowserSubscriptions" ("Endpoint");
+        CREATE INDEX IF NOT EXISTS "IX_BrowserSubscriptions_UserId" ON "BrowserSubscriptions" ("UserId");
 
         CREATE TABLE IF NOT EXISTS "OpenStudentOffers" (
             "Id" uuid NOT NULL,

@@ -690,6 +690,8 @@ public static class ApiEndpoints
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return result;
         });
+        admin.MapPost("/teachers/{teacherId:guid}/availability-rules/{ruleId:guid}/release", async (Guid teacherId, Guid ruleId, ClaimsPrincipal principal, AcademyDbContext db, RealtimeNotifier realtime) =>
+            await ReleaseAvailabilityRuleAsync(teacherId, ruleId, UserId(principal), db, realtime));
 
         // Transcript review lives in LessonReviewEndpoints (also open to support).
 
@@ -928,14 +930,14 @@ public static class ApiEndpoints
         teacher.MapGet("/lesson-requests", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok((await db.LessonRequests.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).Where(x => x.TeacherId == UserId(p)).OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToRequest)));
         teacher.MapPost("/lesson-requests/{id:guid}/confirm", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
-            var request = await db.LessonRequests.FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
+            var request = await db.LessonRequests.Include(x => x.Teacher).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
             request.Status = "pending_admin"; request.TeacherRespondedAt = DateTimeOffset.UtcNow;
             db.Notifications.Add(new AppNotification
             {
                 UserId = request.StudentId,
-                Title = "Teacher accepted your lesson request",
-                Body = "Your teacher agreed to the time. The academy will confirm it on your schedule.",
+                Title = $"{request.Teacher?.FullName ?? "Your teacher"} accepted your lesson request",
+                Body = "They agreed to the time. The academy will confirm it on your schedule.",
                 Kind = "request",
                 Link = "/schedule",
                 DedupeKey = $"request-teacher-accepted:{request.Id}",
@@ -948,14 +950,14 @@ public static class ApiEndpoints
         });
         teacher.MapPost("/lesson-requests/{id:guid}/reject", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, RejectRequest? input = null) =>
         {
-            var request = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
+            var request = await db.LessonRequests.Include(x => x.Teacher).Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability).FirstOrDefaultAsync(x => x.Id == id && x.TeacherId == UserId(p));
             if (request is null) return Results.NotFound(); if (request.Status != "pending_teacher") return Results.Conflict(new { message = "This request is no longer awaiting teacher confirmation." });
             request.Status = "rejected"; request.RejectionReason = input?.Reason; request.TeacherRespondedAt = DateTimeOffset.UtcNow; request.AvailabilitySlot!.Status = "available";
             db.Notifications.Add(new AppNotification
             {
                 UserId = request.StudentId,
-                Title = "Lesson request declined",
-                Body = input?.Reason ?? "Your teacher could not take this time. Pick another weekly slot to keep learning.",
+                Title = $"{request.Teacher?.FullName ?? "Your teacher"} declined your lesson request",
+                Body = input?.Reason ?? "Pick another weekly slot to keep learning.",
                 Kind = "request",
                 Link = "/book",
                 DedupeKey = $"request-teacher-declined:{request.Id}",
@@ -1972,13 +1974,79 @@ public static class ApiEndpoints
     {
         var rule = await db.TeacherAvailabilityRules.FirstOrDefaultAsync(x => x.Id == ruleId && x.TeacherId == teacherId);
         if (rule is null) return Results.NotFound();
-        if (await db.LessonSeries.AnyAsync(x => x.AvailabilityRuleId == ruleId))
-            return Results.Conflict(new { message = "A slot that a student has booked cannot be removed." });
+        if (await db.LessonSeries.AnyAsync(x => x.AvailabilityRuleId == ruleId && x.IsActive))
+            return Results.Conflict(new { message = "Students are still booked on this weekly time. End their lessons first." });
         if (await db.LessonChangeRequests.AnyAsync(x => x.RequestedRuleId == ruleId))
             return Results.Conflict(new { message = "This slot is recorded in a weekly time change, so it cannot be removed." });
         db.TeacherAvailabilityRules.Remove(rule);
         await db.SaveChangesAsync();
         return Results.NoContent();
+    }
+
+    /// <summary>
+    /// Ends every active weekly series built on one announced slot, so an
+    /// administrator can take a time back from the students who booked it. The
+    /// release mirrors the student's own "end weekly lessons": future lessons
+    /// were never charged, so no credit moves and nobody takes a strike.
+    /// </summary>
+    private static async Task<IResult> ReleaseAvailabilityRuleAsync(Guid teacherId, Guid ruleId, Guid actorId, AcademyDbContext db, RealtimeNotifier realtime)
+    {
+        if (!await db.TeacherAvailabilityRules.AnyAsync(x => x.Id == ruleId && x.TeacherId == teacherId))
+            return Results.NotFound();
+        var seriesList = await db.LessonSeries.Include(x => x.Student).Include(x => x.Teacher)
+            .Where(x => x.AvailabilityRuleId == ruleId && x.IsActive).ToListAsync();
+        if (seriesList.Count == 0) return Results.Ok(new { released = 0, lessonsCancelled = 0 });
+
+        var now = DateTimeOffset.UtcNow;
+        var cancelled = 0;
+        await using var tx = await db.Database.BeginTransactionAsync();
+        foreach (var series in seriesList)
+        {
+            series.IsActive = false;
+            var futureLessons = await db.Lessons
+                .Where(x => x.SeriesId == series.Id && x.Status == "scheduled" && x.StartsAt > now).ToListAsync();
+            foreach (var lesson in futureLessons)
+            {
+                lesson.Status = "cancelled";
+                lesson.CancellationOutcome = "series_ended";
+                lesson.CancelReason = "The academy ended this weekly time.";
+                lesson.CancelledById = actorId;
+                lesson.CancelledAt = now;
+                cancelled++;
+            }
+
+            var keepsTeacher = await db.LessonSeries.AnyAsync(x =>
+                x.StudentId == series.StudentId && x.TeacherId == series.TeacherId && x.IsActive && x.Id != series.Id);
+            if (!keepsTeacher)
+                await db.Assignments.Where(x => x.StudentId == series.StudentId && x.TeacherId == series.TeacherId && x.IsActive)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+
+            var when = LessonOpsMessaging.WeeklyAt(series.DayOfWeek, series.StartsAtTime, series.TimeZoneId);
+            var studentName = series.Student?.FullName ?? "A student";
+            var teacherName = series.Teacher?.FullName ?? "their teacher";
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                series.TeacherId, "Weekly lessons ended",
+                $"The academy ended {studentName}'s weekly lessons with you on {when}. Their future lessons are off your calendar.",
+                "booking", "/schedule", $"series-ended-by-admin:{series.Id}"));
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                series.StudentId, "Weekly lessons ended",
+                $"The academy ended your weekly lessons with {teacherName} on {when}. You can book another time.",
+                "booking", "/book", $"series-ended-by-admin:{series.Id}"));
+        }
+        Audit(db, actorId, "admin_availability_released", "TeacherAvailabilityRule", ruleId, $"seriesEnded={seriesList.Count}; lessonsCancelled={cancelled}");
+
+        try { await db.SaveChangesAsync(); await tx.CommitAsync(); }
+        catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "Unable to end these weekly lessons. Please try again." }); }
+
+        foreach (var series in seriesList)
+        {
+            await realtime.ToParticipantsAsync(series.TeacherId, series.StudentId, RealtimeScopes.Lessons);
+            await realtime.ToUsersAsync(new[] { series.TeacherId, series.StudentId }, RealtimeScopes.Notifications);
+        }
+        await realtime.ToUserAsync(teacherId, RealtimeScopes.Directory);
+        await realtime.ToStaffAsync(RealtimeScopes.Directory);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
+        return Results.Ok(new { released = seriesList.Count, lessonsCancelled = cancelled });
     }
 
     private static async Task<List<Lesson>> BuildSeriesLessonsAsync(AcademyDbContext db, LessonSeries series, DateTimeOffset now)
