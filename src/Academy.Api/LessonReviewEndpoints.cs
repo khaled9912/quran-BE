@@ -15,6 +15,11 @@ public static class LessonReviewEndpoints
     public static void MapLessonReviews(this WebApplication app)
     {
         var reviewer = app.MapGroup("/api/admin").RequireAuthorization("ReviewerOnly");
+        reviewer.AddEndpointFilter(async (context, next) =>
+        {
+            context.HttpContext.Response.Headers.CacheControl = "no-store";
+            return await next(context);
+        });
 
         // Flagged lessons remain the fastest way to catch off-platform contact,
         // but the queue below covers every lesson that has a transcript.
@@ -28,39 +33,36 @@ public static class LessonReviewEndpoints
 
     private static async Task<IResult> FlaggedLessonsAsync(AcademyDbContext db)
     {
-        var grouped = await db.LessonTranscriptSegments
+        var grouped = await db.LessonTranscriptSegments.AsNoTracking()
             .Where(x => x.Flags != "")
             .GroupBy(x => x.LessonId)
             .Select(g => new { LessonId = g.Key, Flagged = g.Count(), LastFlaggedAt = g.Max(x => x.CreatedAt) })
-            .OrderByDescending(x => x.LastFlaggedAt)
-            .Take(200)
-            .ToListAsync();
-        if (grouped.Count == 0) return Results.Ok(Array.Empty<object>());
-        var ids = grouped.Select(x => x.LessonId).ToList();
-        var lessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student)
+            .OrderByDescending(x => x.LastFlaggedAt).Take(200).ToDictionaryAsync(x => x.LessonId);
+        var gaps = await TranscriptCaptureEndpoints.CoverageGaps(db)
+            .OrderByDescending(x => x.LastSeenAt).Take(200)
+            .Select(x => new { x.LessonId, x.LastStatus, x.LastSeenAt }).ToDictionaryAsync(x => x.LessonId);
+        var ids = grouped.Keys.Concat(gaps.Keys).Distinct().ToList();
+        var lessons = await db.Lessons.AsNoTracking().Include(x => x.Teacher).Include(x => x.Student)
             .Where(x => ids.Contains(x.Id)).ToListAsync();
-        var rawFlags = await db.LessonTranscriptSegments
+        var rawFlags = await db.LessonTranscriptSegments.AsNoTracking()
             .Where(x => ids.Contains(x.LessonId) && x.Flags != "")
-            .Select(x => new { x.LessonId, x.Flags })
-            .ToListAsync();
-        return Results.Ok(grouped.Select(g =>
+            .Select(x => new { x.LessonId, x.Flags }).ToListAsync();
+        return Results.Ok(lessons.Select(lesson =>
         {
-            var lesson = lessons.FirstOrDefault(l => l.Id == g.LessonId);
-            var reasons = rawFlags.Where(f => f.LessonId == g.LessonId)
-                .SelectMany(f => f.Flags.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            grouped.TryGetValue(lesson.Id, out var group);
+            gaps.TryGetValue(lesson.Id, out var gap);
+            var reasons = rawFlags.Where(f => f.LessonId == lesson.Id).SelectMany(f => Flags(f.Flags))
+                .Concat(gap is null ? [] : new[] { TranscriptCaptureEndpoints.CoverageReason(gap.LastStatus) })
                 .Distinct().OrderBy(x => x).ToArray();
             return new
             {
-                lessonId = g.LessonId,
-                startsAt = lesson?.StartsAt,
-                status = lesson?.Status,
-                teacherName = lesson?.Teacher?.FullName,
-                studentName = lesson?.Student?.FullName,
-                flaggedSegments = g.Flagged,
-                lastFlaggedAt = g.LastFlaggedAt,
+                lessonId = lesson.Id, startsAt = lesson.StartsAt, status = lesson.Status,
+                teacherName = lesson.Teacher!.FullName, studentName = lesson.Student!.FullName,
+                flaggedSegments = group?.Flagged ?? 0,
+                lastFlaggedAt = group?.LastFlaggedAt ?? gap!.LastSeenAt,
                 reasons
             };
-        }));
+        }).OrderByDescending(x => x.flaggedSegments > 0).ThenByDescending(x => x.startsAt).Take(200));
     }
 
     private static async Task<IResult> TranscriptAsync(Guid id, ClaimsPrincipal principal, AcademyDbContext db)
@@ -95,6 +97,11 @@ public static class LessonReviewEndpoints
         var review = await db.LessonQualityReviews.AsNoTracking()
             .Include(x => x.Reviewer)
             .FirstOrDefaultAsync(x => x.LessonId == id);
+        var captures = await db.LessonTranscriptCaptures.AsNoTracking().Where(x => x.LessonId == id)
+            .Select(x => new { x.Role, x.LastStatus, x.FirstSeenAt, x.LastSeenAt, x.LastSegmentAt, x.SegmentCount, x.Expected })
+            .ToListAsync();
+        var gapStatuses = await TranscriptCaptureEndpoints.CoverageGaps(db).Where(x => x.LessonId == id)
+            .Select(x => x.LastStatus).ToListAsync();
 
         return new
         {
@@ -109,12 +116,16 @@ public static class LessonReviewEndpoints
                 teacherName = lesson.Teacher!.FullName,
                 studentName = lesson.Student!.FullName
             },
+            captures,
+            coverageReasons = gapStatuses.Select(TranscriptCaptureEndpoints.CoverageReason).ToArray(),
+            retentionDays = 30,
             metrics = Metrics(segments, lesson.Teacher.FullName, lesson.Student.FullName),
             review = review is null ? null : ReviewPayload(review),
             segments = segments.Select(x => new
             {
                 x.Id,
                 x.Speaker,
+                x.Source,
                 x.Text,
                 x.AtSeconds,
                 x.CreatedAt,
@@ -134,8 +145,10 @@ public static class LessonReviewEndpoints
         if (normalized is not ("all" or "unreviewed" or "draft" or "submitted" or "flagged"))
             return Results.BadRequest(new { message = "Status must be all, unreviewed, draft, submitted, or flagged." });
 
+        var coverage = TranscriptCaptureEndpoints.CoverageGaps(db);
         var query = db.Lessons.AsNoTracking()
-            .Where(l => db.LessonTranscriptSegments.Any(s => s.LessonId == l.Id));
+            .Where(l => db.LessonTranscriptSegments.Any(s => s.LessonId == l.Id)
+                || coverage.Any(c => c.LessonId == l.Id));
         if (from is not null) query = query.Where(l => l.StartsAt >= from);
         if (to is not null) query = query.Where(l => l.StartsAt < to);
 
@@ -168,6 +181,8 @@ public static class LessonReviewEndpoints
             .Where(x => ids.Contains(x.LessonId))
             .ToDictionaryAsync(x => x.LessonId);
 
+        var gaps = await coverage.Where(x => ids.Contains(x.LessonId))
+            .Select(x => new { x.LessonId, x.LastStatus }).ToDictionaryAsync(x => x.LessonId);
         var items = lessons.Select(lesson =>
         {
             counts.TryGetValue(lesson.Id, out var count);
@@ -175,6 +190,7 @@ public static class LessonReviewEndpoints
             var reasons = flaggedSegments
                 .Where(x => x.LessonId == lesson.Id)
                 .SelectMany(x => Flags(x.Flags))
+                .Concat(gaps.TryGetValue(lesson.Id, out var gap) ? new[] { TranscriptCaptureEndpoints.CoverageReason(gap.LastStatus) } : [])
                 .Distinct()
                 .OrderBy(x => x)
                 .ToArray();
@@ -200,10 +216,10 @@ public static class LessonReviewEndpoints
             "unreviewed" => item.ReviewStatus is null,
             "draft" => item.ReviewStatus == "draft",
             "submitted" => item.ReviewStatus == "submitted",
-            "flagged" => item.FlaggedSegments > 0,
+            "flagged" => item.FlagReasons.Length > 0,
             _ => true
         }).ToList();
-        if (flagged == true) items = items.Where(item => item.FlaggedSegments > 0).ToList();
+        if (flagged == true) items = items.Where(item => item.FlagReasons.Length > 0).ToList();
 
         return Results.Ok(items
             .OrderByDescending(item => item.FlaggedSegments > 0)
@@ -371,8 +387,8 @@ public static class LessonReviewEndpoints
         if (input.TeacherAction?.Trim().Length > 1000) errors["teacherAction"] = ["Keep the teacher action under 1000 characters."];
         if (input.StudentAction?.Trim().Length > 1000) errors["studentAction"] = ["Keep the student action under 1000 characters."];
 
-        if (!await db.LessonTranscriptSegments.AsNoTracking().AnyAsync(x => x.LessonId == id))
-            errors["lesson"] = ["This lesson has no transcript yet, so it cannot be reviewed."];
+        if (status == "submitted" && !await db.LessonTranscriptSegments.AsNoTracking().AnyAsync(x => x.LessonId == id))
+            errors["lesson"] = ["Without a retained transcript, save follow-up notes as a draft instead of scoring the lesson."];
         if (errors.Count > 0) return Results.ValidationProblem(errors);
 
         var review = await db.LessonQualityReviews.FirstOrDefaultAsync(x => x.LessonId == id);

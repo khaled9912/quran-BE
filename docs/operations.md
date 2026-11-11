@@ -27,7 +27,12 @@ Hosting and incident history live in the repository-root `README.md`.
 | `Email__Username` / `__Password` | SMTP credentials; use an app password |
 | `Email__From` | Sender address; defaults to `Email__Username` |
 | `Email__To` | The fixed contact-form receiver |
-| `Transcripts__IngestKey` | Shared secret for `POST /api/lessons/{id}/transcript`; when unset the route answers `404`, so the transcript feature is dark by default |
+| `Transcripts__IngestKey` | Server-only shared secret for the trusted relay route `POST /api/lessons/{id}/transcript`; when unset that route answers `404`. Never put it in a web or mobile build. Browser self-capture does not use it |
+| `LessonRoom__Whiteboard` / `__Chat` / `__CameraBackground` / `__Pen` / `__PerformanceSettings` | Live-room feature flags, all **off** by default. `GET /api/config/lesson-room` (anonymous, `no-store`) reports them; both clients refetch it every 30 seconds and wait for the first answer before creating a conference — Jitsi fixes its toolbar at join time, so a flip of these five only reaches rooms opened after it. `__PerformanceSettings` is web-only: it adds Jitsi's video-quality picker, which the mobile SDK's fixed native toolbar cannot show |
+| `LessonRoom__Transcription` | **Off** by default. Enables desktop-browser self-microphone transcription and `POST /api/lessons/{id}/transcript/self` (`404` while off). Open rooms follow a flip within ~30–45 s; suspended/offline clients cannot be switched off instantly |
+| `LessonRoom__ReportConcern` | **Off** by default. Enables the student's confidential conduct-concern report (`conduct_concern` incidents answer `404` while off) |
+| `Transcripts__LightCaptureSince` | Approved UTC activation instant (ISO 8601) for coverage-gap expectations. Missing/invalid means no expectations are recorded, so no `no_transcript`/`unsupported_device` gaps appear; lessons before it are never enrolled |
+| `Scheduling__TimeChangeLeadMinutes` | Academy-wide notice, in minutes, a student must leave a teacher when moving a weekly lesson (default `60`). Weekly times whose next class starts inside that window are not offered and are rejected on request; `0` disables the rule |
 | `Realtime__PublicUrl` | Absolute origin the browser should use for the SignalR hub; otherwise proxy headers, then the request host |
 | `SENTRY_DSN` / `Sentry__Dsn` | Error reporting; no-op when empty |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SERVICE_NAME` | Enables OpenTelemetry tracing/metrics when set |
@@ -35,6 +40,14 @@ Hosting and incident history live in the repository-root `README.md`.
 `EXPO_*` push credentials are not read by the API — the Expo push endpoint is
 called with the tokens the app registered. OTP and password-reset codes share a
 60-second resend cooldown per target.
+
+Transcript retention is fixed at 30 days and needs no setting: reads hide
+older segments and capture rows immediately, and the `TranscriptRetention`
+hosted service deletes them at startup and hourly. Reviews and incidents are
+kept. Before switching `LessonRoom__Transcription` or `LessonRoom__ReportConcern`
+on in production, the owner must approve the consent and notice wording, and
+`Transcripts__LightCaptureSince` must be set to the activation instant; see
+`docs/plans/transcript-capture-plan.md` at the workspace root.
 
 ## Database lifecycle
 
@@ -84,9 +97,32 @@ The live model is recurring rules → instant bookings → materialized series.
 - Booking, series creation, and lesson materialization run in one transaction,
   which also sets the student's active teacher assignment.
 - Materialization is 8 weeks ahead and rolls forward whenever fewer than 28 days
-  of lessons remain; the recheck against calendar overlaps happens inside the
-  same transaction, so a rule that became busy cannot produce a duplicate lesson.
-- Change requests are retargeted and re-materialized on admin approval only.
+  of lessons remain. Rolling materialization checks calendar conflicts, skips
+  conflicting occurrences, and notifies the teacher, student, and admins. This
+  check is not a blanket guarantee against every concurrent scheduling race.
+- Materialization preserves already represented dates, including cancelled
+  occurrences and the original dates of individually moved lessons, rather than
+  recreating them. Only cancellations with outcome `series_rescheduled` are
+  excluded from this date-preservation check so the retargeted series can rebuild.
+- Student weekly time changes apply immediately to another open, published rule
+  of the same teacher, with conflict and lead-time checks inside a serializable
+  transaction. Only the selected series is retargeted: its future scheduled
+  lessons are cancelled with outcome `series_rescheduled` (not deleted), their
+  pending occurrence proposals close, and lessons are rebuilt at the new time.
+  The old slot opens; other series and booked weekdays remain unchanged. The
+  teacher, student, and admins are notified of the new time; no approval is
+  required and the admin change history is read-only.
+- Ending a selected series cancels only its future scheduled lessons with
+  outcome `series_ended`, closes their pending requests, and releases its weekly
+  slot. Other series are unaffected; there is no automatic pause/resume flow.
+- A one-lesson reschedule needs the other party's acceptance before the original
+  lesson starts and moves only that occurrence, not the weekly series. For an
+  admin-originated proposal, the teacher answers a normal reschedule and the
+  student answers a make-up. Admins may override but cannot answer their own
+  proposals. For a normally cancelled lesson, a teacher or admin proposes a
+  make-up and the student accepts; direct admin replacement remains an override.
+  Released weekly occurrences (`series_ended` or `series_rescheduled`) cannot
+  receive make-ups.
 - Weekly rules store wall-clock times plus an IANA zone; lessons store real UTC
   instants. Never compare the two directly.
 - Timestamps are `timestamp with time zone` through `DateTimeOffset`.

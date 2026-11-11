@@ -111,10 +111,22 @@ public static class LessonOperationsEndpoints
         h.ProposedPayableMinutes, h.ApprovedPayableMinutes, h.ApprovalStatus,
         h.AdjustmentReason, h.ApprovedAt);
 
+    // Conduct reports never enter a teacher's history, even with another role.
+    // Staff keep their existing access; students only see their own report.
+    private static IQueryable<LessonIncident> VisibleIncidents(AcademyDbContext db, ClaimsPrincipal p)
+    {
+        var userId = UserId(p);
+        var staff = !p.IsInRole("teacher") && (IsAdmin(p) || p.IsInRole("support"));
+        var student = !p.IsInRole("teacher") && p.IsInRole("student");
+        return db.LessonIncidents.Where(x => x.Type != "conduct_concern"
+            || (x.Lesson != null && x.Lesson.TeacherId != userId
+                && (staff || (student && x.ReportedBy == userId && x.Lesson.StudentId == userId))));
+    }
+
     private static LessonIncidentDto ToIncident(LessonIncident i, Lesson l) => new(
         i.Id, i.LessonId, l.StartsAt, l.TeacherId, l.Teacher?.FullName ?? "Teacher",
         l.StudentId, l.Student?.FullName ?? "Student", i.Type, i.Status, i.Detail,
-        i.CreatedAt, i.ResolvedAt, i.ResolutionNote);
+        i.CreatedAt, i.ResolvedAt, i.ResolutionNote, i.ReportedBy);
 
     private static TeacherPenaltyDto ToPenalty(TeacherPenalty x) => new(
         x.Id, x.TeacherId, x.Teacher?.FullName ?? "Teacher", x.LessonId, x.EventType,
@@ -218,8 +230,8 @@ public static class LessonOperationsEndpoints
             var hours = await db.TeacherHours.AsNoTracking().FirstOrDefaultAsync(x => x.LessonId == id, ct);
             var excuse = await db.LessonExcuseRequests.AsNoTracking().Include(x => x.Student).Include(x => x.Lesson)
                 .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(ct);
-            var incident = await db.LessonIncidents.AsNoTracking()
-                .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(ct);
+            var incidents = await VisibleIncidents(db, p).AsNoTracking()
+                .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
             var calls = await db.LessonCalls.AsNoTracking()
                 .Include(x => x.Caller).Include(x => x.Callee)
                 .Where(x => x.LessonId == id).OrderByDescending(x => x.CreatedAt).Take(20).ToListAsync(ct);
@@ -236,7 +248,7 @@ public static class LessonOperationsEndpoints
                 mapped.FirstOrDefault(x => x.Status == "pending"), mapped, attendance,
                 hours is null ? null : ToHours(hours, lesson),
                 excuse is null ? null : ToExcuse(excuse),
-                incident is null ? null : ToIncident(incident, lesson),
+                incidents.Select(x => ToIncident(x, lesson)).ToList(),
                 replacement is null ? null : ApiEndpoints.ToLesson(replacement),
                 original is null ? null : ApiEndpoints.ToLesson(original),
                 calls.Select(ToCall).ToList()));
@@ -287,12 +299,14 @@ public static class LessonOperationsEndpoints
             if (isMakeup)
             {
                 if (!IsAdmin(p) && ActorRole(p) != "teacher") return Results.Forbid();
+                if (lesson.CancellationOutcome is "series_ended" or "series_rescheduled")
+                    return Results.Conflict(new { message = "A released weekly time is not eligible for a make-up lesson." });
                 if (lesson.IsMakeup)
                     return Results.Conflict(new { message = "A make-up lesson cannot be rescheduled again." });
                 if (await db.Lessons.AnyAsync(x => x.OriginalLessonId == id && x.Status != "cancelled", ct))
                     return Results.Conflict(new { message = "This cancelled lesson already has an active replacement." });
             }
-            else if (lesson.Status != "scheduled" || lesson.EndsAt <= DateTimeOffset.UtcNow)
+            else if (lesson.Status != "scheduled" || lesson.StartsAt <= DateTimeOffset.UtcNow)
                 return Results.Conflict(new { message = "Only a scheduled, upcoming lesson can be rescheduled." });
 
             var now = DateTimeOffset.UtcNow;
@@ -311,10 +325,8 @@ public static class LessonOperationsEndpoints
             if (await HasConflictAsync(db, lesson.Id, lesson.TeacherId, lesson.StudentId, proposedStarts, proposedEnds, ct))
                 return Results.Conflict(new { message = "The teacher or student already has a lesson at that time." });
 
-            var pending = await db.LessonRescheduleRequests
-                .Where(x => x.LessonId == id && x.Status == "pending").ToListAsync(ct);
-            foreach (var stale in pending.Where(x => x.ExpiresAt <= now)) stale.Status = "expired";
-            if (pending.Any(x => x.Status == "pending"))
+            await LessonPolicyService.ExpireRescheduleRequestsAsync(db, now, push, realtime, id, ct);
+            if (await db.LessonRescheduleRequests.AnyAsync(x => x.LessonId == id && x.Status == "pending", ct))
                 return Results.Conflict(new { message = "A reschedule request is already waiting for a reply." });
 
             var note = (input.Note ?? "").Trim();
@@ -374,17 +386,20 @@ public static class LessonOperationsEndpoints
                 .FirstOrDefaultAsync(x => x.Id == requestId, ct);
             if (request?.Lesson is null) return Results.NotFound();
             var lesson = request.Lesson;
+            if (!CanView(lesson, p)) return Results.Forbid();
             var now = DateTimeOffset.UtcNow;
             if (request.Status == "pending" && request.ExpiresAt <= now)
             {
-                request.Status = "expired";
-                await db.SaveChangesAsync(ct);
+                await LessonPolicyService.ExpireRescheduleRequestsAsync(db, now, push, realtime, lesson.Id, ct);
+                await db.Entry(request).ReloadAsync(ct);
             }
             if (request.Status != "pending")
                 return Results.Conflict(new { message = "This reschedule request is no longer open." });
             // A cancelled lesson is rebooked as a make-up instead of moved.
             var isMakeup = lesson.Status == "cancelled";
-            if (!isMakeup && (lesson.Status != "scheduled" || lesson.EndsAt <= now))
+            if (isMakeup && lesson.CancellationOutcome is "series_ended" or "series_rescheduled")
+                return Results.Conflict(new { message = "A released weekly time is not eligible for a make-up lesson." });
+            if (!isMakeup && (lesson.Status != "scheduled" || lesson.StartsAt <= now))
             {
                 request.Status = "cancelled";
                 request.RespondedAt = now;
@@ -399,8 +414,7 @@ public static class LessonOperationsEndpoints
             // side of a normal reschedule is whichever participant did not ask.
             var responderId = isMakeup ? lesson.StudentId
                 : request.RequestedById == lesson.TeacherId ? lesson.StudentId
-                : request.RequestedById == lesson.StudentId ? lesson.TeacherId
-                : Guid.Empty;
+                : lesson.TeacherId;
             if (UserId(p) != responderId && !IsAdmin(p)) return Results.Forbid();
             if (UserId(p) == request.RequestedById) return Results.Forbid();
             if (request.ProposedStartsAt <= now)
@@ -412,6 +426,12 @@ public static class LessonOperationsEndpoints
             var responseNote = (input?.Note ?? "").Trim() is { Length: > 0 } note
                 ? note[..Math.Min(note.Length, 500)]
                 : null;
+            await using var acceptance = await db.Database.BeginTransactionAsync(ct);
+            var claimed = await db.LessonRescheduleRequests
+                .Where(x => x.Id == requestId && x.Status == "pending" && x.ExpiresAt > now)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "accepted"), ct);
+            if (claimed == 0)
+                return Results.Conflict(new { message = "This reschedule request is no longer open." });
             request.Status = "accepted";
             request.RespondedById = UserId(p);
             request.RespondedAt = now;
@@ -440,6 +460,7 @@ public static class LessonOperationsEndpoints
                 Audit(db, UserId(p), "reschedule_accepted", "Lesson", replacement.Id,
                     $"Make-up for cancelled lesson {lesson.Id} accepted at {replacement.StartsAt:u}.");
                 await db.SaveChangesAsync(ct);
+                await acceptance.CommitAsync(ct);
 
                 await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById],
                     "Make-up lesson booked", reply, $"/lesson/{replacement.Id}", ct);
@@ -462,16 +483,20 @@ public static class LessonOperationsEndpoints
                 Reason = "Reschedule request accepted",
             });
             var movedTo = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
+            var movedNote = lesson.SeriesId is null
+                ? $"Your lesson moved to {movedTo}."
+                : $"Your lesson moved to {movedTo}. Only this lesson changed — your weekly time stays as booked.";
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 request.RequestedById, "Reschedule accepted",
-                $"Your lesson moved to {movedTo}.",
+                movedNote,
                 "lesson", $"/lesson/{lesson.Id}", $"reschedule-accepted:{request.Id}"));
             Audit(db, UserId(p), "reschedule_accepted", "Lesson", lesson.Id,
                 $"Moved from {previous.StartsAt:u} to {lesson.StartsAt:u}.");
             await db.SaveChangesAsync(ct);
+            await acceptance.CommitAsync(ct);
 
             await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], "Reschedule accepted",
-                $"Your lesson moved to {movedTo}.", $"/lesson/{lesson.Id}", ct);
+                movedNote, $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.Ok(ToReschedule(request, "User", now));
         });
@@ -489,10 +514,21 @@ public static class LessonOperationsEndpoints
             var isMakeup = lesson.Status == "cancelled";
             var responderId = isMakeup ? lesson.StudentId
                 : request.RequestedById == lesson.TeacherId ? lesson.StudentId
-                : request.RequestedById == lesson.StudentId ? lesson.TeacherId
-                : Guid.Empty;
+                : lesson.TeacherId;
             if (UserId(p) != responderId && !IsAdmin(p)) return Results.Forbid();
             if (UserId(p) == request.RequestedById) return Results.Forbid();
+            var now = DateTimeOffset.UtcNow;
+            if (request.ExpiresAt <= now)
+            {
+                await LessonPolicyService.ExpireRescheduleRequestsAsync(db, now, push, realtime, lesson.Id, ct);
+                return Results.Conflict(new { message = "This reschedule request is no longer open." });
+            }
+            await using var decline = await db.Database.BeginTransactionAsync(ct);
+            var claimed = await db.LessonRescheduleRequests
+                .Where(x => x.Id == requestId && x.Status == "pending" && x.ExpiresAt > now)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "declined"), ct);
+            if (claimed == 0)
+                return Results.Conflict(new { message = "This reschedule request is no longer open." });
 
             var note = (input?.Note ?? "").Trim();
             request.Status = "declined";
@@ -510,6 +546,7 @@ public static class LessonOperationsEndpoints
                 request.RequestedById, declineTitle, declineBody,
                 "lesson", $"/lesson/{lesson.Id}", $"reschedule-declined:{request.Id}"));
             await db.SaveChangesAsync(ct);
+            await decline.CommitAsync(ct);
             await LessonOpsMessaging.PushAsync(db, push, [request.RequestedById], declineTitle, declineBody,
                 $"/lesson/{lesson.Id}", ct);
             await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
@@ -517,16 +554,23 @@ public static class LessonOperationsEndpoints
         });
 
         api.MapPost("/reschedule-requests/{requestId:guid}/cancel", async (
-            Guid requestId, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
+            Guid requestId, ClaimsPrincipal p, AcademyDbContext db,
+            AcademyPushSender push, RealtimeNotifier realtime, CancellationToken ct) =>
         {
-            var request = await db.LessonRescheduleRequests.FirstOrDefaultAsync(x => x.Id == requestId, ct);
+            var request = await db.LessonRescheduleRequests.AsNoTracking().Include(x => x.Lesson)
+                .FirstOrDefaultAsync(x => x.Id == requestId, ct);
             if (request is null) return Results.NotFound();
-            if (request.Status != "pending")
-                return Results.Conflict(new { message = "This reschedule request is no longer open." });
             if (request.RequestedById != UserId(p) && !IsAdmin(p)) return Results.Forbid();
-            request.Status = "cancelled";
-            request.RespondedAt = DateTimeOffset.UtcNow;
-            await db.SaveChangesAsync(ct);
+            var now = DateTimeOffset.UtcNow;
+            await LessonPolicyService.ExpireRescheduleRequestsAsync(db, now, push, realtime, request.LessonId, ct);
+            var changed = await db.LessonRescheduleRequests
+                .Where(x => x.Id == requestId && x.Status == "pending" && x.ExpiresAt > now)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "cancelled")
+                    .SetProperty(x => x.RespondedAt, now), ct);
+            if (changed == 0)
+                return Results.Conflict(new { message = "This reschedule request is no longer open." });
+            var lesson = request.Lesson!;
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
             return Results.NoContent();
         });
 
@@ -542,6 +586,8 @@ public static class LessonOperationsEndpoints
             if (!IsAdmin(p)) return Results.Forbid();
             if (original.Status != "cancelled")
                 return Results.Conflict(new { message = "A replacement can only be created for a cancelled lesson." });
+            if (original.CancellationOutcome is "series_ended" or "series_rescheduled")
+                return Results.Conflict(new { message = "A released weekly time is not eligible for a make-up lesson." });
             if (await db.Lessons.AnyAsync(x => x.OriginalLessonId == id && x.Status != "cancelled", ct))
                 return Results.Conflict(new { message = "This cancelled lesson already has an active replacement." });
 
@@ -599,7 +645,7 @@ public static class LessonOperationsEndpoints
 
         api.MapPost("/lessons/{id:guid}/attendance/events", async (
             Guid id, AttendanceBeatRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            RealtimeNotifier realtime, CancellationToken ct) =>
+            RealtimeNotifier realtime, IConfiguration config, CancellationToken ct) =>
         {
             var lesson = await LoadLessonAsync(db, id, ct);
             if (lesson is null) return Results.NotFound();
@@ -645,6 +691,7 @@ public static class LessonOperationsEndpoints
                 .Where(x => x.LessonId == lesson.Id && x.UserId == userId).ToListAsync(ct);
             if (action == "join")
             {
+                await TranscriptCaptureEndpoints.ExpectAsync(db, config, lesson, userId, now, ct);
                 var open = intervals.FirstOrDefault(x => x.LeftAt is null && x.DeviceId == deviceId);
                 if (open is null)
                 {
@@ -774,13 +821,18 @@ public static class LessonOperationsEndpoints
 
         api.MapPost("/lessons/{id:guid}/incident", async (
             Guid id, ReportIncidentRequest input, ClaimsPrincipal p, AcademyDbContext db,
-            AcademyPushSender push, CancellationToken ct) =>
+            IConfiguration config, AcademyPushSender push, CancellationToken ct) =>
         {
+            var type = (input.Type ?? "attendance_dispute").Trim().ToLowerInvariant();
+            var conductConcern = type == "conduct_concern";
+            if (conductConcern && !config.GetValue<bool>("LessonRoom:ReportConcern")) return Results.NotFound();
             var lesson = await LoadLessonAsync(db, id, ct);
             if (lesson is null) return Results.NotFound();
             if (lesson.TeacherId != UserId(p) && lesson.StudentId != UserId(p)) return Results.Forbid();
-            var type = (input.Type ?? "attendance_dispute").Trim().ToLowerInvariant();
-            if (type is not ("attendance_dispute" or "potential_teacher_no_show" or "potential_student_no_show"))
+            if (conductConcern && (lesson.StudentId != UserId(p) || lesson.TeacherId == UserId(p)
+                || !p.IsInRole("student") || p.IsInRole("teacher") || IsAdmin(p) || p.IsInRole("support")))
+                return Results.Forbid();
+            if (type is not ("attendance_dispute" or "potential_teacher_no_show" or "potential_student_no_show" or "conduct_concern"))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["type"] = ["Unknown incident type."] });
             var detail = (input.Detail ?? "").Trim();
             if (detail.Length is < 5 or > 1000)
@@ -798,16 +850,39 @@ public static class LessonOperationsEndpoints
             };
             db.LessonIncidents.Add(incident);
             var admins = await LessonOpsMessaging.AdminUserIdsAsync(db, ct);
+            if (conductConcern)
+            {
+                var teacherRoleIds = db.Roles.Where(x => x.NormalizedName == "TEACHER").Select(x => x.Id);
+                var teachers = await db.UserRoles.Where(x => admins.Contains(x.UserId) && teacherRoleIds.Contains(x.RoleId))
+                    .Select(x => x.UserId).ToListAsync(ct);
+                admins.RemoveAll(x => x == lesson.TeacherId || x == lesson.StudentId || teachers.Contains(x));
+            }
             var reporter = lesson.StudentId == UserId(p) ? lesson.Student : lesson.Teacher;
-            var body = LessonOpsMessaging.LessonSummary(
-                lesson, $"{reporter?.FullName ?? "A participant"} reported: {detail}");
+            var title = conductConcern ? "Lesson conduct concern" : "Lesson attendance issue";
+            // Keep confidential text in the authenticated incident workflow only,
+            // never in notification previews, push payloads, email, or audit logs.
+            var body = conductConcern
+                ? $"{reporter?.FullName ?? "A student"} submitted a confidential lesson conduct concern. Open the lesson to review it."
+                : LessonOpsMessaging.LessonSummary(lesson, $"{reporter?.FullName ?? "A participant"} reported: {detail}");
             var link = LessonOpsMessaging.LessonLink(lesson);
             foreach (var adminId in admins)
                 db.Notifications.Add(LessonOpsMessaging.Notice(
-                    adminId, "Lesson attendance issue", body, "lesson", link,
+                    adminId, title, body, "lesson", link,
                     $"incident-admin:{incident.Id}:{adminId}"));
-            await db.SaveChangesAsync(ct);
-            await LessonOpsMessaging.PushAsync(db, push, admins, "Lesson attendance issue", body, link, ct);
+            try
+            {
+                await db.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException ex) when (conductConcern
+                && ex.InnerException is Npgsql.PostgresException
+                {
+                    SqlState: Npgsql.PostgresErrorCodes.UniqueViolation,
+                    ConstraintName: "IX_LessonIncidents_LessonId_Type",
+                })
+            {
+                return Results.Conflict(new { message = "This issue was already reported for the lesson." });
+            }
+            await LessonOpsMessaging.PushAsync(db, push, admins, title, body, link, ct);
             return Results.Ok(ToIncident(incident, lesson));
         });
 
@@ -1180,7 +1255,7 @@ public static class LessonOperationsEndpoints
         var admin = app.MapGroup("/api/admin").RequireAuthorization("AdminOnly");
 
         // ------------------------------------------------------- live dashboard
-        admin.MapGet("/lesson-ops", async (string? date, AcademyDbContext db, CancellationToken ct) =>
+        admin.MapGet("/lesson-ops", async (string? date, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
         {
             var now = DateTimeOffset.UtcNow;
             var (dayStart, dayEnd, key) = LessonPolicyService.DayBounds(date, now);
@@ -1197,7 +1272,7 @@ public static class LessonOperationsEndpoints
             var requesterNames = await NamesAsync(db, pendingReschedules.Select(x => x.RequestedById), ct);
             var hours = await db.TeacherHours.AsNoTracking()
                 .Where(x => ids.Contains(x.LessonId)).ToDictionaryAsync(x => x.LessonId, ct);
-            var incidents = await db.LessonIncidents.AsNoTracking()
+            var incidents = await VisibleIncidents(db, p).AsNoTracking()
                 .Where(x => ids.Contains(x.LessonId)).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
 
             var rows = new List<LessonOpsLessonDto>();
@@ -1228,13 +1303,13 @@ public static class LessonOperationsEndpoints
                 missing,
                 await db.LessonRescheduleRequests.CountAsync(x => x.Status == "pending" && x.ExpiresAt > now, ct),
                 await db.LessonExcuseRequests.CountAsync(x => x.Status == "pending", ct),
-                await db.LessonIncidents.CountAsync(x => x.Status == "open", ct),
+                await VisibleIncidents(db, p).CountAsync(x => x.Status == "open", ct),
                 await db.TeacherHours.CountAsync(x => x.ApprovalStatus == "pending" && x.Lesson != null && x.Lesson.EndsAt <= now, ct));
 
             return Results.Ok(new AdminLessonOpsDto(key, summary, rows));
         });
 
-        admin.MapGet("/lesson-ops/{lessonId:guid}", async (Guid lessonId, AcademyDbContext db, CancellationToken ct) =>
+        admin.MapGet("/lesson-ops/{lessonId:guid}", async (Guid lessonId, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
         {
             var lesson = await LoadLessonAsync(db, lessonId, ct);
             if (lesson is null) return Results.NotFound();
@@ -1249,7 +1324,7 @@ public static class LessonOperationsEndpoints
                 .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
             var names = await NamesAsync(db, requests.Select(x => x.RequestedById), ct);
             var hours = await db.TeacherHours.AsNoTracking().FirstOrDefaultAsync(x => x.LessonId == lessonId, ct);
-            var incidents = await db.LessonIncidents.AsNoTracking()
+            var incidents = await VisibleIncidents(db, p).AsNoTracking()
                 .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
             var excuse = await db.LessonExcuseRequests.AsNoTracking().Include(x => x.Student).Include(x => x.Lesson)
                 .Where(x => x.LessonId == lessonId).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync(ct);
@@ -1357,9 +1432,9 @@ public static class LessonOperationsEndpoints
         });
 
         // ------------------------------------------------------------ incidents
-        admin.MapGet("/lesson-incidents", async (string? status, AcademyDbContext db, CancellationToken ct) =>
+        admin.MapGet("/lesson-incidents", async (string? status, ClaimsPrincipal p, AcademyDbContext db, CancellationToken ct) =>
         {
-            var q = db.LessonIncidents.AsNoTracking()
+            var q = VisibleIncidents(db, p).AsNoTracking()
                 .Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
                 .AsQueryable();
@@ -1377,9 +1452,29 @@ public static class LessonOperationsEndpoints
                 .Include(x => x.Lesson).ThenInclude(x => x!.Student)
                 .FirstOrDefaultAsync(x => x.Id == id, ct);
             if (incident?.Lesson is null) return Results.NotFound();
+            if (incident.Type == "conduct_concern"
+                && (p.IsInRole("teacher") || incident.Lesson.TeacherId == UserId(p))) return Results.Forbid();
             if (incident.Status != "open")
                 return Results.Conflict(new { message = "This incident was already resolved." });
             var action = (input.Action ?? "").Trim().ToLowerInvariant();
+            if (incident.Type == "conduct_concern")
+            {
+                if (action is not ("resolved" or "dismissed"))
+                    return Results.ValidationProblem(new Dictionary<string, string[]>
+                    {
+                        ["action"] = ["Choose resolved or dismissed for a conduct concern. Attendance and penalties are reviewed separately."],
+                    });
+                incident.Status = action;
+                incident.ResolvedBy = UserId(p);
+                incident.ResolvedAt = DateTimeOffset.UtcNow;
+                var resolutionNote = (input.Note ?? "").Trim();
+                incident.ResolutionNote = resolutionNote.Length == 0 ? null : resolutionNote[..Math.Min(resolutionNote.Length, 1000)];
+                Audit(db, UserId(p), "conduct_concern_resolved", "LessonIncident", incident.Id, $"Marked {action}.");
+                await db.SaveChangesAsync(ct);
+                // Never publish to participants or copy confidential notes into
+                // cancellation, reliability, compensation, or notification records.
+                return Results.Ok(ToIncident(incident, incident.Lesson));
+            }
             if (action is not ("student_no_show" or "teacher_no_show" or "both_absent" or "dismissed"))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["action"] = ["Choose student_no_show, teacher_no_show, both_absent, or dismissed."] });
 

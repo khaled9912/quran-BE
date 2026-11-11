@@ -143,14 +143,23 @@ picked someone else, and the student's remaining offers are withdrawn.
 | POST | `/student/series/{seriesId}/change-requests` | Student; `{ requestedRuleId, note? }` |
 | GET | `/admin/change-requests[?status=applied\|pending\|approved\|rejected]` | Admin; read-only history |
 
-The student may only move to another open rule of the same teacher. The move is
-applied inside a serializable transaction — the series is retargeted, its future
-lessons are deleted and materialized again — and returns `409` when the slot is
-booked, overlaps another of the student's weekly times, or was taken a moment
-earlier. Status is `applied`; `pending`, `approved` and `rejected` only exist on
-rows the removed approval queue left behind, and any row still `pending` is
-settled at start-up. The student, the teacher and every admin are notified after
-the change; none of them decides it.
+The student may only move the selected series to another open, published rule
+of the **same teacher**. The move applies immediately inside a serializable
+transaction with conflict and configured lead-time checks. Only that series is
+retargeted: its future `scheduled` lessons are cancelled with outcome
+`series_rescheduled`, not deleted, their pending occurrence proposals close, and
+lessons are materialized at the new weekly time. Other lessons, other series,
+and the student's other booked weekdays remain unchanged. The old weekly slot
+becomes bookable again.
+
+The call returns `409` when the target is booked, overlaps another of the
+student's weekly times, was taken a moment earlier, or fails the configured
+notice window (`Scheduling__TimeChangeLeadMinutes`, default 60 minutes). Status
+is `applied`; `pending`, `approved` and `rejected` are legacy-only values from the
+removed approval queue, and any row still `pending` is settled at start-up. The
+student, teacher, and every admin are notified of the new time. No teacher
+acceptance or admin approval is required; admin change history is read-only.
+This changes the weekly series, unlike a one-lesson reschedule below.
 
 ## Lessons, reports, reviews
 
@@ -194,14 +203,10 @@ student, a teacher, and an admin can call the same route on their own lesson.
 | POST | `/lessons/{id}/cancel` | Participant or admin; `{ reason?, ... }` |
 | GET | `/lessons/{id}/reschedule-requests` | Participant or admin |
 | POST | `/lessons/{id}/reschedule-requests` | Participant or admin; on a cancelled lesson, teacher or admin only |
-| POST | `/reschedule-requests/{requestId}/accept` | Invited participant; the student when the lesson was cancelled |
-| POST | `/reschedule-requests/{requestId}/decline` | Invited participant |
+| POST | `/reschedule-requests/{requestId}/accept` | Responder (see below), or an admin override |
+| POST | `/reschedule-requests/{requestId}/decline` | Responder (see below), or an admin override |
 | POST | `/reschedule-requests/{requestId}/cancel` | Requester |
 | POST | `/lessons/{id}/replacement` | Admin only; direct make-up override, no client calls it |
-
-Accepting a request on a scheduled lesson moves that lesson. Accepting one on a cancelled
-lesson books the make-up (`isMakeup`, `originalLessonId`) instead — the proposal alone books
-nothing, so a rebooked time is only settled once the student replies.
 | GET | `/lessons/{id}/attendance` | Participant or admin |
 | POST | `/lessons/{id}/attendance/events` | Participant; idempotent `eventId` |
 | GET | `/lessons/{id}/excuse` | Participant or admin |
@@ -214,6 +219,19 @@ nothing, so a rebooked time is only settled once the student replies.
 | GET | `/teacher/reliability` | Teacher |
 | GET | `/teacher/hours` | Teacher; actual / proposed / approved |
 | GET | `/teacher/salary-periods` | Teacher |
+
+A reschedule request moves **one lesson**, never its weekly series; to move every
+future week, use the weekly time change above. Accepting a request on a scheduled
+lesson moves that lesson, and only before the original lesson starts. Accepting one
+on a cancelled lesson books the make-up (`isMakeup`, `originalLessonId`) instead —
+the proposal alone books nothing, so a rebooked time is only settled once the
+student replies.
+
+The responder is the student for every make-up proposal, whoever raised it. For a
+normal reschedule it is the participant who did not ask, so an admin-originated
+proposal is answered by the teacher. Admins can accept or decline as an override but
+never answer their own proposal. Lessons released by a weekly change or series end
+(`series_rescheduled`, `series_ended`) cannot receive a make-up (`409`).
 
 Admin queues:
 

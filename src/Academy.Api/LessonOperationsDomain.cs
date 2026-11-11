@@ -290,7 +290,8 @@ public sealed class LessonIncident
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid LessonId { get; set; }
     public Lesson? Lesson { get; set; }
-    // potential_teacher_no_show | potential_student_no_show | both_absent | attendance_dispute
+    // potential_teacher_no_show | potential_student_no_show | both_absent | attendance_dispute | conduct_concern
+    // conduct_concern detail/resolution are confidential: reporter and authorized staff only, never teachers.
     [MaxLength(40)] public string Type { get; set; } = "";
     // open | resolved | dismissed
     [MaxLength(20)] public string Status { get; set; } = "open";

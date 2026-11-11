@@ -54,6 +54,7 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
     public DbSet<Lesson> Lessons => Set<Lesson>();
     public DbSet<ContactSubmission> ContactSubmissions => Set<ContactSubmission>();
     public DbSet<LessonTranscriptSegment> LessonTranscriptSegments => Set<LessonTranscriptSegment>();
+    public DbSet<LessonTranscriptCapture> LessonTranscriptCaptures => Set<LessonTranscriptCapture>();
     public DbSet<LessonQualityReview> LessonQualityReviews => Set<LessonQualityReview>();
     public DbSet<TranscriptAccessLog> TranscriptAccessLogs => Set<TranscriptAccessLog>();
     public DbSet<UserAvatar> UserAvatars => Set<UserAvatar>();
@@ -93,6 +94,14 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         b.Entity<LessonTranscriptSegment>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LessonTranscriptSegment>().HasIndex(x => new { x.LessonId, x.CreatedAt });
         b.Entity<LessonTranscriptSegment>().HasIndex(x => x.Flags).HasFilter("\"Flags\" <> ''");
+        b.Entity<LessonTranscriptSegment>().HasIndex(x => x.CreatedAt);
+        b.Entity<LessonTranscriptSegment>().HasIndex(x => new { x.LessonId, x.SourceUserId, x.ClientSegmentId }).IsUnique();
+        // Read boundaries still expire text while the host is asleep between cleanup runs.
+        b.Entity<LessonTranscriptSegment>().HasQueryFilter(x => x.CreatedAt >= DateTimeOffset.UtcNow.AddDays(-30));
+        b.Entity<LessonTranscriptCapture>().HasKey(x => new { x.LessonId, x.UserId });
+        b.Entity<LessonTranscriptCapture>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<LessonTranscriptCapture>().HasIndex(x => x.FirstSeenAt);
+        b.Entity<LessonTranscriptCapture>().HasQueryFilter(x => x.FirstSeenAt >= DateTimeOffset.UtcNow.AddDays(-30));
         b.Entity<LessonQualityReview>().HasOne(x => x.Lesson).WithOne().HasForeignKey<LessonQualityReview>(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LessonQualityReview>().HasOne(x => x.Reviewer).WithMany().HasForeignKey(x => x.ReviewerId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<LessonQualityReview>().HasIndex(x => x.LessonId).IsUnique();
@@ -141,7 +150,9 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         b.Entity<Lesson>().HasOne(x => x.LessonRequest).WithMany().HasForeignKey(x => x.LessonRequestId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<Lesson>().HasOne(x => x.Series).WithMany().HasForeignKey(x => x.SeriesId).OnDelete(DeleteBehavior.SetNull);
         b.Entity<Lesson>().HasIndex(x => x.LessonRequestId).IsUnique();
-        b.Entity<Lesson>().HasIndex(x => new { x.SeriesId, x.StartsAt }).IsUnique().HasFilter("\"SeriesId\" IS NOT NULL");
+        b.Entity<Lesson>().HasIndex(x => new { x.SeriesId, x.StartsAt })
+            .HasDatabaseName("IX_Lessons_SeriesId_StartsAt_Current").IsUnique()
+            .HasFilter("\"SeriesId\" IS NOT NULL AND (\"CancellationOutcome\" IS NULL OR \"CancellationOutcome\" <> 'series_rescheduled')");
         b.Entity<Lesson>().HasIndex(x => new { x.TeacherId, x.StartsAt, x.EndsAt });
         b.Entity<Lesson>().HasIndex(x => new { x.StudentId, x.StartsAt, x.EndsAt });
         b.Entity<AppNotification>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);

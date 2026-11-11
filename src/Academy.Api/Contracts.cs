@@ -50,9 +50,9 @@ public sealed record LessonReportDto(Guid Id, Guid LessonId, DateTimeOffset Star
 public sealed record TeacherReviewDto(Guid Id, Guid LessonId, DateTimeOffset StartsAt, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int Rating, string? Comment, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record PublicTeacherDto(Guid Id, string FullName, string? AvatarUrl, double? AverageRating, int ReviewCount, IReadOnlyList<TeacherReviewDto> Reviews);
 public sealed record LessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, DateTimeOffset? ActualStartedAt, DateTimeOffset? ActualEndedAt, LessonReportDto? Report, TeacherReviewDto? Review, Guid? SeriesId = null, bool IsTrial = false, string? CancellationOutcome = null, string? CancelReason = null, DateTimeOffset? CancelledAt = null, Guid? CancelledById = null, bool IsMakeup = false, Guid? OriginalLessonId = null);
-public sealed record WeeklyRuleDto(Guid Id, Guid TeacherId, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, string Status);
+public sealed record WeeklyRuleDto(Guid Id, Guid TeacherId, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, string Status, DateTimeOffset? NextStartsAt = null);
 public sealed record LessonSeriesDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId, bool IsActive, DateTimeOffset CreatedAt);
-public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<WeeklyRuleDto> Slots, IReadOnlyList<LessonSeriesDto> Series, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null, bool HasLessons = false);
+public sealed record WeeklyAvailabilityDto(UserDto? Teacher, IReadOnlyList<WeeklyRuleDto> Slots, IReadOnlyList<LessonSeriesDto> Series, double? AverageRating = null, int ReviewCount = 0, IReadOnlyList<TeacherReviewDto>? Reviews = null, bool HasLessons = false, int TimeChangeLeadMinutes = 0);
 public sealed record LessonChangeRequestDto(Guid Id, Guid SeriesId, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, int CurrentDayOfWeek, string CurrentStartsAtTime, string CurrentEndsAtTime, int RequestedDayOfWeek, string RequestedStartsAtTime, string RequestedEndsAtTime, string TimeZoneId, string Status, string? StudentNote, string? AdminNote, DateTimeOffset CreatedAt, DateTimeOffset? AdminRespondedAt);
 public sealed record TeacherApplicationDto(Guid Id, string FullName, string Email, string PhoneNumber, IReadOnlyList<string> Subjects, string EnglishLevel, int ExperienceYears, string Bio, string AvailabilityNote, string Status, string? RejectionReason, DateTimeOffset CreatedAt, DateTimeOffset? ReviewedAt, Guid? TeacherId, string? CvFileName, string? IntroFileName, string? QuranRecordingFileName);
 
@@ -226,7 +226,11 @@ public sealed record LessonIncidentDto(
     string Detail,
     DateTimeOffset CreatedAt,
     DateTimeOffset? ResolvedAt,
-    string? ResolutionNote);
+    string? ResolutionNote,
+    // Null when the lesson-ops monitor filed the row from room presence rather
+    // than a person. Participants need the difference: a machine noticing a
+    // no-show is not the other side complaining about them.
+    Guid? ReportedBy);
 
 public sealed record TeacherHoursDto(
     Guid Id,
@@ -352,7 +356,10 @@ public sealed record LessonOperationsDto(
     AttendanceSummaryDto Attendance,
     TeacherHoursDto? Hours,
     ExcuseRequestDto? Excuse,
-    LessonIncidentDto? Incident,
+    // Every report on the lesson, newest first. One row per lesson used to mean
+    // the newest report — whoever filed it, or the monitor — replaced the
+    // participant's own in the panel and locked them out of reporting.
+    IReadOnlyList<LessonIncidentDto> Incidents,
     LessonDto? ReplacementLesson,
     LessonDto? OriginalLesson,
     IReadOnlyList<LessonCallDto> Calls);

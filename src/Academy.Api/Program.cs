@@ -196,6 +196,10 @@ builder.Services.AddRateLimiter(options =>
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
     // The transcript relay posts with a shared server key, so this is the only
     // thing standing between a leaked key and an unbounded insert loop.
+    options.AddPolicy("self-transcripts", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 30, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
     options.AddPolicy("transcripts", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
@@ -217,6 +221,7 @@ else
     builder.Services.AddSingleton<IOtpSender, UnconfiguredOtpSender>();
 builder.Services.AddHealthChecks().AddDbContextCheck<AcademyDbContext>("database");
 builder.Services.AddHostedService<LessonOpsMonitor>();
+builder.Services.AddHostedService<TranscriptRetention>();
 builder.Services.AddSignalR();
 builder.Services.AddSingleton<RealtimeTicketService>();
 builder.Services.AddSingleton<RealtimeNotifier>();
@@ -257,7 +262,6 @@ app.Use(async (context, next) =>
     headers["Referrer-Policy"] = "no-referrer";
     await next();
 });
-app.UseRateLimiter();
 // Reject browser-originated state changes from origins outside the configured frontend origins.
 app.Use(async (context, next) =>
 {
@@ -273,6 +277,7 @@ app.Use(async (context, next) =>
     await next();
 });
 app.UseAuthentication();
+app.UseRateLimiter();
 app.UseAuthorization();
 // A successful mutation makes the caller's screens and the staff dashboards
 // stale. Participants on the other side of a lesson change are notified
@@ -283,6 +288,8 @@ app.Use(async (context, next) =>
     if (context.Request.Method is "GET" or "HEAD" or "OPTIONS") return;
     if (context.Response.StatusCode is < 200 or >= 300) return;
     if (context.User?.Identity?.IsAuthenticated != true) return;
+    // Capture heartbeats must not refresh every staff dashboard every 15 seconds.
+    if (context.Request.Path.Value?.EndsWith("/transcript/self", StringComparison.OrdinalIgnoreCase) == true) return;
 
     var notifier = context.RequestServices.GetRequiredService<RealtimeNotifier>();
     // Staff dashboards are the one view every mutation can affect; participant
@@ -292,11 +299,13 @@ app.Use(async (context, next) =>
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "ana-quran-academy-api" })).AllowAnonymous();
 app.MapHealthChecks("/health/ready").AllowAnonymous();
+app.MapLessonRoomConfig();
 app.MapRealtime();
 app.MapAcademyApi();
 app.MapLessonOperations();
 app.MapTeacherApplications();
 app.MapLessonReviews();
+app.MapTranscriptCapture();
 app.MapPayments();
 app.MapNotifications();
 
@@ -465,7 +474,6 @@ await using (var scope = app.Services.CreateAsyncScope())
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "SeriesId" uuid;
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "IsTrial" boolean NOT NULL DEFAULT FALSE;
         ALTER TABLE "Lessons" ALTER COLUMN "LessonRequestId" DROP NOT NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS "IX_Lessons_SeriesId_StartsAt" ON "Lessons" ("SeriesId", "StartsAt") WHERE "SeriesId" IS NOT NULL;
         CREATE INDEX IF NOT EXISTS "IX_Lessons_SeriesId" ON "Lessons" ("SeriesId");
         DO $$
         BEGIN
@@ -487,6 +495,27 @@ await using (var scope = app.Services.CreateAsyncScope())
         );
         CREATE INDEX IF NOT EXISTS "IX_LessonTranscriptSegments_LessonId_CreatedAt" ON "LessonTranscriptSegments" ("LessonId", "CreatedAt");
         CREATE INDEX IF NOT EXISTS "IX_LessonTranscriptSegments_Flags" ON "LessonTranscriptSegments" ("Flags") WHERE "Flags" <> '';
+        ALTER TABLE "LessonTranscriptSegments" ADD COLUMN IF NOT EXISTS "Source" character varying(10) NOT NULL DEFAULT 'server';
+        ALTER TABLE "LessonTranscriptSegments" ADD COLUMN IF NOT EXISTS "SourceUserId" uuid;
+        ALTER TABLE "LessonTranscriptSegments" ADD COLUMN IF NOT EXISTS "ClientSegmentId" uuid;
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_LessonTranscriptSegments_LessonId_SourceUserId_ClientSegmentId"
+            ON "LessonTranscriptSegments" ("LessonId", "SourceUserId", "ClientSegmentId");
+        CREATE INDEX IF NOT EXISTS "IX_LessonTranscriptSegments_CreatedAt" ON "LessonTranscriptSegments" ("CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "LessonTranscriptCaptures" (
+            "LessonId" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "Role" character varying(20) NOT NULL,
+            "LastStatus" character varying(20) NOT NULL,
+            "Expected" boolean NOT NULL DEFAULT FALSE,
+            "FirstSeenAt" timestamp with time zone NOT NULL,
+            "LastSeenAt" timestamp with time zone NOT NULL,
+            "LastSegmentAt" timestamp with time zone,
+            "SegmentCount" integer NOT NULL DEFAULT 0,
+            CONSTRAINT "PK_LessonTranscriptCaptures" PRIMARY KEY ("LessonId", "UserId"),
+            CONSTRAINT "FK_LessonTranscriptCaptures_Lessons_LessonId" FOREIGN KEY ("LessonId") REFERENCES "Lessons" ("Id") ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS "IX_LessonTranscriptCaptures_FirstSeenAt" ON "LessonTranscriptCaptures" ("FirstSeenAt");
 
         CREATE TABLE IF NOT EXISTS "LessonQualityReviews" (
             "Id" uuid NOT NULL,
@@ -629,6 +658,9 @@ await using (var scope = app.Services.CreateAsyncScope())
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancelledAt" timestamp with time zone;
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "IsMakeup" boolean NOT NULL DEFAULT FALSE;
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "OriginalLessonId" uuid;
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_Lessons_SeriesId_StartsAt_Current" ON "Lessons" ("SeriesId", "StartsAt")
+            WHERE "SeriesId" IS NOT NULL AND ("CancellationOutcome" IS NULL OR "CancellationOutcome" <> 'series_rescheduled');
+        DROP INDEX IF EXISTS "IX_Lessons_SeriesId_StartsAt";
         CREATE INDEX IF NOT EXISTS "IX_Lessons_OriginalLessonId" ON "Lessons" ("OriginalLessonId");
         ALTER TABLE "AspNetUsers" ADD COLUMN IF NOT EXISTS "Grade" character varying(20);
 

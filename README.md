@@ -14,7 +14,7 @@ A lean .NET 10 Web API for the Next.js App Router frontend and the Expo mobile a
 - Profiles, avatars, and teacher directory with ratings and reviews.
 - Teacher-published **weekly availability rules** and instant student booking of any number of times; one active teacher per student.
 - Permanent weekly series with 8 weeks of lessons materialized ahead and rolled forward; the first lesson is a trial.
-- Open student offers (one-off times claimed by the first accepting teacher) and admin-mediated weekly time changes.
+- Open student offers (one-off times claimed by the first accepting teacher) and immediate, self-service weekly time changes.
 - Lesson list/detail, post-lesson teacher reports, and one 1–5 star student review per lesson.
 - Lesson operations: policy-driven cancellations, credits, reschedules, make-up lessons, attendance beacons, excuses, incidents, reliability events, penalties, teacher hours, and salary periods.
 - Monthly student billing in USD (claims and admin confirmation) and teacher earnings in EGP with payout details.
@@ -94,9 +94,11 @@ The first-run setup uses `EnsureCreated` to create the initial schema and seed r
 
 **No teacher yet:** a student without an active teacher publishes one-off open offers; the first teacher to accept books one and becomes their teacher.
 
-**Moving a weekly time:** the student requests another open rule of the same teacher → the admin queue handles it. The teacher is notified that a review is happening but does not see the requested time until the admin approves.
+**Moving a weekly time:** the student picks another open rule of the same teacher → the API moves that one series immediately. Its future lessons are cancelled as `series_rescheduled` (kept, not deleted) and rebuilt at the new time; other booked weekdays are untouched. The teacher, student, and admins are notified; nobody approves it. Example: with Monday and Thursday booked, moving Monday to Wednesday leaves Wednesday and Thursday.
 
-**Ending a series:** the student ends it themselves; future lessons are cancelled and the slot becomes bookable again.
+**Moving one lesson:** a reschedule request on a single lesson needs the other side's acceptance before it starts and never changes the weekly series.
+
+**Ending a series:** the student ends it themselves; future lessons are cancelled as `series_ended`, pending requests close, and the slot becomes bookable again.
 
 Legacy one-off availability and `/api/lesson-requests` approval endpoints are still mounted for compatibility but are not used by the current web or mobile clients.
 

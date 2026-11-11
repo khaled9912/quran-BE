@@ -66,11 +66,13 @@ public sealed class SecurityCollection : ICollectionFixture<PostgresFixture>
 /// own API host, so a rate-limit window or a seeded login cannot bleed into the
 /// next class.
 /// </summary>
-public abstract class ApiTestBase(PostgresFixture postgres) : IAsyncDisposable
+public abstract class ApiTestBase(PostgresFixture postgres) : IAsyncLifetime
 {
     protected ApiFactory Factory { get; } = new(postgres);
 
-    public async ValueTask DisposeAsync()
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    public async Task DisposeAsync()
     {
         await Factory.DisposeAsync();
         GC.SuppressFinalize(this);
@@ -170,6 +172,15 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
         // trail's source IP could never be observed without putting one on the request.
         builder.ConfigureTestServices(services => services.AddSingleton<IStartupFilter>(
             new RemoteAddressFilter(IPAddress.Parse(TestRemoteAddress))));
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await base.DisposeAsync();
+        if (_connectionString.Length == 0) return;
+        // A test database's pool must not outlive its host.
+        using var connection = new Npgsql.NpgsqlConnection(_connectionString);
+        Npgsql.NpgsqlConnection.ClearPool(connection);
     }
 
     private static void Set(string name, string value) => Environment.SetEnvironmentVariable(name, value);

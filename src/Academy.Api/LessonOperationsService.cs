@@ -22,6 +22,52 @@ public static class LessonPolicyService
         return policy;
     }
 
+    public static async Task ExpireRescheduleRequestsAsync(
+        AcademyDbContext db, DateTimeOffset now, AcademyPushSender push, RealtimeNotifier realtime,
+        Guid? lessonId = null, CancellationToken ct = default)
+    {
+        var expiring = await db.LessonRescheduleRequests.AsNoTracking()
+            .Include(x => x.Lesson).ThenInclude(x => x!.Teacher)
+            .Include(x => x.Lesson).ThenInclude(x => x!.Student)
+            .Include(x => x.Lesson).ThenInclude(x => x!.Series)
+            .Where(x => x.Status == "pending" && x.ExpiresAt <= now
+                && (lessonId == null || x.LessonId == lessonId))
+            .ToListAsync(ct);
+
+        foreach (var request in expiring)
+        {
+            var lesson = request.Lesson!;
+            AppNotification notice;
+            await using (var tx = await db.Database.BeginTransactionAsync(ct))
+            {
+                // The conditional update and notice commit together, even when two callers race.
+                var changed = await db.LessonRescheduleRequests
+                    .Where(x => x.Id == request.Id && x.Status == "pending" && x.ExpiresAt <= now)
+                    .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "expired")
+                        .SetProperty(x => x.RespondedAt, now), ct);
+                if (changed == 0) continue;
+
+                var isMakeup = lesson.Status == "cancelled";
+                var waitedFor = isMakeup || request.RequestedById == lesson.TeacherId
+                    ? lesson.Student?.FullName ?? "The student"
+                    : lesson.Teacher?.FullName ?? "The teacher";
+                var when = LessonOpsMessaging.When(request.ProposedStartsAt, lesson.Series?.TimeZoneId);
+                var title = isMakeup ? "Make-up proposal expired" : "Reschedule request expired";
+                var body = isMakeup
+                    ? $"{waitedFor} did not reply to your make-up proposal for {when}. No make-up was booked; you can propose another time."
+                    : $"{waitedFor} did not reply to your proposal for {when}. This request did not change the lesson time. Open the lesson for its current schedule.";
+                notice = LessonOpsMessaging.Notice(request.RequestedById, title, body,
+                    "lesson", $"/lesson/{lesson.Id}", $"reschedule-expired:{request.Id}");
+                db.Notifications.Add(notice);
+                await db.SaveChangesAsync(ct);
+                await tx.CommitAsync(ct);
+            }
+            await LessonOpsMessaging.PushAsync(db, push, [notice.UserId], notice.Title, notice.Body, notice.Link, ct);
+            await realtime.ToUserAsync(notice.UserId, RealtimeScopes.Notifications);
+            await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lesson.Id);
+        }
+    }
+
     public static AcademyPolicyDto ToDto(AcademyPolicy p) => new(
         p.StudentFreeCancelHours,
         p.TeacherFreeCancelHours,

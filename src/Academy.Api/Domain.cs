@@ -216,21 +216,34 @@ public sealed class TeacherReview
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
-/// <summary>
-/// One transcribed utterance, posted by the Jitsi-side capture bot. Segments are
-/// append-only; flags mark attempts to move a lesson off-platform for admin review.
-/// </summary>
 public sealed class LessonTranscriptSegment
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid LessonId { get; set; }
     public Lesson? Lesson { get; set; }
     [MaxLength(120)] public string Speaker { get; set; } = "";
+    [MaxLength(10)] public string Source { get; set; } = "server";
+    public Guid? SourceUserId { get; set; }
+    public Guid? ClientSegmentId { get; set; }
     [MaxLength(4000)] public string Text { get; set; } = "";
     public double? AtSeconds { get; set; }
-    // Comma-separated categories: phone, email, platform, offplatform
+    // Comma-separated categories: phone, email, platform, offplatform, payment, secrecy
     [MaxLength(120)] public string Flags { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class LessonTranscriptCapture
+{
+    public Guid LessonId { get; set; }
+    public Lesson? Lesson { get; set; }
+    public Guid UserId { get; set; }
+    [MaxLength(20)] public string Role { get; set; } = "";
+    [MaxLength(20)] public string LastStatus { get; set; } = "awaiting";
+    public bool Expected { get; set; }
+    public DateTimeOffset FirstSeenAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset LastSeenAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? LastSegmentAt { get; set; }
+    public int SegmentCount { get; set; }
 }
 
 /// <summary>

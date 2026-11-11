@@ -51,13 +51,7 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
         var now = DateTimeOffset.UtcNow;
         var policy = await LessonPolicyService.GetPolicyAsync(db, ct);
 
-        // Requests that ran out of time without a reply.
-        var expiredLessonIds = await db.LessonRescheduleRequests
-            .Where(x => x.Status == "pending" && x.ExpiresAt <= now)
-            .Select(x => x.LessonId).Distinct().ToListAsync(ct);
-        await db.LessonRescheduleRequests
-            .Where(x => x.Status == "pending" && x.ExpiresAt <= now)
-            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "expired"), ct);
+        await LessonPolicyService.ExpireRescheduleRequestsAsync(db, now, push, realtime, ct: ct);
 
         var pushJobs = new List<(Guid UserId, string Title, string Body, string Link)>();
         var adminIds = new List<Guid>();
@@ -262,13 +256,6 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
                 }
                 await realtime.ToStaffAsync(RealtimeScopes.Admin);
             }
-        }
-
-        foreach (var lessonId in expiredLessonIds)
-        {
-            var lesson = await db.Lessons.AsNoTracking().FirstOrDefaultAsync(x => x.Id == lessonId, ct);
-            if (lesson is not null)
-                await realtime.ToParticipantsAsync(lesson.TeacherId, lesson.StudentId, RealtimeScopes.Lessons, lessonId);
         }
 
         foreach (var userId in pushJobs.Select(x => x.UserId).Distinct())
