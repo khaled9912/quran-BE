@@ -226,7 +226,11 @@ public sealed record LessonIncidentDto(
     string Detail,
     DateTimeOffset CreatedAt,
     DateTimeOffset? ResolvedAt,
-    string? ResolutionNote);
+    string? ResolutionNote,
+    // Null when the lesson-ops monitor filed the row from room presence rather
+    // than a person. Participants need the difference: a machine noticing a
+    // no-show is not the other side complaining about them.
+    Guid? ReportedBy);
 
 public sealed record TeacherHoursDto(
     Guid Id,
@@ -352,7 +356,10 @@ public sealed record LessonOperationsDto(
     AttendanceSummaryDto Attendance,
     TeacherHoursDto? Hours,
     ExcuseRequestDto? Excuse,
-    LessonIncidentDto? Incident,
+    // Every report on the lesson, newest first. One row per lesson used to mean
+    // the newest report — whoever filed it, or the monitor — replaced the
+    // participant's own in the panel and locked them out of reporting.
+    IReadOnlyList<LessonIncidentDto> Incidents,
     LessonDto? ReplacementLesson,
     LessonDto? OriginalLesson,
     IReadOnlyList<LessonCallDto> Calls);

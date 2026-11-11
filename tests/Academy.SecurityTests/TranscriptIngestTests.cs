@@ -90,6 +90,86 @@ public sealed class TranscriptIngestTests(PostgresFixture postgres) : ApiTestBas
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Fact]
+    public async Task ExpandedReasonsAreStoredAndReturnedToReviewers()
+    {
+        var (lessonId, _) = await ParticipantsAsync();
+        const string text = "Can you share your mobile number and share your email? Pay me directly and keep this between us.";
+        using var request = await BuildAsync(lessonId, ApiFactory.IngestKey,
+            [new { speaker = "Teacher", text, atSeconds = 10.0 }]);
+
+        var response = await Factory.Client.SendAsync(request);
+        var result = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(1, result.GetProperty("flagged").GetInt32());
+        var stored = await Factory.WithDbAsync(db => db.LessonTranscriptSegments.SingleAsync(x => x.LessonId == lessonId));
+        Assert.Equal(text, stored.Text);
+        Assert.Equal("phone,email,payment,secrecy", stored.Flags);
+
+        using var reviewer = await Factory.LoginAsync("support");
+        var reviewResponse = await reviewer.GetAsync($"/api/admin/lessons/{lessonId}/transcript");
+        Assert.Equal(HttpStatusCode.OK, reviewResponse.StatusCode);
+        var review = await reviewResponse.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+        var flags = review.GetProperty("segments")[0].GetProperty("flags")
+            .EnumerateArray().Select(x => x.GetString()).ToArray();
+        Assert.Equal(new[] { "phone", "email", "payment", "secrecy" }, flags);
+    }
+
+    [Fact]
+    public async Task JoinsOnlyPreviousTextFromTheSameIdentifiedSpeaker()
+    {
+        var (lessonId, _) = await ParticipantsAsync();
+        using var request = await BuildAsync(lessonId, ApiFactory.IngestKey,
+        [
+            new { speaker = "Teacher", text = "zero one five zero", atSeconds = 0.0 },
+            new { speaker = "Student", text = "one two two three one", atSeconds = 1.0 },
+            new { speaker = "Teacher", text = "one two two three one", atSeconds = 2.0 },
+            new { speaker = "Teacher", text = "Read the page.", atSeconds = 3.0 },
+        ]);
+
+        var response = await Factory.Client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var stored = await Factory.WithDbAsync(db => db.LessonTranscriptSegments
+            .Where(x => x.LessonId == lessonId).OrderBy(x => x.AtSeconds).ToListAsync());
+        Assert.Equal(new[] { "", "", "phone", "" }, stored.Select(x => x.Flags));
+        Assert.Equal("one two two three one", stored[2].Text);
+    }
+
+    [Fact]
+    public async Task DoesNotCombineUnknownSpeakers()
+    {
+        var (lessonId, _) = await ParticipantsAsync();
+        using var request = await BuildAsync(lessonId, ApiFactory.IngestKey,
+        [
+            new { speaker = (string?)null, text = "zero one five zero", atSeconds = 0.0 },
+            new { speaker = " ", text = "one two two three one", atSeconds = 1.0 },
+            new { speaker = "Unknown", text = "zero one five zero", atSeconds = 2.0 },
+        ]);
+
+        var response = await Factory.Client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.False(await Factory.WithDbAsync(db => db.LessonTranscriptSegments
+            .AnyAsync(x => x.LessonId == lessonId && x.Flags != "")));
+    }
+
+    [Fact]
+    public async Task ContextDoesNotCarryAcrossRequests()
+    {
+        var (lessonId, _) = await ParticipantsAsync();
+        foreach (var text in new[] { "zero one five zero", "one two two three one" })
+        {
+            using var request = await BuildAsync(lessonId, ApiFactory.IngestKey,
+                [new { speaker = "Teacher", text, atSeconds = 0.0 }]);
+            Assert.Equal(HttpStatusCode.OK, (await Factory.Client.SendAsync(request)).StatusCode);
+        }
+
+        Assert.False(await Factory.WithDbAsync(db => db.LessonTranscriptSegments
+            .AnyAsync(x => x.LessonId == lessonId && x.Flags != "")));
+    }
+
     /// <summary>Creates a teacher, a student and the lesson their transcript belongs to.</summary>
     private async Task<(Guid LessonId, Guid StudentId)> ParticipantsAsync()
     {

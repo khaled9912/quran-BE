@@ -1047,7 +1047,12 @@ public static class ApiEndpoints
             catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "One of the chosen slots was just booked. Refresh and pick another time." }); }
 
             var created = new List<Lesson>();
-            foreach (var s in series) created.AddRange(await BuildSeriesLessonsAsync(db, s, now));
+            foreach (var s in series)
+            {
+                var skipped = new List<DateTimeOffset>();
+                created.AddRange(await BuildSeriesLessonsAsync(db, s, now, skipped));
+                await AddSkippedWeekNoticesAsync(db, s, skipped);
+            }
             if (firstEverLesson && created.Count > 0) created.OrderBy(x => x.StartsAt).First().IsTrial = true;
             await db.SaveChangesAsync();
             await tx.CommitAsync();
@@ -1137,6 +1142,11 @@ public static class ApiEndpoints
                 lesson.CancelledById = studentId;
                 lesson.CancelledAt = now;
             }
+            var futureIds = futureLessons.Select(x => x.Id).ToList();
+            await db.LessonRescheduleRequests.Where(x => futureIds.Contains(x.LessonId) && x.Status == "pending")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "cancelled")
+                    .SetProperty(x => x.RespondedAt, now)
+                    .SetProperty(x => x.ResponseNote, "The weekly booking ended."));
 
             var keepsTeacher = await db.LessonSeries.AnyAsync(x =>
                 x.StudentId == studentId && x.TeacherId == series.TeacherId && x.IsActive && x.Id != series.Id);
@@ -1510,10 +1520,10 @@ public static class ApiEndpoints
             return Results.Ok(await RequestById(db, id));
         }).RequireAuthorization("StudentOnly");
 
-        api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapGet("/lessons", async (ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
         {
-            if (HasRole(p, "student")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.StudentId == UserId(p)));
-            else if (HasRole(p, "teacher")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.TeacherId == UserId(p)));
+            if (HasRole(p, "student")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.StudentId == UserId(p)), realtime, push);
+            else if (HasRole(p, "teacher")) await EnsureRollingLessonsAsync(db, db.LessonSeries.Where(x => x.TeacherId == UserId(p)), realtime, push);
             var q = db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review).AsQueryable();
             if (HasRole(p, "student")) q = q.Where(x => x.StudentId == UserId(p));
             else if (HasRole(p, "teacher")) q = q.Where(x => x.TeacherId == UserId(p));
@@ -1531,8 +1541,7 @@ public static class ApiEndpoints
             return Results.Ok(ToLesson(l));
         }).RequireAuthorization();
 
-        // Capture is server-side (Jigasi + Whisper); the bot authenticates with a
-        // shared key because it has no user session. Disabled until the key is set.
+        // Reserved for trusted server relays; browser capture never receives this key.
         api.MapPost("/lessons/{id:guid}/transcript", async (Guid id, HttpContext http, TranscriptUploadRequest input, AcademyDbContext db, IConfiguration config) =>
         {
             var key = config["Transcripts:IngestKey"];
@@ -1541,16 +1550,21 @@ public static class ApiEndpoints
             var incoming = input.Segments ?? [];
             if (incoming.Count == 0) return Results.BadRequest(new { message = "No segments supplied." });
             if (incoming.Count > 200) return Results.BadRequest(new { message = "Send at most 200 segments per request." });
-            if (!await db.Lessons.AsNoTracking().AnyAsync(x => x.Id == id)) return Results.NotFound();
-            // Bound the stored transcript per lesson so a replayed or leaked
-            // ingest key cannot grow the table without limit.
-            var stored = await db.LessonTranscriptSegments.CountAsync(x => x.LessonId == id);
-            if (stored >= MaxTranscriptSegmentsPerLesson)
+            await using var transaction = await db.Database.BeginTransactionAsync();
+            var transcriptLesson = await db.Lessons.FromSqlInterpolated($"""
+                SELECT * FROM "Lessons" WHERE "Id" = {id} FOR UPDATE
+                """).SingleOrDefaultAsync();
+            if (transcriptLesson is null) return Results.NotFound();
+            if (transcriptLesson.EndsAt < DateTimeOffset.UtcNow.AddDays(-30)) return Results.Conflict();
+            var stored = await db.LessonTranscriptSegments.IgnoreQueryFilters().CountAsync(x => x.LessonId == id);
+            var nonempty = incoming.Count(x => !string.IsNullOrWhiteSpace(x.Text));
+            if (stored + nonempty > TranscriptCaptureEndpoints.MaxSegmentsPerLesson)
                 return Results.Conflict(new { message = "This lesson already has the maximum number of transcript segments." });
 
             var now = DateTimeOffset.UtcNow;
             var accepted = 0;
             var flagged = 0;
+            var previousBySpeaker = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var segment in incoming)
             {
                 var text = segment.Text?.Trim();
@@ -1558,7 +1572,11 @@ public static class ApiEndpoints
                 if (text.Length > 4000) text = text[..4000];
                 var speaker = string.IsNullOrWhiteSpace(segment.Speaker) ? "Unknown" : segment.Speaker.Trim();
                 if (speaker.Length > 120) speaker = speaker[..120];
-                var flags = TranscriptFlags.Scan(text);
+                var identifiedSpeaker = speaker != "Unknown";
+                var context = identifiedSpeaker && previousBySpeaker.TryGetValue(speaker, out var previous)
+                    ? $"{previous} {text}" : text;
+                var flags = TranscriptFlags.Scan(context);
+                if (identifiedSpeaker) previousBySpeaker[speaker] = text;
                 if (flags.Count > 0) flagged++;
                 db.LessonTranscriptSegments.Add(new LessonTranscriptSegment
                 {
@@ -1572,6 +1590,7 @@ public static class ApiEndpoints
                 accepted++;
             }
             await db.SaveChangesAsync();
+            await transaction.CommitAsync();
             return Results.Ok(new { accepted, flagged });
         }).AllowAnonymous().RequireRateLimiting("transcripts");
 
@@ -2018,6 +2037,11 @@ public static class ApiEndpoints
                 lesson.CancelledAt = now;
                 cancelled++;
             }
+            var futureIds = futureLessons.Select(x => x.Id).ToList();
+            await db.LessonRescheduleRequests.Where(x => futureIds.Contains(x.LessonId) && x.Status == "pending")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "cancelled")
+                    .SetProperty(x => x.RespondedAt, now)
+                    .SetProperty(x => x.ResponseNote, "The academy ended the weekly booking."));
 
             var keepsTeacher = await db.LessonSeries.AnyAsync(x =>
                 x.StudentId == series.StudentId && x.TeacherId == series.TeacherId && x.IsActive && x.Id != series.Id);
@@ -2053,17 +2077,28 @@ public static class ApiEndpoints
         return Results.Ok(new { released = seriesList.Count, lessonsCancelled = cancelled });
     }
 
-    private static async Task<List<Lesson>> BuildSeriesLessonsAsync(AcademyDbContext db, LessonSeries series, DateTimeOffset now)
+    private static async Task<List<Lesson>> BuildSeriesLessonsAsync(
+        AcademyDbContext db, LessonSeries series, DateTimeOffset now, List<DateTimeOffset>? skipped = null)
     {
         var zone = ResolveTimeZone(series.TimeZoneId);
-        var existing = await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt >= now.AddDays(-1))
+        var retained = db.Lessons.Where(x => x.SeriesId == series.Id && x.CancellationOutcome != "series_rescheduled");
+        var existing = await retained.Where(x => x.StartsAt >= now.AddDays(-1))
             .Select(x => x.StartsAt).ToListAsync();
+        // A moved occurrence still fulfils its original date; never regenerate it there.
+        var movedFrom = await db.LessonScheduleChanges
+            .Where(x => retained.Any(l => l.Id == x.LessonId) && x.FromStartsAt >= now.AddDays(-1))
+            .Select(x => x.FromStartsAt).ToListAsync();
+        existing.AddRange(movedFrom);
         var lessons = new List<Lesson>();
         foreach (var (start, end) in NextOccurrences(series.DayOfWeek, series.StartsAtTime, series.EndsAtTime, zone, now, 8))
         {
             if (existing.Any(x => Math.Abs((x - start).TotalMinutes) < 1)) continue;
             if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < end && x.EndsAt > start
-                && (x.TeacherId == series.TeacherId || x.StudentId == series.StudentId))) continue;
+                && (x.TeacherId == series.TeacherId || x.StudentId == series.StudentId)))
+            {
+                skipped?.Add(start);
+                continue;
+            }
             lessons.Add(new Lesson
             {
                 TeacherId = series.TeacherId,
@@ -2081,21 +2116,34 @@ public static class ApiEndpoints
     /// A series has no end date, so lessons are materialized on a rolling
     /// window. Extend when fewer than four weeks of lessons remain.
     /// </summary>
-    private static async Task EnsureRollingLessonsAsync(AcademyDbContext db, IQueryable<LessonSeries> query)
+    private static async Task EnsureRollingLessonsAsync(
+        AcademyDbContext db, IQueryable<LessonSeries> query, RealtimeNotifier realtime, AcademyPushSender push)
     {
-        var series = await query.Where(x => x.IsActive).ToListAsync();
+        var series = await query.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.IsActive).ToListAsync();
         if (series.Count == 0) return;
         var ids = series.Select(x => x.Id).ToList();
-        var latest = await db.Lessons.Where(x => x.SeriesId != null && ids.Contains(x.SeriesId.Value))
+        var latest = await db.Lessons.Where(x => x.SeriesId != null && ids.Contains(x.SeriesId.Value)
+                && x.CancellationOutcome != "series_rescheduled")
             .GroupBy(x => x.SeriesId!.Value)
             .Select(g => new { Id = g.Key, Max = g.Max(x => x.StartsAt) })
             .ToDictionaryAsync(x => x.Id, x => x.Max);
         var now = DateTimeOffset.UtcNow;
         var toExtend = series.Where(s => !latest.TryGetValue(s.Id, out var max) || max < now.AddDays(28)).ToList();
         if (toExtend.Count == 0) return;
-        foreach (var s in toExtend) await BuildSeriesLessonsAsync(db, s, now);
+        var notices = new List<AppNotification>();
+        foreach (var s in toExtend)
+        {
+            var skipped = new List<DateTimeOffset>();
+            await BuildSeriesLessonsAsync(db, s, now, skipped);
+            notices.AddRange(await AddSkippedWeekNoticesAsync(db, s, skipped));
+        }
         try { await db.SaveChangesAsync(); }
-        catch (DbUpdateException) { db.ChangeTracker.Clear(); }
+        catch (DbUpdateException) { db.ChangeTracker.Clear(); return; }
+        foreach (var notice in notices)
+        {
+            await realtime.ToUserAsync(notice.UserId, RealtimeScopes.Notifications);
+            await LessonOpsMessaging.PushAsync(db, push, [notice.UserId], notice.Title, notice.Body, notice.Link);
+        }
     }
 
     /// <summary>
@@ -2156,7 +2204,27 @@ public static class ApiEndpoints
         string? conflict = null;
         try
         {
-            await db.Lessons.Where(x => x.SeriesId == series.Id && x.StartsAt > now).ExecuteDeleteAsync();
+            // Keep dependent attendance, cancellation and request history intact.
+            var displaced = await db.Lessons
+                .Where(x => x.SeriesId == series.Id && x.Status == "scheduled" && x.StartsAt > now)
+                .ToListAsync();
+            var displacedIds = displaced.Select(x => x.Id).ToList();
+            foreach (var lesson in displaced)
+            {
+                lesson.Status = "cancelled";
+                lesson.CancellationOutcome = "series_rescheduled";
+                lesson.CancelReason = "The student moved to another weekly time.";
+                lesson.CancelledById = request.StudentId;
+                lesson.CancelledAt = now;
+            }
+            var openRequests = await db.LessonRescheduleRequests
+                .Where(x => displacedIds.Contains(x.LessonId) && x.Status == "pending").ToListAsync();
+            foreach (var open in openRequests)
+            {
+                open.Status = "cancelled";
+                open.RespondedAt = now;
+                open.ResponseNote = "The weekly booking moved to another time.";
+            }
             series.AvailabilityRuleId = rule.Id;
             series.DayOfWeek = rule.DayOfWeek;
             series.StartsAtTime = rule.StartsAtTime;
@@ -2164,7 +2232,11 @@ public static class ApiEndpoints
             series.TimeZoneId = rule.TimeZoneId;
             notices = await AddTimeChangeNoticesAsync(db, series, request);
             await db.SaveChangesAsync();
-            await BuildSeriesLessonsAsync(db, series, now);
+            var skipped = new List<DateTimeOffset>();
+            var rebuilt = await BuildSeriesLessonsAsync(db, series, now, skipped);
+            if (displaced.Any(x => x.IsTrial) && rebuilt.Count > 0)
+                rebuilt.OrderBy(x => x.StartsAt).First().IsTrial = true;
+            notices.AddRange(await AddSkippedWeekNoticesAsync(db, series, skipped));
             await db.SaveChangesAsync();
             await tx.CommitAsync();
         }
@@ -2215,6 +2287,44 @@ public static class ApiEndpoints
             notices.Add(copy);
         }
         return notices;
+    }
+
+    private static async Task<List<AppNotification>> AddSkippedWeekNoticesAsync(
+        AcademyDbContext db, LessonSeries series, List<DateTimeOffset> skipped)
+    {
+        var written = new List<AppNotification>();
+        if (skipped.Count == 0) return written;
+        var names = await db.Users.Where(x => x.Id == series.TeacherId || x.Id == series.StudentId)
+            .ToDictionaryAsync(x => x.Id, x => x.FullName);
+        var studentName = names[series.StudentId];
+        var teacherName = names[series.TeacherId];
+        var adminIds = await LessonOpsMessaging.AdminUserIdsAsync(db);
+        foreach (var start in skipped)
+        {
+            var when = LessonOpsMessaging.When(start, series.TimeZoneId);
+            var key = $"series-week-skipped:{series.Id}:{start:u}";
+            if (await db.Notifications.AnyAsync(x => x.DedupeKey == key)) continue;
+            var notices = new[]
+            {
+                LessonOpsMessaging.Notice(series.StudentId, "Weekly lesson not booked",
+                    $"Your lesson with {teacherName} on {when} clashes with another lesson, so it was not booked. Ask the academy for another time if you need one.",
+                    "booking", "/schedule", key),
+                LessonOpsMessaging.Notice(series.TeacherId, "Weekly lesson not booked",
+                    $"The lesson with {studentName} on {when} clashes with another lesson, so it was not booked.",
+                    "booking", "/schedule", key),
+            };
+            db.Notifications.AddRange(notices);
+            written.AddRange(notices);
+            foreach (var adminId in adminIds)
+            {
+                var notice = LessonOpsMessaging.Notice(adminId, "Weekly lesson not booked",
+                    $"{teacherName} with {studentName} on {when} was not booked because one participant has another lesson. Arrange an alternative time.",
+                    "booking", "/admin/lesson-ops", key);
+                db.Notifications.Add(notice);
+                written.Add(notice);
+            }
+        }
+        return written;
     }
 
     /// <summary>
@@ -2268,9 +2378,6 @@ public static class ApiEndpoints
         => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.Id == id).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).FirstOrDefaultAsync();
 
     private const long MaxAvatarBytes = 2 * 1024 * 1024;
-    // Generous ceiling for a transcripted lesson; bounds what a leaked ingest key
-    // can store per lesson regardless of how many requests it makes.
-    private const int MaxTranscriptSegmentsPerLesson = 5000;
 
     private static bool SecretsMatch(string provided, string expected)
     {

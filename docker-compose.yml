@@ -51,6 +51,9 @@ services:
       WebPush__PublicKey: ${WEBPUSH_PUBLIC_KEY:-}
       WebPush__PrivateKey: ${WEBPUSH_PRIVATE_KEY:-}
       WebPush__Subject: ${WEBPUSH_SUBJECT:-mailto:support@anaquran.com}
+      LessonRoom__Transcription: ${LessonRoom__Transcription:-false}
+      LessonRoom__ReportConcern: ${LessonRoom__ReportConcern:-false}
+      Transcripts__LightCaptureSince: ${Transcripts__LightCaptureSince:-}
       # Observability: both are inert unless set (Sentry is also production-only).
       SENTRY_DSN: ${SENTRY_DSN:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}

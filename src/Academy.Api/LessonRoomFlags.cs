@@ -10,7 +10,13 @@ public sealed record LessonRoomFlags(
     bool Whiteboard,
     bool Chat,
     bool CameraBackground,
-    bool Pen)
+    bool Pen,
+    // Jitsi's video-quality picker, labelled "Performance settings" in its own
+    // UI. Web only: the native SDK fixes a shorter toolbar and never renders
+    // this button.
+    bool PerformanceSettings,
+    bool Transcription,
+    bool ReportConcern)
 {
     /// <summary>
     /// Everything defaults to off: a missing or unreadable setting must leave a
@@ -20,7 +26,10 @@ public sealed record LessonRoomFlags(
         config.GetValue<bool>("LessonRoom:Whiteboard"),
         config.GetValue<bool>("LessonRoom:Chat"),
         config.GetValue<bool>("LessonRoom:CameraBackground"),
-        config.GetValue<bool>("LessonRoom:Pen"));
+        config.GetValue<bool>("LessonRoom:Pen"),
+        config.GetValue<bool>("LessonRoom:PerformanceSettings"),
+        config.GetValue<bool>("LessonRoom:Transcription"),
+        config.GetValue<bool>("LessonRoom:ReportConcern"));
 }
 
 public static class LessonRoomConfigEndpoints
@@ -30,7 +39,10 @@ public static class LessonRoomConfigEndpoints
         // Anonymous by design: the mobile app and signed-out visitors must know
         // the room's shape before they can build it, and the answer only names
         // which buttons exist.
-        app.MapGet("/api/config/lesson-room", (IConfiguration config) =>
-            Results.Ok(LessonRoomFlags.FromConfiguration(config))).AllowAnonymous();
+        app.MapGet("/api/config/lesson-room", (IConfiguration config, HttpResponse response) =>
+        {
+            response.Headers.CacheControl = "no-store";
+            return Results.Ok(LessonRoomFlags.FromConfiguration(config));
+        }).AllowAnonymous();
     }
 }
