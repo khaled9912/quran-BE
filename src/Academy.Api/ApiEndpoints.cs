@@ -984,18 +984,18 @@ public static class ApiEndpoints
 
         // Weekly availability: the teacher announces recurring slots once and
         // students book them directly. No teacher or admin confirmation step.
-        api.MapGet("/student/teacher/weekly-availability", async (ClaimsPrincipal p, AcademyDbContext db) =>
+        api.MapGet("/student/teacher/weekly-availability", async (ClaimsPrincipal p, AcademyDbContext db, IConfiguration config) =>
         {
             var studentId = UserId(p);
             var assignment = await db.Assignments.Include(x => x.Teacher).Where(x => x.StudentId == studentId && x.IsActive).OrderByDescending(x => x.CreatedAt).FirstOrDefaultAsync();
             if (assignment?.Teacher is null) return Results.Ok(new WeeklyAvailabilityDto(null, [], []));
-            return Results.Ok(await WeeklyAvailabilityAsync(db, assignment.Teacher, studentId));
+            return Results.Ok(await WeeklyAvailabilityAsync(db, assignment.Teacher, studentId, config));
         }).RequireAuthorization("StudentOnly");
-        api.MapGet("/teachers/{id:guid}/weekly-availability", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        api.MapGet("/teachers/{id:guid}/weekly-availability", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users, IConfiguration config) =>
         {
             var teacher = await users.FindByIdAsync(id.ToString());
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
-            return Results.Ok(await WeeklyAvailabilityAsync(db, teacher, UserId(p)));
+            return Results.Ok(await WeeklyAvailabilityAsync(db, teacher, UserId(p), config));
         }).RequireAuthorization("StudentOnly");
         api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
@@ -1169,7 +1169,7 @@ public static class ApiEndpoints
                 .OrderByDescending(x => x.CreatedAt).ToListAsync();
             return Results.Ok(list.Select(ToChangeRequest));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
+        api.MapPost("/student/series/{id:guid}/change-requests", async (Guid id, CreateLessonChangeRequestInput input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push, IConfiguration config) =>
         {
             var studentId = UserId(p);
             var series = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
@@ -1191,7 +1191,7 @@ public static class ApiEndpoints
                 RequestedRuleId = rule.Id,
                 StudentNote = note is { Length: > 0 } ? note : null,
             };
-            if (await RecordTimeChangeAsync(db, series, rule, request, now, push) is { } blocked)
+            if (await RecordTimeChangeAsync(db, series, rule, request, now, push, TimeChangeLeadMinutes(config)) is { } blocked)
                 return Results.Conflict(new { message = blocked });
 
             await realtime.ToParticipantsAsync(series.TeacherId, studentId, RealtimeScopes.Lessons);
@@ -1860,7 +1860,7 @@ public static class ApiEndpoints
         return Results.Ok(await RequestById(db, id));
     }
 
-    private static WeeklyRuleDto ToRule(TeacherAvailabilityRule r, string status) => new(r.Id, r.TeacherId, r.DayOfWeek, FormatTime(r.StartsAtTime), FormatTime(r.EndsAtTime), r.TimeZoneId, status);
+    private static WeeklyRuleDto ToRule(TeacherAvailabilityRule r, string status, DateTimeOffset? nextStartsAt = null) => new(r.Id, r.TeacherId, r.DayOfWeek, FormatTime(r.StartsAtTime), FormatTime(r.EndsAtTime), r.TimeZoneId, status, nextStartsAt);
     private static OpenStudentOfferDto ToOpenOffer(OpenStudentOffer offer, string studentName, string? claimedByTeacherName)
         => new(offer.Id, offer.StudentId, studentName, offer.StartsAt, offer.EndsAt, offer.Status, offer.ClaimedByTeacherId, claimedByTeacherName, offer.LessonId, offer.CreatedAt, offer.ClaimedAt);
     // Lessons are standardized so billing, reminders, and reports stay predictable.
@@ -1914,15 +1914,19 @@ public static class ApiEndpoints
             .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
         var bookings = await db.LessonSeries.Where(x => x.IsActive && x.TeacherId == teacherId)
             .Select(x => new { x.AvailabilityRuleId, x.StudentId }).ToListAsync();
+        var now = DateTimeOffset.UtcNow;
         return rules.Select(rule =>
         {
             var booking = bookings.FirstOrDefault(x => x.AvailabilityRuleId == rule.Id);
             var status = booking is null ? "available" : booking.StudentId == studentId ? "yours" : "booked";
-            return ToRule(rule, status);
+            // Where this recurring time happens next, so a client can tell how
+            // much notice a move would give the teacher.
+            var next = NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 2).FirstOrDefault();
+            return ToRule(rule, status, next.StartsAt == default ? null : next.StartsAt);
         }).ToList();
     }
 
-    private static async Task<WeeklyAvailabilityDto> WeeklyAvailabilityAsync(AcademyDbContext db, AcademyUser teacher, Guid studentId)
+    private static async Task<WeeklyAvailabilityDto> WeeklyAvailabilityAsync(AcademyDbContext db, AcademyUser teacher, Guid studentId, IConfiguration config)
     {
         var rules = await WeeklyRulesAsync(db, teacher.Id, studentId);
         var series = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
@@ -1932,7 +1936,7 @@ public static class ApiEndpoints
         var reviews = await db.TeacherReviews.AsNoTracking().Include(x => x.Lesson).Include(x => x.Teacher).Include(x => x.Student)
             .Where(x => x.TeacherId == teacher.Id).OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
         var hasLessons = await db.Lessons.AnyAsync(x => x.StudentId == studentId);
-        return new WeeklyAvailabilityDto(ToPerson(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons);
+        return new WeeklyAvailabilityDto(ToPerson(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons, TimeChangeLeadMinutes(config));
     }
 
     private static async Task<(List<TeacherAvailabilityRule>? Created, string? Error)> CreateAvailabilityRulesAsync(
@@ -2095,14 +2099,28 @@ public static class ApiEndpoints
     }
 
     /// <summary>
+    /// How much notice the academy requires before a student may move onto a
+    /// weekly time. A move that lands on a class starting in minutes leaves the
+    /// teacher no way to prepare, so those times are not offered at all.
+    /// </summary>
+    private static int TimeChangeLeadMinutes(IConfiguration config) =>
+        Math.Max(0, config.GetValue("Scheduling:TimeChangeLeadMinutes", 60));
+
+    /// <summary>
     /// The checks a weekly-time move must pass before anything is written. The
     /// student only ever picks a slot the teacher already published, so there is
     /// nothing to approve; what remains is making sure the slot is still free.
     /// </summary>
     private static async Task<string?> CheckTimeChangeAsync(
-        LessonSeries series, TeacherAvailabilityRule rule, AcademyDbContext db, DateTimeOffset now)
+        LessonSeries series, TeacherAvailabilityRule rule, AcademyDbContext db, DateTimeOffset now, int leadMinutes)
     {
         if (!series.IsActive) return "This booking is no longer active.";
+        if (leadMinutes > 0)
+        {
+            var next = NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 2).FirstOrDefault();
+            if (next.StartsAt != default && next.StartsAt < now.AddMinutes(leadMinutes))
+                return $"That class starts in under {leadMinutes} minutes. Choose a time at least {leadMinutes} minutes away so your teacher has notice.";
+        }
         if (await db.LessonSeries.AnyAsync(x => x.IsActive && x.AvailabilityRuleId == rule.Id && x.Id != series.Id))
             return "That time is no longer available.";
         var otherSeries = await db.LessonSeries
@@ -2124,10 +2142,10 @@ public static class ApiEndpoints
     /// </summary>
     private static async Task<string?> RecordTimeChangeAsync(
         AcademyDbContext db, LessonSeries series, TeacherAvailabilityRule rule,
-        LessonChangeRequest request, DateTimeOffset now, AcademyPushSender? push = null)
+        LessonChangeRequest request, DateTimeOffset now, AcademyPushSender? push = null, int leadMinutes = 0)
     {
         await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable);
-        if (await CheckTimeChangeAsync(series, rule, db, now) is { } blocked)
+        if (await CheckTimeChangeAsync(series, rule, db, now, leadMinutes) is { } blocked)
         {
             await tx.RollbackAsync();
             return blocked;

@@ -292,6 +292,7 @@ app.Use(async (context, next) =>
 if (app.Environment.IsDevelopment()) { app.UseSwagger(); app.UseSwaggerUI(); }
 app.MapGet("/health", () => Results.Ok(new { status = "ok", service = "ana-quran-academy-api" })).AllowAnonymous();
 app.MapHealthChecks("/health/ready").AllowAnonymous();
+app.MapLessonRoomConfig();
 app.MapRealtime();
 app.MapAcademyApi();
 app.MapLessonOperations();

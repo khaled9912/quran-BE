@@ -28,6 +28,8 @@ Hosting and incident history live in the repository-root `README.md`.
 | `Email__From` | Sender address; defaults to `Email__Username` |
 | `Email__To` | The fixed contact-form receiver |
 | `Transcripts__IngestKey` | Shared secret for `POST /api/lessons/{id}/transcript`; when unset the route answers `404`, so the transcript feature is dark by default |
+| `LessonRoom__Whiteboard` / `__Chat` / `__CameraBackground` / `__Pen` | Live-room feature flags, all **off** by default. `GET /api/config/lesson-room` (anonymous) reports them, and both clients read it at startup before a conference is created — Jitsi fixes its toolbar at join time, so a flip only reaches rooms opened after it |
+| `Scheduling__TimeChangeLeadMinutes` | Academy-wide notice, in minutes, a student must leave a teacher when moving a weekly lesson (default `60`). Weekly times whose next class starts inside that window are not offered and are rejected on request; `0` disables the rule |
 | `Realtime__PublicUrl` | Absolute origin the browser should use for the SignalR hub; otherwise proxy headers, then the request host |
 | `SENTRY_DSN` / `Sentry__Dsn` | Error reporting; no-op when empty |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SERVICE_NAME` | Enables OpenTelemetry tracing/metrics when set |
