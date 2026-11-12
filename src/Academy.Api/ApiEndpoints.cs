@@ -2313,15 +2313,17 @@ public static class ApiEndpoints
             .Select(g => new { Id = g.Key, Max = g.Max(x => x.StartsAt) })
             .ToDictionaryAsync(x => x.Id, x => x.Max);
         var now = DateTimeOffset.UtcNow;
+        // Runs whether or not anything needs extending: the shift can be visible
+        // weeks before the rolling window has to grow.
+        var notices = await AddDaylightShiftNoticesAsync(db, series, now);
         var toExtend = series.Where(s => !latest.TryGetValue(s.Id, out var max) || max < now.AddDays(28)).ToList();
-        if (toExtend.Count == 0) return;
-        var notices = new List<AppNotification>();
         foreach (var s in toExtend)
         {
             var skipped = new List<DateTimeOffset>();
             await BuildSeriesLessonsAsync(db, s, now, skipped);
             notices.AddRange(await AddSkippedWeekNoticesAsync(db, s, skipped));
         }
+        if (toExtend.Count == 0 && notices.Count == 0) return;
         try { await db.SaveChangesAsync(); }
         catch (DbUpdateException) { db.ChangeTracker.Clear(); return; }
         foreach (var notice in notices)
@@ -2510,6 +2512,81 @@ public static class ApiEndpoints
             }
         }
         return written;
+    }
+
+    /// <summary>
+    /// A weekly time is pinned to the teacher's clock, so when daylight saving
+    /// moves the student's clock and not the teacher's, the lesson lands on a
+    /// different hour for the student while nothing about the booking changed.
+    /// The materialized lessons are already right; this is only the sentence that
+    /// warns the student before they turn up an hour early. One notice per series
+    /// per shift, because the shift is a date, not a recurring event.
+    /// </summary>
+    private static async Task<List<AppNotification>> AddDaylightShiftNoticesAsync(
+        AcademyDbContext db, List<LessonSeries> series, DateTimeOffset now)
+    {
+        var written = new List<AppNotification>();
+        var studentIds = series.Select(x => x.StudentId).Distinct().ToList();
+        var onboardings = await db.StudentOnboardings
+            .Where(x => studentIds.Contains(x.StudentId))
+            .Select(x => new { x.StudentId, x.TimeZoneId, x.UpdatedAt }).ToListAsync();
+        var studentZones = onboardings.GroupBy(x => x.StudentId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(x => x.UpdatedAt).First().TimeZoneId);
+
+        var shifts = new List<(LessonSeries Series, DateTimeOffset StartsAt, int DeltaMinutes, string StudentZone)>();
+        foreach (var row in series)
+        {
+            if (!studentZones.TryGetValue(row.StudentId, out var studentZone)) continue;
+            studentZone = studentZone.Trim();
+            if (studentZone.Length == 0
+                || studentZone.Equals(row.TimeZoneId, StringComparison.OrdinalIgnoreCase)) continue;
+
+            DateTime? previous = null;
+            foreach (var (start, _) in NextOccurrences(row.DayOfWeek, row.StartsAtTime, row.EndsAtTime, ResolveTimeZone(row.TimeZoneId), now, 8))
+            {
+                var local = TimeZoneInfo.ConvertTime(start, ResolveTimeZone(studentZone)).DateTime;
+                if (previous is { } before && before.TimeOfDay != local.TimeOfDay)
+                {
+                    // Fold into the shortest way round, so a change that crosses
+                    // midnight reads as an hour earlier rather than 23 hours later.
+                    var minutes = (int)(local.TimeOfDay - before.TimeOfDay).TotalMinutes;
+                    minutes = ((minutes % 1440) + 2160) % 1440 - 720;
+                    if (minutes != 0) shifts.Add((row, start, minutes, studentZone));
+                    break;
+                }
+                previous = local;
+            }
+        }
+        if (shifts.Count == 0) return written;
+
+        var keys = shifts.Select(x => $"dst-shift:{x.Series.Id}:{x.StartsAt:u}").ToList();
+        var alreadySent = await db.Notifications
+            .Where(x => x.DedupeKey != null && keys.Contains(x.DedupeKey))
+            .Select(x => x.DedupeKey!).ToListAsync();
+
+        foreach (var (row, start, minutes, studentZone) in shifts)
+        {
+            var key = $"dst-shift:{row.Id}:{start:u}";
+            if (alreadySent.Contains(key)) continue;
+            var teacherName = row.Teacher?.FullName ?? "your teacher";
+            var notice = LessonOpsMessaging.Notice(
+                row.StudentId, "Your class time shifts",
+                $"Clocks change where you live, so your lesson with {teacherName} on " +
+                $"{LessonOpsMessaging.When(start, studentZone)} is {ShiftLength(minutes)} " +
+                $"{(minutes > 0 ? "later" : "earlier")} than the usual one. {teacherName} keeps the same weekly time.",
+                "lesson", "/schedule", key);
+            db.Notifications.Add(notice);
+            written.Add(notice);
+        }
+        return written;
+    }
+
+    private static string ShiftLength(int minutes)
+    {
+        var hours = Math.Abs(minutes) / 60;
+        return Math.Abs(minutes) % 60 == 0
+            ? hours == 1 ? "an hour" : $"{hours} hours"
+            : $"{Math.Abs(minutes)} minutes";
     }
 
     /// <summary>
