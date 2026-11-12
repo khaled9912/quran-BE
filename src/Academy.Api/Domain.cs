@@ -112,6 +112,40 @@ public sealed class StudentAvailability
 }
 
 /// <summary>
+/// What a student tells the academy before a teacher is assigned: their level in
+/// each subject and the weekly times they could take a lesson. These are
+/// preferences, not bookings — only the admin turns them into a lesson series.
+/// </summary>
+public sealed class StudentOnboarding
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    [MaxLength(20)] public string QuranLevel { get; set; } = "";
+    [MaxLength(20)] public string TajweedLevel { get; set; } = "";
+    [MaxLength(20)] public string IslamicStudiesLevel { get; set; } = "";
+    [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    /// <summary>Set when the student finishes the wizard; until then they are sent back to it.</summary>
+    public DateTimeOffset? CompletedAt { get; set; }
+}
+
+/// <summary>One preferred weekly window, stored in the student's own time zone.</summary>
+public sealed class StudentWeeklyPreference
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    // 0 = Sunday ... 6 = Saturday
+    public int DayOfWeek { get; set; }
+    public TimeOnly StartsAtTime { get; set; }
+    public TimeOnly EndsAtTime { get; set; }
+    [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
 /// A time an unassigned student offers to every active teacher. The first
 /// teacher to accept books a one-off lesson instantly and closes the offer.
 /// </summary>

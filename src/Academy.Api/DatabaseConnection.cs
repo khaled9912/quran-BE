@@ -37,7 +37,11 @@ public static class DatabaseConnection
             Password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "",
             SslMode = SslMode.Require,
             ApplicationName = "AnaQuranAcademy",
-            MaxPoolSize = 20
+            MaxPoolSize = 20,
+            // Npgsql leaves TCP keepalive off, so a connection idle past the pooler's
+            // timeout is closed silently and the next request pays a full DNS + TLS +
+            // startup handshake. 15s is comfortably inside any pooler or NAT cutoff.
+            KeepAlive = 15
         };
 
         foreach (var pair in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))

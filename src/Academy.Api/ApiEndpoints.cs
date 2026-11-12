@@ -29,6 +29,10 @@ public static class ApiEndpoints
         "Grade 7", "Grade 8", "Grade 9", "Grade 10", "Grade 11", "Grade 12",
     };
 
+    // The levels a student picks per subject during onboarding. The same three
+    // words are shown to the admin when they match a student to a teacher.
+    public static readonly string[] StudentLevels = new[] { "beginner", "intermediate", "advanced" };
+
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
@@ -136,14 +140,12 @@ public static class ApiEndpoints
         var api = app.MapGroup("/api");
 
         var auth = api.MapGroup("/auth").AllowAnonymous();
-        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, HttpContext http) =>
+        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
             if (NameContainsContact(input.FullName))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter the student's name, not an email address."] });
-            if (!RegistrationPolicy.IsAllowed(http, input.Country))
-                return Results.Problem(RegistrationPolicy.BlockedMessage, statusCode: 403);
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var result = await users.CreateAsync(user, input.Password);
             if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
@@ -460,7 +462,7 @@ public static class ApiEndpoints
             });
         }).RequireRateLimiting("otp");
 
-        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, HttpContext http) =>
+        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
             var phone = PhoneNumbers.Normalize(input.Phone);
             if (phone is null || string.IsNullOrWhiteSpace(input.Code))
@@ -470,9 +472,6 @@ public static class ApiEndpoints
             var user = users.Users.FirstOrDefault(x => x.PhoneNumber == phone);
             if (user is null)
             {
-                // Only new accounts are gated; existing students can sign in from anywhere.
-                if (!RegistrationPolicy.IsAllowed(http, input.Country))
-                    return Results.Problem(RegistrationPolicy.BlockedMessage, statusCode: 403);
                 var fullName = input.FullName?.Trim() ?? "";
                 if (fullName.Length == 0) return Results.Ok(new { requiresProfile = true });
                 if (fullName.Length is < 2 or > 160)
@@ -696,6 +695,53 @@ public static class ApiEndpoints
         // Transcript review lives in LessonReviewEndpoints (also open to support).
 
         admin.MapGet("/assignments", async (AcademyDbContext db) => await AssignmentList(db));
+
+        // Everyone waiting on a teacher, with the answers they gave during
+        // onboarding — that is what an assignment decision is made from.
+        admin.MapGet("/students/pending", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
+        {
+            var students = (await users.GetUsersInRoleAsync("student")).Where(x => x.IsActive).ToList();
+            var ids = students.Select(x => x.Id).ToList();
+            var assigned = await db.Assignments.AsNoTracking().Where(x => x.IsActive && ids.Contains(x.StudentId))
+                .Select(x => new { x.StudentId, x.TeacherId }).ToListAsync();
+            var teacherNames = await db.Users.AsNoTracking()
+                .Where(x => assigned.Select(a => a.TeacherId).Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => DisplayName(x.FullName) ?? "Teacher");
+            var onboarded = await db.StudentOnboardings.AsNoTracking().Where(x => ids.Contains(x.StudentId))
+                .ToDictionaryAsync(x => x.StudentId);
+            var prefs = await db.StudentWeeklyPreferences.AsNoTracking().Where(x => ids.Contains(x.StudentId))
+                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+
+            var rows = new List<PendingStudentDto>();
+            foreach (var student in students)
+            {
+                onboarded.TryGetValue(student.Id, out var row);
+                var teacherId = assigned.FirstOrDefault(a => a.StudentId == student.Id)?.TeacherId;
+                rows.Add(new PendingStudentDto(
+                    student.Id,
+                    DisplayName(student.FullName) ?? "Student",
+                    student.Email ?? "",
+                    student.CreatedAt,
+                    row is null ? null : new StudentOnboardingDto(
+                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+                        prefs.Where(x => x.StudentId == student.Id)
+                            .Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
+                        row.CompletedAt, row.UpdatedAt),
+                    teacherId is not null,
+                    teacherId is null ? null : teacherNames.GetValueOrDefault(teacherId.Value)));
+            }
+            // Nobody should wait unseen: the longest-waiting student comes first.
+            return Results.Ok(rows.OrderBy(x => x.HasTeacher).ThenBy(x => x.RegisteredAt).ToList());
+        });
+
+        admin.MapPost("/students/{id:guid}/weekly-lessons", async (Guid id, BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
+        {
+            var student = await users.FindByIdAsync(id.ToString());
+            if (student is null || !student.IsActive || !await users.IsInRoleAsync(student, "student"))
+                return Results.NotFound(new { message = "That student was not found." });
+            return await BookWeeklySlotsAsync(db, id, input.RuleIds, realtime, UserId(p));
+        });
+
         api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");
         api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
         {
@@ -704,16 +750,48 @@ public static class ApiEndpoints
             if (teacher is null || student is null || !await users.IsInRoleAsync(teacher, "teacher") || !await users.IsInRoleAsync(student, "student")) return Results.BadRequest(new { message = "A valid teacher and student are required." });
             var activeElsewhere = await db.Assignments.Where(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId).ToListAsync();
             foreach (var previous in activeElsewhere) previous.IsActive = false;
+            // The student has been waiting on this page, so the assignment itself
+            // has to reach them — not just the realtime refresh.
+            async Task AnnounceAsync(Guid assignmentId)
+            {
+                var key = $"assignment:{assignmentId}";
+                if (await db.Notifications.AnyAsync(x => x.DedupeKey == $"{key}:student")) return;
+                var teacherName = DisplayName(teacher.FullName) ?? "your teacher";
+                var studentName = DisplayName(student.FullName) ?? "A student";
+                db.Notifications.AddRange(
+                    new AppNotification
+                    {
+                        UserId = input.StudentId,
+                        Title = "Your teacher is assigned",
+                        Body = $"{teacherName} will be teaching you. The academy is setting your weekly time now.",
+                        Kind = "booking",
+                        Link = "/student/dashboard",
+                        DedupeKey = $"{key}:student",
+                    },
+                    new AppNotification
+                    {
+                        UserId = input.TeacherId,
+                        Title = "New student assigned",
+                        Body = $"{studentName} has been assigned to you. Book their weekly time when you are ready.",
+                        Kind = "booking",
+                        Link = "/teacher/dashboard",
+                        DedupeKey = $"{key}:teacher",
+                    });
+                await db.SaveChangesAsync();
+                await realtime.ToUsersAsync([input.TeacherId, input.StudentId], RealtimeScopes.Notifications);
+            }
             var existing = await db.Assignments.FirstOrDefaultAsync(x => x.TeacherId == input.TeacherId && x.StudentId == input.StudentId);
             if (existing is not null)
             {
                 existing.IsActive = true; await db.SaveChangesAsync();
+                await AnnounceAsync(existing.Id);
                 await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
                 await realtime.ToStaffAsync(RealtimeScopes.Directory);
                 return Results.Ok(await AssignmentById(db, existing.Id));
             }
             var assignment = new TeacherStudentAssignment { TeacherId = input.TeacherId, StudentId = input.StudentId };
             db.Assignments.Add(assignment); await db.SaveChangesAsync();
+            await AnnounceAsync(assignment.Id);
             await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/teacher-student-assignments/{assignment.Id}", await AssignmentById(db, assignment.Id));
@@ -736,7 +814,8 @@ public static class ApiEndpoints
             var user = await users.FindByIdAsync(id.ToString()); return user is null || !await users.IsInRoleAsync(user, "teacher") ? Results.NotFound() : Results.Ok(ToUser(user, "teacher"));
         }).RequireAuthorization("AdminOnly");
 
-        // Student-facing directory of active teachers and their open lesson times.
+        // Staff-facing view of every active teacher and their open lesson times.
+        // Students no longer browse a directory: the academy assigns their teacher.
         api.MapGet("/teachers/directory", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
             var teachers = (await users.GetUsersInRoleAsync("teacher")).Where(x => x.IsActive).ToList();
@@ -765,9 +844,9 @@ public static class ApiEndpoints
                 })
                 .ToList();
             return Results.Ok(result);
-        }).RequireAuthorization();
+        }).RequireAuthorization("AdminOnly");
 
-        // Student-facing directory of teachers and their announced weekly times.
+        // Staff-facing directory of teachers and their announced weekly times.
         api.MapGet("/teachers/weekly-directory", async (AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
             var teachers = (await users.GetUsersInRoleAsync("teacher")).Where(x => x.IsActive).OrderBy(x => x.FullName).ToList();
@@ -788,12 +867,15 @@ public static class ApiEndpoints
                     rating?.Count ?? 0));
             }
             return Results.Ok(result);
-        }).RequireAuthorization();
+        }).RequireAuthorization("AdminOnly");
 
-        api.MapGet("/teachers/{id:guid}/profile", async (Guid id, AcademyDbContext db, UserManager<AcademyUser> users) =>
+        api.MapGet("/teachers/{id:guid}/profile", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
             var teacher = await users.FindByIdAsync(id.ToString());
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
+            // A student only ever sees the teacher the academy assigned them.
+            if (HasRole(p, "student") && !await db.Assignments.AnyAsync(x => x.TeacherId == id && x.StudentId == UserId(p) && x.IsActive))
+                return Results.NotFound();
             var slots = await db.AvailabilitySlots.AsNoTracking()
                 .Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > DateTimeOffset.UtcNow)
                 .OrderBy(x => x.StartsAt)
@@ -957,7 +1039,7 @@ public static class ApiEndpoints
             {
                 UserId = request.StudentId,
                 Title = $"{request.Teacher?.FullName ?? "Your teacher"} declined your lesson request",
-                Body = input?.Reason ?? "Pick another weekly slot to keep learning.",
+                Body = input?.Reason ?? "Message the academy and we will find you another time.",
                 Kind = "request",
                 Link = "/book",
                 DedupeKey = $"request-teacher-declined:{request.Id}",
@@ -968,6 +1050,73 @@ public static class ApiEndpoints
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
             return Results.Ok(await RequestById(db, id));
         });
+
+        // Onboarding: the two answers the academy needs before it chooses a
+        // teacher — where the student stands in each subject, and the weekly
+        // windows they could take a lesson in. Preferences, never bookings.
+        api.MapGet("/student/onboarding", async (ClaimsPrincipal p, AcademyDbContext db) =>
+            Results.Ok(await StudentOnboardingAsync(db, UserId(p))))
+            .RequireAuthorization("StudentOnly");
+        api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            var studentId = UserId(p);
+            var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel" };
+            var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel }
+                .Select(value => (value ?? "").Trim().ToLowerInvariant())
+                .ToArray();
+            for (var i = 0; i < levels.Length; i++)
+            {
+                if (levels[i].Length == 0)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { [fieldNames[i]] = ["Choose a level."] });
+                if (Array.IndexOf(StudentLevels, levels[i]) < 0)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { [fieldNames[i]] = ["Choose beginner, intermediate or advanced."] });
+            }
+
+            var zone = (input.TimeZoneId ?? "").Trim();
+            if (zone.Length == 0 || TimeZoneInfo.TryFindSystemTimeZoneById(zone, out _) is false)
+                zone = "UTC";
+
+            var prefs = new List<StudentWeeklyPreference>();
+            foreach (var slot in (input.WeeklySlots ?? []).Take(21))
+            {
+                if (slot.DayOfWeek < 0 || slot.DayOfWeek > 6)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose a day of the week."] });
+                if (!TimeOnly.TryParse(slot.StartsAtTime, CultureInfo.InvariantCulture, DateTimeStyles.None, out var start)
+                    || !TimeOnly.TryParse(slot.EndsAtTime, CultureInfo.InvariantCulture, DateTimeStyles.None, out var end)
+                    || end <= start)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Each time needs a start and a later end."] });
+                if (prefs.Any(x => x.DayOfWeek == slot.DayOfWeek && x.StartsAtTime == start && x.EndsAtTime == end)) continue;
+                prefs.Add(new StudentWeeklyPreference
+                {
+                    StudentId = studentId,
+                    DayOfWeek = slot.DayOfWeek,
+                    StartsAtTime = start,
+                    EndsAtTime = end,
+                    TimeZoneId = zone,
+                });
+            }
+            if (input.Completed && prefs.Count == 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose at least one weekly time."] });
+
+            var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
+            if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
+            row.QuranLevel = levels[0];
+            row.TajweedLevel = levels[1];
+            row.IslamicStudiesLevel = levels[2];
+            row.TimeZoneId = zone;
+            row.UpdatedAt = DateTimeOffset.UtcNow;
+            // Backing out of the wizard is allowed, but a student who never
+            // finishes is nudged back into it rather than left on the waiting page.
+            if (input.Completed) row.CompletedAt ??= DateTimeOffset.UtcNow;
+
+            var stale = await db.StudentWeeklyPreferences.Where(x => x.StudentId == studentId).ToListAsync();
+            db.StudentWeeklyPreferences.RemoveRange(stale);
+            db.StudentWeeklyPreferences.AddRange(prefs);
+            await db.SaveChangesAsync();
+
+            await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await StudentOnboardingAsync(db, studentId));
+        }).RequireAuthorization("StudentOnly");
 
         api.MapGet("/student/teacher/availability", async (ClaimsPrincipal p, AcademyDbContext db, UserManager<AcademyUser> users) =>
         {
@@ -995,121 +1144,21 @@ public static class ApiEndpoints
         {
             var teacher = await users.FindByIdAsync(id.ToString());
             if (teacher is null || !teacher.IsActive || !await users.IsInRoleAsync(teacher, "teacher")) return Results.NotFound();
+            // Kept for the change-time flow, which only ever runs against the
+            // student's own teacher. Any other teacher stays invisible to them.
+            if (!await db.Assignments.AnyAsync(x => x.TeacherId == id && x.StudentId == UserId(p) && x.IsActive))
+                return Results.NotFound();
             return Results.Ok(await WeeklyAvailabilityAsync(db, teacher, UserId(p), config));
         }).RequireAuthorization("StudentOnly");
-        api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        // Students no longer pick a teacher or book their own weekly times: the
+        // academy assigns both. The booking itself lives in BookWeeklySlotsAsync,
+        // which the admin endpoint below now drives.
+        api.MapPost("/student/bookings", async (BookWeeklySlotsRequest input, ClaimsPrincipal p) =>
         {
-            var studentId = UserId(p);
-            var ruleIds = (input.RuleIds ?? []).Distinct().ToList();
-            if (ruleIds.Count < 1)
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["ruleIds"] = ["Choose at least one weekly slot."] });
-            var rules = await db.TeacherAvailabilityRules.Where(x => ruleIds.Contains(x.Id))
-                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
-            if (rules.Count != ruleIds.Count) return Results.Conflict(new { message = "One of the chosen slots no longer exists." });
-            if (rules.Select(x => x.TeacherId).Distinct().Count() != 1)
-                return Results.Conflict(new { message = "Choose slots from a single teacher." });
-            var teacherId = rules[0].TeacherId;
-            if (!await db.Users.AnyAsync(x => x.Id == teacherId && x.IsActive))
-                return Results.Conflict(new { message = "This teacher is not accepting lessons right now." });
-            var taken = await db.LessonSeries.Where(x => x.IsActive && ruleIds.Contains(x.AvailabilityRuleId))
-                .Select(x => x.AvailabilityRuleId).ToListAsync();
-            if (taken.Count > 0)
-                return Results.Conflict(new { message = "One of the chosen slots was just booked. Refresh and pick another time." });
-            var mySeries = await db.LessonSeries.Where(x => x.StudentId == studentId && x.IsActive).ToListAsync();
-            if (rules.Any(r => mySeries.Any(s => Overlaps(s.DayOfWeek, s.StartsAtTime, s.EndsAtTime, r.DayOfWeek, r.StartsAtTime, r.EndsAtTime))))
-                return Results.Conflict(new { message = "One of the chosen slots overlaps a lesson you already have." });
-            var now = DateTimeOffset.UtcNow;
-            foreach (var rule in rules)
-                foreach (var (start, end) in NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 8))
-                    if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < end && x.EndsAt > start && (x.TeacherId == teacherId || x.StudentId == studentId)))
-                        return Results.Conflict(new { message = "This time conflicts with an existing lesson." });
-
-            await using var tx = await db.Database.BeginTransactionAsync();
-            await db.Assignments.Where(x => x.StudentId == studentId && x.IsActive && x.TeacherId != teacherId)
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
-            var assignment = await db.Assignments.FirstOrDefaultAsync(x => x.StudentId == studentId && x.TeacherId == teacherId);
-            if (assignment is null) db.Assignments.Add(new TeacherStudentAssignment { TeacherId = teacherId, StudentId = studentId });
-            else if (!assignment.IsActive) assignment.IsActive = true;
-
-            var firstEverLesson = !await db.Lessons.AnyAsync(x => x.StudentId == studentId);
-            var series = rules.Select(rule => new LessonSeries
-            {
-                TeacherId = teacherId,
-                StudentId = studentId,
-                AvailabilityRuleId = rule.Id,
-                DayOfWeek = rule.DayOfWeek,
-                StartsAtTime = rule.StartsAtTime,
-                EndsAtTime = rule.EndsAtTime,
-                TimeZoneId = rule.TimeZoneId,
-            }).ToList();
-            db.LessonSeries.AddRange(series);
-            try { await db.SaveChangesAsync(); }
-            catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "One of the chosen slots was just booked. Refresh and pick another time." }); }
-
-            var created = new List<Lesson>();
-            foreach (var s in series)
-            {
-                var skipped = new List<DateTimeOffset>();
-                created.AddRange(await BuildSeriesLessonsAsync(db, s, now, skipped));
-                await AddSkippedWeekNoticesAsync(db, s, skipped);
-            }
-            if (firstEverLesson && created.Count > 0) created.OrderBy(x => x.StartsAt).First().IsTrial = true;
-            await db.SaveChangesAsync();
-            await tx.CommitAsync();
-
-            // Booking a weekly time makes the student assigned, so any open
-            // broadcast offers can no longer be claimed.
-            await db.OpenStudentOffers.Where(x => x.StudentId == studentId && x.Status == "open")
-                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "withdrawn"));
-
-            var seriesIds = series.Select(x => x.Id).ToList();
-            var lessonIds = created.Select(x => x.Id).ToList();
-            var savedSeries = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
-                .Where(x => seriesIds.Contains(x.Id)).ToListAsync();
-            var savedLessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review)
-                .Where(x => lessonIds.Contains(x.Id)).OrderBy(x => x.StartsAt).ToListAsync();
-
-            // The teacher must hear about a new booking right away: the slot is
-            // already theirs, so the notice is the first sign on their schedule.
-            var studentName = savedSeries[0].Student?.FullName ?? "A student";
-            var teacherName = savedSeries[0].Teacher?.FullName ?? "your teacher";
-            var bookingKey = $"booking:{savedSeries[0].Id}";
-            var timeWord = savedSeries.Count == 1 ? "weekly time" : "weekly times";
-            var firstAt = savedLessons.Count > 0
-                ? LessonOpsMessaging.When(savedLessons[0].StartsAt, savedSeries[0].TimeZoneId)
-                : null;
-            db.Notifications.AddRange(
-                new AppNotification
-                {
-                    UserId = teacherId,
-                    Title = "New weekly booking",
-                    Body = firstAt is null
-                        ? $"{studentName} booked {savedSeries.Count} {timeWord} with you. The first lesson is on the way."
-                        : $"{studentName} booked {savedSeries.Count} {timeWord} with you. First lesson {firstAt}.",
-                    Kind = "booking",
-                    Link = "/schedule",
-                    DedupeKey = bookingKey,
-                },
-                new AppNotification
-                {
-                    UserId = studentId,
-                    Title = "Weekly lessons booked",
-                    Body = firstAt is null
-                        ? $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. Open your schedule to see the first lesson."
-                        : $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. First lesson {firstAt}.",
-                    Kind = "booking",
-                    Link = "/schedule",
-                    DedupeKey = $"{bookingKey}:student",
-                });
-            try { await db.SaveChangesAsync(); }
-            catch (DbUpdateException) { /* The booking is already saved; a repeated notice is harmless. */ }
-
-            await realtime.ToParticipantsAsync(teacherId, studentId, RealtimeScopes.Lessons);
-            await realtime.ToUsersAsync([teacherId, studentId], RealtimeScopes.Notifications);
-            await realtime.ToStaffAsync(RealtimeScopes.Admin);
-            await realtime.ToStaffAsync(RealtimeScopes.Directory);
-
-            return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
+            _ = input; _ = p;
+            return Results.Json(
+                new { message = "The academy sets your weekly times for you. Open your dashboard to see what is coming." },
+                statusCode: StatusCodes.Status410Gone);
         }).RequireAuthorization("StudentOnly");
         api.MapGet("/student/series", async (ClaimsPrincipal p, AcademyDbContext db) =>
         {
@@ -1858,7 +1907,7 @@ public static class ApiEndpoints
             {
                 UserId = request.StudentId,
                 Title = "Lesson request could not be confirmed",
-                Body = reason ?? "The academy could not confirm this time. Book another weekly slot or message us.",
+                Body = reason ?? "The academy could not confirm this time. Message us and we will set another one for you.",
                 Kind = "request",
                 Link = "/book",
                 DedupeKey = $"request-rejected:{request.Id}:student",
@@ -2058,7 +2107,7 @@ public static class ApiEndpoints
                 "booking", "/schedule", $"series-ended-by-admin:{series.Id}"));
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 series.StudentId, "Weekly lessons ended",
-                $"The academy ended your weekly lessons with {teacherName} on {when}. You can book another time.",
+                $"The academy ended your weekly lessons with {teacherName} on {when}. We will set a new time for you.",
                 "booking", "/book", $"series-ended-by-admin:{series.Id}"));
         }
         Audit(db, actorId, "admin_availability_released", "TeacherAvailabilityRule", ruleId, $"seriesEnded={seriesList.Count}; lessonsCancelled={cancelled}");
@@ -2075,6 +2124,141 @@ public static class ApiEndpoints
         await realtime.ToStaffAsync(RealtimeScopes.Directory);
         await realtime.ToStaffAsync(RealtimeScopes.Admin);
         return Results.Ok(new { released = seriesList.Count, lessonsCancelled = cancelled });
+    }
+
+    private static async Task<StudentOnboardingDto?> StudentOnboardingAsync(AcademyDbContext db, Guid studentId)
+    {
+        var row = await db.StudentOnboardings.AsNoTracking().FirstOrDefaultAsync(x => x.StudentId == studentId);
+        if (row is null) return null;
+        var prefs = await db.StudentWeeklyPreferences.AsNoTracking()
+            .Where(x => x.StudentId == studentId)
+            .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
+            .ToListAsync();
+        return new StudentOnboardingDto(
+            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+            prefs.Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
+            row.CompletedAt, row.UpdatedAt);
+    }
+
+    /// <summary>
+    /// Turns a teacher's weekly rules into a repeating series for one student and
+    /// makes that teacher the student's assignment. The academy drives this now —
+    /// students no longer book their own times.
+    /// </summary>
+    private static async Task<IResult> BookWeeklySlotsAsync(
+        AcademyDbContext db, Guid studentId, List<Guid>? ruleIds, RealtimeNotifier realtime, Guid? actorId)
+    {
+        var ids = (ruleIds ?? []).Distinct().ToList();
+        if (ids.Count < 1)
+            return Results.ValidationProblem(new Dictionary<string, string[]> { ["ruleIds"] = ["Choose at least one weekly slot."] });
+        var rules = await db.TeacherAvailabilityRules.Where(x => ids.Contains(x.Id))
+            .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+        if (rules.Count != ids.Count) return Results.Conflict(new { message = "One of the chosen slots no longer exists." });
+        if (rules.Select(x => x.TeacherId).Distinct().Count() != 1)
+            return Results.Conflict(new { message = "Choose slots from a single teacher." });
+        var teacherId = rules[0].TeacherId;
+        if (!await db.Users.AnyAsync(x => x.Id == teacherId && x.IsActive))
+            return Results.Conflict(new { message = "This teacher is not accepting lessons right now." });
+        var taken = await db.LessonSeries.Where(x => x.IsActive && ids.Contains(x.AvailabilityRuleId))
+            .Select(x => x.AvailabilityRuleId).ToListAsync();
+        if (taken.Count > 0)
+            return Results.Conflict(new { message = "One of the chosen slots is already taken. Pick another time." });
+        var mySeries = await db.LessonSeries.Where(x => x.StudentId == studentId && x.IsActive).ToListAsync();
+        if (rules.Any(r => mySeries.Any(s => Overlaps(s.DayOfWeek, s.StartsAtTime, s.EndsAtTime, r.DayOfWeek, r.StartsAtTime, r.EndsAtTime))))
+            return Results.Conflict(new { message = "One of the chosen slots overlaps a lesson this student already has." });
+        var now = DateTimeOffset.UtcNow;
+        foreach (var rule in rules)
+            foreach (var (start, end) in NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 8))
+                if (await db.Lessons.AnyAsync(x => x.Status == "scheduled" && x.StartsAt < end && x.EndsAt > start && (x.TeacherId == teacherId || x.StudentId == studentId)))
+                    return Results.Conflict(new { message = "This time conflicts with an existing lesson." });
+
+        await using var tx = await db.Database.BeginTransactionAsync();
+        await db.Assignments.Where(x => x.StudentId == studentId && x.IsActive && x.TeacherId != teacherId)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
+        var assignment = await db.Assignments.FirstOrDefaultAsync(x => x.StudentId == studentId && x.TeacherId == teacherId);
+        if (assignment is null) db.Assignments.Add(new TeacherStudentAssignment { TeacherId = teacherId, StudentId = studentId });
+        else if (!assignment.IsActive) assignment.IsActive = true;
+
+        var firstEverLesson = !await db.Lessons.AnyAsync(x => x.StudentId == studentId);
+        var series = rules.Select(rule => new LessonSeries
+        {
+            TeacherId = teacherId,
+            StudentId = studentId,
+            AvailabilityRuleId = rule.Id,
+            DayOfWeek = rule.DayOfWeek,
+            StartsAtTime = rule.StartsAtTime,
+            EndsAtTime = rule.EndsAtTime,
+            TimeZoneId = rule.TimeZoneId,
+        }).ToList();
+        db.LessonSeries.AddRange(series);
+        try { await db.SaveChangesAsync(); }
+        catch (DbUpdateException) { await tx.RollbackAsync(); return Results.Conflict(new { message = "One of the chosen slots is already taken. Pick another time." }); }
+
+        var created = new List<Lesson>();
+        foreach (var s in series)
+        {
+            var skipped = new List<DateTimeOffset>();
+            created.AddRange(await BuildSeriesLessonsAsync(db, s, now, skipped));
+            await AddSkippedWeekNoticesAsync(db, s, skipped);
+        }
+        if (firstEverLesson && created.Count > 0) created.OrderBy(x => x.StartsAt).First().IsTrial = true;
+        await db.SaveChangesAsync();
+        await tx.CommitAsync();
+
+        // An assigned student no longer needs the broadcast offer other teachers
+        // could claim, so it closes here.
+        await db.OpenStudentOffers.Where(x => x.StudentId == studentId && x.Status == "open")
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "withdrawn"));
+
+        var seriesIds = series.Select(x => x.Id).ToList();
+        var lessonIds = created.Select(x => x.Id).ToList();
+        var savedSeries = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
+            .Where(x => seriesIds.Contains(x.Id)).ToListAsync();
+        var savedLessons = await db.Lessons.Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Report).Include(x => x.Review)
+            .Where(x => lessonIds.Contains(x.Id)).OrderBy(x => x.StartsAt).ToListAsync();
+
+        var studentName = savedSeries[0].Student?.FullName ?? "A student";
+        var teacherName = savedSeries[0].Teacher?.FullName ?? "your teacher";
+        var bookingKey = $"booking:{savedSeries[0].Id}";
+        var timeWord = savedSeries.Count == 1 ? "weekly time" : "weekly times";
+        var firstAt = savedLessons.Count > 0
+            ? LessonOpsMessaging.When(savedLessons[0].StartsAt, savedSeries[0].TimeZoneId)
+            : null;
+        db.Notifications.AddRange(
+            new AppNotification
+            {
+                UserId = teacherId,
+                Title = "New weekly booking",
+                Body = firstAt is null
+                    ? $"{studentName} is learning with you on {savedSeries.Count} {timeWord}. The first lesson is on the way."
+                    : $"{studentName} is learning with you on {savedSeries.Count} {timeWord}. First lesson {firstAt}.",
+                Kind = "booking",
+                Link = "/schedule",
+                DedupeKey = bookingKey,
+            },
+            new AppNotification
+            {
+                UserId = studentId,
+                Title = "Your weekly lessons are set",
+                Body = firstAt is null
+                    ? $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. Open your schedule to see the first lesson."
+                    : $"Your {savedSeries.Count} {timeWord} with {teacherName} repeat every week. First lesson {firstAt}.",
+                Kind = "booking",
+                Link = "/schedule",
+                DedupeKey = $"{bookingKey}:student",
+            });
+        try { await db.SaveChangesAsync(); }
+        catch (DbUpdateException) { /* The booking is already saved; a repeated notice is harmless. */ }
+        if (actorId is not null)
+            Audit(db, actorId, "student.weekly-lessons.booked", "LessonSeries", savedSeries[0].Id,
+                $"{studentName} booked {savedSeries.Count} {timeWord} with {teacherName}");
+
+        await realtime.ToParticipantsAsync(teacherId, studentId, RealtimeScopes.Lessons);
+        await realtime.ToUsersAsync([teacherId, studentId], RealtimeScopes.Notifications);
+        await realtime.ToStaffAsync(RealtimeScopes.Admin);
+        await realtime.ToStaffAsync(RealtimeScopes.Directory);
+
+        return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
     }
 
     private static async Task<List<Lesson>> BuildSeriesLessonsAsync(

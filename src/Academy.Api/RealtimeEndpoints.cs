@@ -11,15 +11,16 @@ public static class RealtimeEndpoints
         {
             var (token, expiresAt) = tickets.Create(user);
 
-            // The browser reaches the API through the Vercel /api rewrite, so the
-            // request host can be the frontend host. Prefer an explicit setting,
-            // then proxy headers, then the request host.
+            // The ticket is requested through the frontend's /api rewrite, so the
+            // hub address is only correct if the operator says what it is. Proxy
+            // headers are not read here: a client controls them, and a spoofed host
+            // would point the lesson room's websocket at a server of the caller's
+            // choosing. When Forwarding:TrustedProxies is configured, the forwarded
+            // headers middleware has already validated and applied them to Host.
             var configured = (config["Realtime:PublicUrl"] ?? "").Trim().TrimEnd('/');
-            var host = request.Headers["X-Forwarded-Host"].FirstOrDefault() ?? request.Host.ToString();
-            var scheme = request.Headers["X-Forwarded-Proto"].FirstOrDefault() ?? request.Scheme;
             var hubUrl = configured.Length > 0
                 ? $"{configured}/api/realtime/hub"
-                : $"{scheme}://{host}/api/realtime/hub";
+                : $"{request.Scheme}://{request.Host}/api/realtime/hub";
 
             return Results.Ok(new { token, expiresAt, hub = hubUrl });
         }).RequireAuthorization();

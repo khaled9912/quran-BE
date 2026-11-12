@@ -33,7 +33,10 @@ Hosting and incident history live in the repository-root `README.md`.
 | `LessonRoom__ReportConcern` | **Off** by default. Enables the student's confidential conduct-concern report (`conduct_concern` incidents answer `404` while off) |
 | `Transcripts__LightCaptureSince` | Approved UTC activation instant (ISO 8601) for coverage-gap expectations. Missing/invalid means no expectations are recorded, so no `no_transcript`/`unsupported_device` gaps appear; lessons before it are never enrolled |
 | `Scheduling__TimeChangeLeadMinutes` | Academy-wide notice, in minutes, a student must leave a teacher when moving a weekly lesson (default `60`). Weekly times whose next class starts inside that window are not offered and are rejected on request; `0` disables the rule |
-| `Realtime__PublicUrl` | Absolute origin the browser should use for the SignalR hub; otherwise proxy headers, then the request host |
+| `Realtime__PublicUrl` | Absolute origin the browser should use for the SignalR hub; otherwise the request's own host. Proxy headers are not consulted |
+| `Forwarding__TrustedProxies` | Comma-separated addresses of the proxies allowed to name the real client (`X-Forwarded-For` / `-Proto`). **Blank by default**, which means those headers are ignored entirely. Set it wherever the API sits behind a same-origin proxy, or every browser shares one rate-limit bucket and the audit log records the proxy's address instead of the user's |
+| `Forwarding__AllowedHosts` | Optional. Enables trusting `X-Forwarded-Host` and limits it to these host names (exact, or `*.example.com`). Prefer setting `Realtime__PublicUrl` instead |
+| `WebPush__PublicKey` / `__PrivateKey` / `__Subject` | VAPID identity for **browser** notifications (`npx web-push generate-vapid-keys`). `GET /api/web-push/key` answers `503` and subscriptions stay off while either half is blank; only the public half is ever sent to a client. Mobile push and the in-app feed do not use these |
 | `SENTRY_DSN` / `Sentry__Dsn` | Error reporting; no-op when empty |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SERVICE_NAME` | Enables OpenTelemetry tracing/metrics when set |
 

@@ -356,9 +356,12 @@ submitted. See
 | GET | `/realtime/ticket` | Any; `{ token, expiresAt, hub }` |
 | WS | `/realtime/hub` | Short-lived ticket, not the cookie |
 
-`hub` honours `Realtime:PublicUrl`, then `X-Forwarded-Host` / `X-Forwarded-Proto`,
-then the request host — the browser reaches the API through the frontend's `/api`
-rewrite, so the request host can be the frontend host. Change scopes are
+`hub` is `Realtime:PublicUrl` when set, otherwise the request's own scheme and
+host — `X-Forwarded-Host` is not read here, because the caller controls it and a
+spoofed host would point the lesson room's websocket at a server of the caller's
+choosing. Those headers are applied to the request only when
+`Forwarding:TrustedProxies` names the proxy in front of the API, so set
+`Realtime:PublicUrl` on any hosted environment. Change scopes are
 `lessons`, `notifications`, `admin`, `self`, `directory`, `offers`, `billing`,
 `policy`, `support`, and `calls` (a lesson ring, sent to both participants).
 Clients fall back to polling every 120 seconds when the socket is down.

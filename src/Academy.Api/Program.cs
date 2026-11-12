@@ -230,11 +230,22 @@ builder.Services.AddSingleton<LessonShareBoard>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// Must be registered before the container is built; any configuration problem it
+// finds is logged once a logger exists. With Forwarding:TrustedProxies unset (the
+// local default) nothing is registered and the peer address stays the only trust.
+var forwardingProblems = new List<string>();
+var forwardedHeaders = Forwarding.TryConfigure(builder.Services, builder.Configuration, forwardingProblems.Add);
+
 var app = builder.Build();
+
 app.Logger.LogInformation(
     "Academy API starting in {Environment}; database bootstrap {BootstrapState}.",
     app.Environment.EnvironmentName,
     builder.Configuration.GetValue("Database:EnsureCreated", true) ? "enabled" : "disabled");
+foreach (var problem in forwardingProblems) app.Logger.LogWarning("{ForwardingProblem}", problem);
+// Registered before anything reads the client address so rate-limit buckets,
+// audit rows and logs all see the real user instead of the proxy's egress IP.
+if (forwardedHeaders) app.UseForwardedHeaders();
 app.UseExceptionHandler(handler => handler.Run(async context =>
 {
     var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
@@ -970,6 +981,34 @@ await using (var scope = app.Services.CreateAsyncScope())
         CREATE INDEX IF NOT EXISTS "IX_OpenStudentOffers_StudentId_StartsAt" ON "OpenStudentOffers" ("StudentId", "StartsAt");
         CREATE INDEX IF NOT EXISTS "IX_OpenStudentOffers_Status_StartsAt" ON "OpenStudentOffers" ("Status", "StartsAt");
         CREATE INDEX IF NOT EXISTS "IX_OpenStudentOffers_Status_ClaimedAt" ON "OpenStudentOffers" ("Status", "ClaimedAt");
+
+        CREATE TABLE IF NOT EXISTS "StudentOnboardings" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "QuranLevel" character varying(20) NOT NULL,
+            "TajweedLevel" character varying(20) NOT NULL,
+            "IslamicStudiesLevel" character varying(20) NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            "CompletedAt" timestamp with time zone,
+            CONSTRAINT "PK_StudentOnboardings" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_StudentOnboardings_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_StudentOnboardings_StudentId" ON "StudentOnboardings" ("StudentId");
+
+        CREATE TABLE IF NOT EXISTS "StudentWeeklyPreferences" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "DayOfWeek" integer NOT NULL,
+            "StartsAtTime" time without time zone NOT NULL,
+            "EndsAtTime" time without time zone NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_StudentWeeklyPreferences" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_StudentWeeklyPreferences_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_StudentWeeklyPreferences_StudentId_DayOfWeek_StartsAtTime_EndsAtTime" ON "StudentWeeklyPreferences" ("StudentId", "DayOfWeek", "StartsAtTime", "EndsAtTime");
 
         CREATE TABLE IF NOT EXISTS "LessonCalls" (
             "Id" uuid NOT NULL,
