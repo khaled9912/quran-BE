@@ -124,6 +124,7 @@ public sealed class StudentOnboarding
     [MaxLength(20)] public string QuranLevel { get; set; } = "";
     [MaxLength(20)] public string TajweedLevel { get; set; } = "";
     [MaxLength(20)] public string IslamicStudiesLevel { get; set; } = "";
+    [MaxLength(20)] public string ArabicLevel { get; set; } = "";
     [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;

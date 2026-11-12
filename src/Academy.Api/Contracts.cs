@@ -27,6 +27,7 @@ public sealed record SaveStudentOnboardingRequest(
     string? QuranLevel,
     string? TajweedLevel,
     string? IslamicStudiesLevel,
+    string? ArabicLevel,
     string? TimeZoneId,
     List<StudentWeeklyPreferenceInput>? WeeklySlots,
     bool Completed);
@@ -36,6 +37,7 @@ public sealed record StudentOnboardingDto(
     string QuranLevel,
     string TajweedLevel,
     string IslamicStudiesLevel,
+    string ArabicLevel,
     string TimeZoneId,
     IReadOnlyList<StudentWeeklyPreferenceDto> WeeklySlots,
     DateTimeOffset? CompletedAt,

@@ -723,7 +723,7 @@ public static class ApiEndpoints
                     student.Email ?? "",
                     student.CreatedAt,
                     row is null ? null : new StudentOnboardingDto(
-                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId,
                         prefs.Where(x => x.StudentId == student.Id)
                             .Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
                         row.CompletedAt, row.UpdatedAt),
@@ -1060,8 +1060,8 @@ public static class ApiEndpoints
         api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             var studentId = UserId(p);
-            var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel" };
-            var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel }
+            var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel", "arabicLevel" };
+            var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel, input.ArabicLevel }
                 .Select(value => (value ?? "").Trim().ToLowerInvariant())
                 .ToArray();
             for (var i = 0; i < levels.Length; i++)
@@ -1077,7 +1077,7 @@ public static class ApiEndpoints
                 zone = "UTC";
 
             var prefs = new List<StudentWeeklyPreference>();
-            foreach (var slot in (input.WeeklySlots ?? []).Take(21))
+            foreach (var slot in (input.WeeklySlots ?? []).Take(168))
             {
                 if (slot.DayOfWeek < 0 || slot.DayOfWeek > 6)
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose a day of the week."] });
@@ -1103,6 +1103,7 @@ public static class ApiEndpoints
             row.QuranLevel = levels[0];
             row.TajweedLevel = levels[1];
             row.IslamicStudiesLevel = levels[2];
+            row.ArabicLevel = levels[3];
             row.TimeZoneId = zone;
             row.UpdatedAt = DateTimeOffset.UtcNow;
             // Backing out of the wizard is allowed, but a student who never
@@ -2135,7 +2136,7 @@ public static class ApiEndpoints
             .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
             .ToListAsync();
         return new StudentOnboardingDto(
-            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId,
             prefs.Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
             row.CompletedAt, row.UpdatedAt);
     }
