@@ -37,12 +37,32 @@ public static class TeacherApplicationEndpoints
             .RequireRateLimiting("applications");
 
         var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
+        // Applications carry a teacher's phone number, email, CV and voice
+        // recordings. A shared browser or a cached admin tab must not keep them.
+        admin.AddEndpointFilter(async (context, next) =>
+        {
+            context.HttpContext.Response.Headers.CacheControl = "no-store";
+            return await next(context);
+        });
+
         admin.MapGet("/teacher-applications", ListApplicationsAsync);
         admin.MapGet("/teacher-applications/{id:guid}/cv", DownloadCvAsync);
         admin.MapGet("/teacher-applications/{id:guid}/intro", DownloadIntroAsync);
         admin.MapGet("/teacher-applications/{id:guid}/quran", DownloadQuranRecordingAsync);
         admin.MapPatch("/teacher-applications/{id:guid}", ReviewApplicationAsync);
     }
+
+    private static void Audit(
+        AcademyDbContext db, Guid? actorId, HttpContext http, string action, Guid applicationId, string detail) =>
+        db.AuditLogs.Add(new AuditLog
+        {
+            ActorId = actorId,
+            Action = action,
+            EntityType = "TeacherApplication",
+            EntityId = applicationId,
+            Detail = detail,
+            SourceIp = http.Connection.RemoteIpAddress?.ToString(),
+        });
 
     private static async Task<IResult> SubmitApplicationAsync(
         HttpContext http,
@@ -285,28 +305,46 @@ public static class TeacherApplicationEndpoints
             x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName, x.QuranRecordingFileName)).ToList());
     }
 
-    private static async Task<IResult> DownloadCvAsync(Guid id, [FromServices] AcademyDbContext db)
+    private static async Task<IResult> DownloadCvAsync(
+        Guid id, ClaimsPrincipal principal, HttpContext http, [FromServices] AcademyDbContext db)
     {
         var cv = await db.TeacherApplicationCvs.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.ApplicationId == id);
+            .FirstOrDefaultAsync(x => x.ApplicationId == id, http.RequestAborted);
         if (cv is null) return Results.NotFound();
+        await RecordFileViewAsync(db, principal, http, id, "cv", http.RequestAborted);
         return Results.File(cv.Data, cv.ContentType, SafeFileName(cv.FileName));
     }
 
-    private static async Task<IResult> DownloadIntroAsync(Guid id, [FromServices] AcademyDbContext db)
+    private static async Task<IResult> DownloadIntroAsync(
+        Guid id, ClaimsPrincipal principal, HttpContext http, [FromServices] AcademyDbContext db)
     {
         var intro = await db.TeacherApplicationIntros.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.ApplicationId == id);
+            .FirstOrDefaultAsync(x => x.ApplicationId == id, http.RequestAborted);
         if (intro is null) return Results.NotFound();
+        await RecordFileViewAsync(db, principal, http, id, "self-introduction", http.RequestAborted);
         return Results.File(intro.Data, intro.ContentType, SafeFileName(intro.FileName, "self-introduction.webm"));
     }
 
-    private static async Task<IResult> DownloadQuranRecordingAsync(Guid id, [FromServices] AcademyDbContext db)
+    private static async Task<IResult> DownloadQuranRecordingAsync(
+        Guid id, ClaimsPrincipal principal, HttpContext http, [FromServices] AcademyDbContext db)
     {
         var recording = await db.TeacherApplicationQuranRecordings.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.ApplicationId == id);
+            .FirstOrDefaultAsync(x => x.ApplicationId == id, http.RequestAborted);
         if (recording is null) return Results.NotFound();
+        await RecordFileViewAsync(db, principal, http, id, "quran recitation", http.RequestAborted);
         return Results.File(recording.Data, recording.ContentType, SafeFileName(recording.FileName, "quran-recitation.webm"));
+    }
+
+    /// <summary>
+    /// Applicant documents are personal recordings and CVs, so an administrator
+    /// opening one leaves a row the academy can point at if the applicant later
+    /// says their material was read.
+    /// </summary>
+    private static async Task RecordFileViewAsync(
+        AcademyDbContext db, ClaimsPrincipal principal, HttpContext http, Guid id, string kind, CancellationToken ct)
+    {
+        Audit(db, ApiEndpoints.UserId(principal), http, "teacher_application_file_viewed", id, kind);
+        await db.SaveChangesAsync(ct);
     }
 
     private static async Task<IResult> ReviewApplicationAsync(
@@ -372,6 +410,12 @@ public static class TeacherApplicationEndpoints
         application.ReviewedBy = ApiEndpoints.UserId(principal);
         application.ReviewedAt = DateTimeOffset.UtcNow;
         application.RejectionReason = next == "rejected" ? reason : null;
+
+        Audit(db, ApiEndpoints.UserId(principal), http,
+            next == "approved" ? "teacher_application_approved" : "teacher_application_rejected",
+            application.Id, next == "approved"
+                ? $"Teacher account {application.TeacherId} created."
+                : reason ?? "");
 
         try
         {

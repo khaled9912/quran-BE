@@ -230,11 +230,22 @@ builder.Services.AddSingleton<LessonShareBoard>();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// Must be registered before the container is built; any configuration problem it
+// finds is logged once a logger exists. With Forwarding:TrustedProxies unset (the
+// local default) nothing is registered and the peer address stays the only trust.
+var forwardingProblems = new List<string>();
+var forwardedHeaders = Forwarding.TryConfigure(builder.Services, builder.Configuration, forwardingProblems.Add);
+
 var app = builder.Build();
+
 app.Logger.LogInformation(
     "Academy API starting in {Environment}; database bootstrap {BootstrapState}.",
     app.Environment.EnvironmentName,
     builder.Configuration.GetValue("Database:EnsureCreated", true) ? "enabled" : "disabled");
+foreach (var problem in forwardingProblems) app.Logger.LogWarning("{ForwardingProblem}", problem);
+// Registered before anything reads the client address so rate-limit buckets,
+// audit rows and logs all see the real user instead of the proxy's egress IP.
+if (forwardedHeaders) app.UseForwardedHeaders();
 app.UseExceptionHandler(handler => handler.Run(async context =>
 {
     var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
