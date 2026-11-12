@@ -140,14 +140,12 @@ public static class ApiEndpoints
         var api = app.MapGroup("/api");
 
         var auth = api.MapGroup("/auth").AllowAnonymous();
-        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, HttpContext http) =>
+        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
             if (NameContainsContact(input.FullName))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter the student's name, not an email address."] });
-            if (!RegistrationPolicy.IsAllowed(http, input.Country))
-                return Results.Problem(RegistrationPolicy.BlockedMessage, statusCode: 403);
             var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
             var result = await users.CreateAsync(user, input.Password);
             if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
@@ -464,7 +462,7 @@ public static class ApiEndpoints
             });
         }).RequireRateLimiting("otp");
 
-        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn, HttpContext http) =>
+        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
             var phone = PhoneNumbers.Normalize(input.Phone);
             if (phone is null || string.IsNullOrWhiteSpace(input.Code))
@@ -474,9 +472,6 @@ public static class ApiEndpoints
             var user = users.Users.FirstOrDefault(x => x.PhoneNumber == phone);
             if (user is null)
             {
-                // Only new accounts are gated; existing students can sign in from anywhere.
-                if (!RegistrationPolicy.IsAllowed(http, input.Country))
-                    return Results.Problem(RegistrationPolicy.BlockedMessage, statusCode: 403);
                 var fullName = input.FullName?.Trim() ?? "";
                 if (fullName.Length == 0) return Results.Ok(new { requiresProfile = true });
                 if (fullName.Length is < 2 or > 160)
