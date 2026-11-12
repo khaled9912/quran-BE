@@ -22,6 +22,32 @@ public sealed record RequestSlotInput(Guid AvailabilitySlotId);
 public sealed record PublishOpenOfferRequest(DateTimeOffset StartsAt, DateTimeOffset EndsAt);
 public sealed record CreateAvailabilityRulesRequest(List<int>? DaysOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
 public sealed record BookWeeklySlotsRequest(List<Guid>? RuleIds);
+public sealed record StudentWeeklyPreferenceInput(int DayOfWeek, string StartsAtTime, string EndsAtTime);
+public sealed record SaveStudentOnboardingRequest(
+    string? QuranLevel,
+    string? TajweedLevel,
+    string? IslamicStudiesLevel,
+    string? TimeZoneId,
+    List<StudentWeeklyPreferenceInput>? WeeklySlots,
+    bool Completed);
+public sealed record StudentWeeklyPreferenceDto(Guid Id, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
+public sealed record StudentOnboardingDto(
+    Guid StudentId,
+    string QuranLevel,
+    string TajweedLevel,
+    string IslamicStudiesLevel,
+    string TimeZoneId,
+    IReadOnlyList<StudentWeeklyPreferenceDto> WeeklySlots,
+    DateTimeOffset? CompletedAt,
+    DateTimeOffset UpdatedAt);
+public sealed record PendingStudentDto(
+    Guid StudentId,
+    string StudentName,
+    string Email,
+    DateTimeOffset RegisteredAt,
+    StudentOnboardingDto? Onboarding,
+    bool HasTeacher,
+    string? TeacherName);
 public sealed record CreateLessonChangeRequestInput(Guid RequestedRuleId, string? Note);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);

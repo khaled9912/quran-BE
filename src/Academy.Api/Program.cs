@@ -971,6 +971,34 @@ await using (var scope = app.Services.CreateAsyncScope())
         CREATE INDEX IF NOT EXISTS "IX_OpenStudentOffers_Status_StartsAt" ON "OpenStudentOffers" ("Status", "StartsAt");
         CREATE INDEX IF NOT EXISTS "IX_OpenStudentOffers_Status_ClaimedAt" ON "OpenStudentOffers" ("Status", "ClaimedAt");
 
+        CREATE TABLE IF NOT EXISTS "StudentOnboardings" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "QuranLevel" character varying(20) NOT NULL,
+            "TajweedLevel" character varying(20) NOT NULL,
+            "IslamicStudiesLevel" character varying(20) NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            "CompletedAt" timestamp with time zone,
+            CONSTRAINT "PK_StudentOnboardings" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_StudentOnboardings_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_StudentOnboardings_StudentId" ON "StudentOnboardings" ("StudentId");
+
+        CREATE TABLE IF NOT EXISTS "StudentWeeklyPreferences" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "DayOfWeek" integer NOT NULL,
+            "StartsAtTime" time without time zone NOT NULL,
+            "EndsAtTime" time without time zone NOT NULL,
+            "TimeZoneId" character varying(100) NOT NULL,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_StudentWeeklyPreferences" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_StudentWeeklyPreferences_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_StudentWeeklyPreferences_StudentId_DayOfWeek_StartsAtTime_EndsAtTime" ON "StudentWeeklyPreferences" ("StudentId", "DayOfWeek", "StartsAtTime", "EndsAtTime");
+
         CREATE TABLE IF NOT EXISTS "LessonCalls" (
             "Id" uuid NOT NULL,
             "LessonId" uuid NOT NULL,

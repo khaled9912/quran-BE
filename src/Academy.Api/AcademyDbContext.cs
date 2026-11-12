@@ -46,6 +46,8 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
     public DbSet<TeacherStudentAssignment> Assignments => Set<TeacherStudentAssignment>();
     public DbSet<AvailabilitySlot> AvailabilitySlots => Set<AvailabilitySlot>();
     public DbSet<StudentAvailability> StudentAvailabilities => Set<StudentAvailability>();
+    public DbSet<StudentOnboarding> StudentOnboardings => Set<StudentOnboarding>();
+    public DbSet<StudentWeeklyPreference> StudentWeeklyPreferences => Set<StudentWeeklyPreference>();
     public DbSet<OpenStudentOffer> OpenStudentOffers => Set<OpenStudentOffer>();
     public DbSet<LessonRequest> LessonRequests => Set<LessonRequest>();
     public DbSet<TeacherAvailabilityRule> TeacherAvailabilityRules => Set<TeacherAvailabilityRule>();
@@ -118,6 +120,10 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         b.Entity<StudentAvailability>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<StudentAvailability>().HasOne(x => x.Teacher).WithMany().HasForeignKey(x => x.TeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<StudentAvailability>().HasIndex(x => new { x.StudentId, x.StartsAt, x.EndsAt });
+        b.Entity<StudentOnboarding>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<StudentOnboarding>().HasIndex(x => x.StudentId).IsUnique();
+        b.Entity<StudentWeeklyPreference>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<StudentWeeklyPreference>().HasIndex(x => new { x.StudentId, x.DayOfWeek, x.StartsAtTime, x.EndsAtTime }).IsUnique();
         b.Entity<OpenStudentOffer>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<OpenStudentOffer>().HasOne(x => x.ClaimedByTeacher).WithMany().HasForeignKey(x => x.ClaimedByTeacherId).OnDelete(DeleteBehavior.Restrict);
         b.Entity<OpenStudentOffer>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.SetNull);
