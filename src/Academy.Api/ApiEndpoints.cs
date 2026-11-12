@@ -1057,7 +1057,7 @@ public static class ApiEndpoints
         api.MapGet("/student/onboarding", async (ClaimsPrincipal p, AcademyDbContext db) =>
             Results.Ok(await StudentOnboardingAsync(db, UserId(p))))
             .RequireAuthorization("StudentOnly");
-        api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
         {
             var studentId = UserId(p);
             var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel", "arabicLevel" };
@@ -1108,12 +1108,18 @@ public static class ApiEndpoints
             row.UpdatedAt = DateTimeOffset.UtcNow;
             // Backing out of the wizard is allowed, but a student who never
             // finishes is nudged back into it rather than left on the waiting page.
+            var firstCompletion = input.Completed && row.CompletedAt is null;
             if (input.Completed) row.CompletedAt ??= DateTimeOffset.UtcNow;
 
             var stale = await db.StudentWeeklyPreferences.Where(x => x.StudentId == studentId).ToListAsync();
             db.StudentWeeklyPreferences.RemoveRange(stale);
             db.StudentWeeklyPreferences.AddRange(prefs);
             await db.SaveChangesAsync();
+
+            // The desk already shows the queue; this is what tells someone to look
+            // at it. A student who already has a teacher is not waiting on anyone.
+            if (firstCompletion && !await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.IsActive))
+                await AnnounceStudentApplicationAsync(db, realtime, push, studentId, row, prefs);
 
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
             return Results.Ok(await StudentOnboardingAsync(db, studentId));
@@ -2139,6 +2145,56 @@ public static class ApiEndpoints
             row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId,
             prefs.Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
             row.CompletedAt, row.UpdatedAt);
+    }
+
+    /// <summary>
+    /// A finished setup is an application someone has to act on, so every admin's
+    /// bell carries the answers that decide the placement: the four levels and the
+    /// first window the student is free in. The assignment desk holds the rest,
+    /// and the per-admin dedupe key means one student is announced once.
+    /// </summary>
+    private static async Task AnnounceStudentApplicationAsync(
+        AcademyDbContext db,
+        RealtimeNotifier realtime,
+        AcademyPushSender push,
+        Guid studentId,
+        StudentOnboarding row,
+        List<StudentWeeklyPreference> prefs)
+    {
+        var adminIds = await LessonOpsMessaging.AdminUserIdsAsync(db);
+        if (adminIds.Count == 0) return;
+
+        var name = DisplayName(await db.Users.AsNoTracking()
+            .Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync()) ?? "A student";
+        var title = "Student waiting for a teacher";
+        var body = $"{name} finished their setup: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}";
+        const string link = "/people/assign";
+
+        foreach (var adminId in adminIds)
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                adminId, title, body, "request", link, $"student-waiting:{studentId}:admin:{adminId}"));
+        await db.SaveChangesAsync();
+
+        await realtime.ToUsersAsync(adminIds, RealtimeScopes.Notifications);
+        await LessonOpsMessaging.PushAsync(db, push, adminIds, title, body, link);
+    }
+
+    private static string ApplicationLevels(StudentOnboarding row) =>
+        $"Quran {LevelWord(row.QuranLevel)}, Tajweed {LevelWord(row.TajweedLevel)}, " +
+        $"Studies {LevelWord(row.IslamicStudiesLevel)}, Arabic {LevelWord(row.ArabicLevel)}";
+
+    private static string LevelWord(string value) =>
+        value.Length == 0 ? "not given" : $"{char.ToUpperInvariant(value[0])}{value[1..]}";
+
+    /// <summary>The earliest window they offered, named once, then how many more there are.</summary>
+    private static string ApplicationTimes(List<StudentWeeklyPreference> prefs, string zone)
+    {
+        if (prefs.Count == 0) return "No weekly times given yet.";
+        var first = prefs.OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).First();
+        var at = LessonOpsMessaging.WeeklyAt(first.DayOfWeek, first.StartsAtTime, zone);
+        return prefs.Count == 1
+            ? $"Free {at}."
+            : $"Free {at} and {prefs.Count - 1} more.";
     }
 
     /// <summary>
