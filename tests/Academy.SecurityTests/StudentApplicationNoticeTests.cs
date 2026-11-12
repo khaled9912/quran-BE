@@ -72,7 +72,7 @@ public sealed class StudentApplicationNoticeTests(PostgresFixture postgres) : Ap
     }
 
     [Fact]
-    public async Task RepeatingACompletedSetupDoesNotAnnounceTheStudentTwice()
+    public async Task UpdatingTheApplicationTellsTheDeskAgain()
     {
         var (student, _) = await Factory.LoginAsAsync("student");
         using var _ = student;
@@ -80,7 +80,13 @@ public sealed class StudentApplicationNoticeTests(PostgresFixture postgres) : Ap
 
         Assert.Equal(HttpStatusCode.OK, (await student.PutAsJsonAsync("/api/student/onboarding", Draft(true))).StatusCode);
         Assert.Equal(HttpStatusCode.OK, (await student.PutAsJsonAsync("/api/student/onboarding", Draft(true))).StatusCode);
-        Assert.Single(await NoticesAsync());
+
+        var notices = await NoticesAsync();
+        Assert.Equal(2, notices.Count);
+        Assert.Single(notices, x => x.Title == "Student waiting for a teacher");
+        var update = Assert.Single(notices, x => x.Title == "Student updated their application");
+        Assert.Contains("still waiting for a teacher", update.Body);
+        Assert.Contains("Arabic Beginner", update.Body);
     }
 
     [Fact]

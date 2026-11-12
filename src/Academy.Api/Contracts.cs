@@ -32,6 +32,7 @@ public sealed record SaveStudentOnboardingRequest(
     List<StudentWeeklyPreferenceInput>? WeeklySlots,
     bool Completed);
 public sealed record StudentWeeklyPreferenceDto(Guid Id, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
+public sealed record ChooseStudentPlanRequest(int DaysPerWeek);
 public sealed record StudentOnboardingDto(
     Guid StudentId,
     string QuranLevel,
@@ -39,6 +40,7 @@ public sealed record StudentOnboardingDto(
     string IslamicStudiesLevel,
     string ArabicLevel,
     string TimeZoneId,
+    int PlanDaysPerWeek,
     IReadOnlyList<StudentWeeklyPreferenceDto> WeeklySlots,
     DateTimeOffset? CompletedAt,
     DateTimeOffset UpdatedAt);

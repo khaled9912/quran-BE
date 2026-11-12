@@ -113,8 +113,9 @@ public sealed class StudentAvailability
 
 /// <summary>
 /// What a student tells the academy before a teacher is assigned: their level in
-/// each subject and the weekly times they could take a lesson. These are
-/// preferences, not bookings — only the admin turns them into a lesson series.
+/// each subject, how many days a week they want, and the weekly times they could
+/// take a lesson in. These are preferences, not bookings — only the admin turns
+/// them into a lesson series.
 /// </summary>
 public sealed class StudentOnboarding
 {
@@ -126,6 +127,11 @@ public sealed class StudentOnboarding
     [MaxLength(20)] public string IslamicStudiesLevel { get; set; } = "";
     [MaxLength(20)] public string ArabicLevel { get; set; } = "";
     [MaxLength(100)] public string TimeZoneId { get; set; } = "UTC";
+    /// <summary>
+    /// How many days a week the student asked for on the public plans page. Zero
+    /// means they have not chosen one yet; it is a wish, not a subscription.
+    /// </summary>
+    public int PlanDaysPerWeek { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     /// <summary>Set when the student finishes the wizard; until then they are sent back to it.</summary>

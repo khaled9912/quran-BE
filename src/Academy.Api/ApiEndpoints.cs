@@ -33,6 +33,10 @@ public static class ApiEndpoints
     // words are shown to the admin when they match a student to a teacher.
     public static readonly string[] StudentLevels = new[] { "beginner", "intermediate", "advanced" };
 
+    // The tiers published on /plans. A student recording a wish is not opening a
+    // subscription, but the desk only ever reads one of these numbers.
+    public static readonly int[] StudentPlanDaysPerWeek = new[] { 2, 3, 4, 5 };
+
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
@@ -669,6 +673,29 @@ public static class ApiEndpoints
             if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
             return Results.Ok((await q.OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToChangeRequest));
         });
+        // Every active teacher's published week in one call, so the assignment
+        // desk can rank teachers against a student's offered hours without
+        // fetching them one at a time.
+        admin.MapGet("/teachers/availability-rules", async (AcademyDbContext db) =>
+        {
+            var teacherIds = await ActiveTeacherIdsAsync(db);
+            if (teacherIds.Count == 0) return Results.Ok(new List<WeeklyRuleDto>());
+
+            var rules = await db.TeacherAvailabilityRules
+                .Where(x => teacherIds.Contains(x.TeacherId))
+                .OrderBy(x => x.TeacherId).ThenBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
+                .ToListAsync();
+            var bookedRuleIds = (await db.LessonSeries
+                .Where(x => x.IsActive && teacherIds.Contains(x.TeacherId))
+                .Select(x => x.AvailabilityRuleId).ToListAsync()).ToHashSet();
+            var now = DateTimeOffset.UtcNow;
+            return Results.Ok(rules.Select(rule =>
+            {
+                var next = NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 2).FirstOrDefault();
+                return ToRule(rule, bookedRuleIds.Contains(rule.Id) ? "booked" : "available",
+                    next.StartsAt == default ? null : next.StartsAt);
+            }).ToList());
+        });
         admin.MapGet("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, AcademyDbContext db) =>
             await db.Users.AnyAsync(x => x.Id == teacherId)
                 ? Results.Ok(await WeeklyRulesAsync(db, teacherId, null))
@@ -723,7 +750,7 @@ public static class ApiEndpoints
                     student.Email ?? "",
                     student.CreatedAt,
                     row is null ? null : new StudentOnboardingDto(
-                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId,
+                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId, row.PlanDaysPerWeek,
                         prefs.Where(x => x.StudentId == student.Id)
                             .Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
                         row.CompletedAt, row.UpdatedAt),
@@ -1117,11 +1144,35 @@ public static class ApiEndpoints
             await db.SaveChangesAsync();
 
             // The desk already shows the queue; this is what tells someone to look
-            // at it. A student who already has a teacher is not waiting on anyone.
-            if (firstCompletion && !await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.IsActive))
-                await AnnounceStudentApplicationAsync(db, realtime, push, studentId, row, prefs);
+            // at it. A student who already has a teacher is not waiting on anyone,
+            // and one who backs out of the wizard mid-way has not applied yet.
+            if (input.Completed && !await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.IsActive))
+                await AnnounceStudentApplicationAsync(db, realtime, push, studentId, row, prefs, firstCompletion);
 
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await StudentOnboardingAsync(db, studentId));
+        }).RequireAuthorization("StudentOnly");
+
+        // What the student asked for on /plans. Nothing is billed from it — the
+        // fee still comes from the lessons that actually took place — but the
+        // assignment desk reads it next to their hours to know how much academy
+        // the family expects, and asks for the money accordingly.
+        api.MapPatch("/student/plan", async (ChooseStudentPlanRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            if (Array.IndexOf(StudentPlanDaysPerWeek, input.DaysPerWeek) < 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose one of the plans on the plans page."] });
+
+            var studentId = UserId(p);
+            var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
+            if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
+            if (row.PlanDaysPerWeek != input.DaysPerWeek)
+            {
+                row.PlanDaysPerWeek = input.DaysPerWeek;
+                row.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync();
+                await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            }
+
             return Results.Ok(await StudentOnboardingAsync(db, studentId));
         }).RequireAuthorization("StudentOnly");
 
@@ -2142,16 +2193,17 @@ public static class ApiEndpoints
             .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
             .ToListAsync();
         return new StudentOnboardingDto(
-            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId,
+            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId, row.PlanDaysPerWeek,
             prefs.Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
             row.CompletedAt, row.UpdatedAt);
     }
 
     /// <summary>
-    /// A finished setup is an application someone has to act on, so every admin's
-    /// bell carries the answers that decide the placement: the four levels and the
-    /// first window the student is free in. The assignment desk holds the rest,
-    /// and the per-admin dedupe key means one student is announced once.
+    /// An application someone has to act on goes to every admin's bell with the
+    /// answers that decide the placement: the four levels and the first window
+    /// the student is free in. The assignment desk holds the rest. Each save has
+    /// its own dedupe key, so a student updating their application is never
+    /// silently swallowed by the notice their first submission already sent.
     /// </summary>
     private static async Task AnnounceStudentApplicationAsync(
         AcademyDbContext db,
@@ -2159,20 +2211,24 @@ public static class ApiEndpoints
         AcademyPushSender push,
         Guid studentId,
         StudentOnboarding row,
-        List<StudentWeeklyPreference> prefs)
+        List<StudentWeeklyPreference> prefs,
+        bool firstCompletion)
     {
         var adminIds = await LessonOpsMessaging.AdminUserIdsAsync(db);
         if (adminIds.Count == 0) return;
 
         var name = DisplayName(await db.Users.AsNoTracking()
             .Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync()) ?? "A student";
-        var title = "Student waiting for a teacher";
-        var body = $"{name} finished their setup: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}";
+        var title = firstCompletion ? "Student waiting for a teacher" : "Student updated their application";
+        var body = firstCompletion
+            ? $"{name} finished their setup: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}"
+            : $"{name} is still waiting for a teacher and updated their application: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}";
         const string link = "/people/assign";
+        var stamp = row.UpdatedAt.ToUniversalTime().ToString("yyyyMMddHHmmssfffffff", CultureInfo.InvariantCulture);
 
         foreach (var adminId in adminIds)
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                adminId, title, body, "request", link, $"student-waiting:{studentId}:admin:{adminId}"));
+                adminId, title, body, "request", link, $"student-waiting:{studentId}:{stamp}:admin:{adminId}"));
         await db.SaveChangesAsync();
 
         await realtime.ToUsersAsync(adminIds, RealtimeScopes.Notifications);

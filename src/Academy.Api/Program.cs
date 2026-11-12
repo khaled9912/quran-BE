@@ -990,6 +990,7 @@ await using (var scope = app.Services.CreateAsyncScope())
             "IslamicStudiesLevel" character varying(20) NOT NULL,
             "ArabicLevel" character varying(20) NOT NULL,
             "TimeZoneId" character varying(100) NOT NULL,
+            "PlanDaysPerWeek" integer NOT NULL DEFAULT 0,
             "CreatedAt" timestamp with time zone NOT NULL,
             "UpdatedAt" timestamp with time zone NOT NULL,
             "CompletedAt" timestamp with time zone,
@@ -998,6 +999,7 @@ await using (var scope = app.Services.CreateAsyncScope())
         );
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_StudentOnboardings_StudentId" ON "StudentOnboardings" ("StudentId");
         ALTER TABLE "StudentOnboardings" ADD COLUMN IF NOT EXISTS "ArabicLevel" character varying(20) NOT NULL DEFAULT '';
+        ALTER TABLE "StudentOnboardings" ADD COLUMN IF NOT EXISTS "PlanDaysPerWeek" integer NOT NULL DEFAULT 0;
 
         CREATE TABLE IF NOT EXISTS "StudentWeeklyPreferences" (
             "Id" uuid NOT NULL,
