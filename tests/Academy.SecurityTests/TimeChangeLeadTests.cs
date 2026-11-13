@@ -74,6 +74,9 @@ public sealed class TimeChangeLeadTests(PostgresFixture postgres) : ApiTestBase(
         await Factory.WithDbAsync(async db =>
         {
             db.TeacherAvailabilityRules.AddRange(home, soon, far);
+            // A student only ever reads their own teacher's week, and that
+            // visibility comes from the assignment the academy made.
+            db.Assignments.Add(new TeacherStudentAssignment { TeacherId = teacher.Id, StudentId = student.Id });
             db.LessonSeries.Add(new LessonSeries
             {
                 TeacherId = teacher.Id,
