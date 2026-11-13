@@ -29,9 +29,12 @@ public sealed record SaveStudentOnboardingRequest(
     string? IslamicStudiesLevel,
     string? ArabicLevel,
     string? TimeZoneId,
+    int? DaysPerWeek,
     List<StudentWeeklyPreferenceInput>? WeeklySlots,
     bool Completed);
 public sealed record StudentWeeklyPreferenceDto(Guid Id, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
+/// <summary>A repeating weekly lesson the student already has, on their teacher's clock.</summary>
+public sealed record StudentWeeklyLessonDto(Guid Id, int DayOfWeek, string StartsAtTime, string EndsAtTime, string TimeZoneId);
 public sealed record ChooseStudentPlanRequest(int DaysPerWeek);
 public sealed record StudentOnboardingDto(
     Guid StudentId,
@@ -51,7 +54,8 @@ public sealed record PendingStudentDto(
     DateTimeOffset RegisteredAt,
     StudentOnboardingDto? Onboarding,
     bool HasTeacher,
-    string? TeacherName);
+    string? TeacherName,
+    IReadOnlyList<StudentWeeklyLessonDto> WeeklyLessons);
 public sealed record CreateLessonChangeRequestInput(Guid RequestedRuleId, string? Note);
 public sealed record SaveLessonReportRequest(string ClassSummary, string StudentFeedback, string Progress);
 public sealed record SaveTeacherReviewRequest(int Rating, string? Comment);

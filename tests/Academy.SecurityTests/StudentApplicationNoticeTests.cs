@@ -17,6 +17,7 @@ public sealed class StudentApplicationNoticeTests(PostgresFixture postgres) : Ap
         islamicStudiesLevel = "advanced",
         arabicLevel = "beginner",
         timeZoneId = "Europe/London",
+        daysPerWeek = 2,
         weeklySlots = new object[]
         {
             new { dayOfWeek = 6, startsAtTime = "19:00", endsAtTime = "20:00" },

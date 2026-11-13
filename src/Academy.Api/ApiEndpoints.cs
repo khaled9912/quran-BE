@@ -738,6 +738,10 @@ public static class ApiEndpoints
                 .ToDictionaryAsync(x => x.StudentId);
             var prefs = await db.StudentWeeklyPreferences.AsNoTracking().Where(x => ids.Contains(x.StudentId))
                 .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+            // What the student already has, so the desk can say which of the hours
+            // they offered are still waiting for a teacher.
+            var booked = await db.LessonSeries.AsNoTracking().Where(x => x.IsActive && ids.Contains(x.StudentId))
+                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
 
             var rows = new List<PendingStudentDto>();
             foreach (var student in students)
@@ -755,7 +759,9 @@ public static class ApiEndpoints
                             .Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
                         row.CompletedAt, row.UpdatedAt),
                     teacherId is not null,
-                    teacherId is null ? null : teacherNames.GetValueOrDefault(teacherId.Value)));
+                    teacherId is null ? null : teacherNames.GetValueOrDefault(teacherId.Value),
+                    booked.Where(x => x.StudentId == student.Id)
+                        .Select(x => new StudentWeeklyLessonDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList()));
             }
             // Nobody should wait unseen: the longest-waiting student comes first.
             return Results.Ok(rows.OrderBy(x => x.HasTeacher).ThenBy(x => x.RegisteredAt).ToList());
@@ -1103,6 +1109,9 @@ public static class ApiEndpoints
             if (zone.Length == 0 || TimeZoneInfo.TryFindSystemTimeZoneById(zone, out _) is false)
                 zone = "UTC";
 
+            if (input.DaysPerWeek is not null && Array.IndexOf(StudentPlanDaysPerWeek, input.DaysPerWeek.Value) < 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose 2, 3, 4 or 5 days a week."] });
+
             var prefs = new List<StudentWeeklyPreference>();
             foreach (var slot in (input.WeeklySlots ?? []).Take(168))
             {
@@ -1126,7 +1135,21 @@ public static class ApiEndpoints
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose at least one weekly time."] });
 
             var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
+            // A plan is a promise about the week, so the hours offered have to be
+            // able to keep it. Mid-wizard the answer may still be missing; a
+            // finished application may not.
+            var planDays = input.DaysPerWeek ?? row?.PlanDaysPerWeek ?? 0;
+            if (input.Completed)
+            {
+                if (planDays == 0)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose how many days a week you want to learn."] });
+                var offeredDays = prefs.Select(x => x.DayOfWeek).Distinct().Count();
+                if (offeredDays < planDays)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = [$"A {planDays}-day plan needs at least {planDays} different days."] });
+            }
+
             if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
+            if (input.DaysPerWeek is not null) row.PlanDaysPerWeek = input.DaysPerWeek.Value;
             row.QuranLevel = levels[0];
             row.TajweedLevel = levels[1];
             row.IslamicStudiesLevel = levels[2];
@@ -1156,13 +1179,21 @@ public static class ApiEndpoints
         // What the student asked for on /plans. Nothing is billed from it — the
         // fee still comes from the lessons that actually took place — but the
         // assignment desk reads it next to their hours to know how much academy
-        // the family expects, and asks for the money accordingly.
+        // the family expects.
         api.MapPatch("/student/plan", async (ChooseStudentPlanRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
             if (Array.IndexOf(StudentPlanDaysPerWeek, input.DaysPerWeek) < 0)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose one of the plans on the plans page."] });
 
             var studentId = UserId(p);
+            // A bigger plan is only believable if the week can hold it. Someone
+            // who has not offered any hours yet is still inside setup, where the
+            // wizard is what enforces the match.
+            var offeredDays = await db.StudentWeeklyPreferences.AsNoTracking()
+                .Where(x => x.StudentId == studentId).Select(x => x.DayOfWeek).Distinct().CountAsync();
+            if (offeredDays > 0 && offeredDays < input.DaysPerWeek)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = [$"Your times cover {offeredDays} {(offeredDays == 1 ? "day" : "days")}; that plan needs {input.DaysPerWeek}."] });
+
             var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
             if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
             if (row.PlanDaysPerWeek != input.DaysPerWeek)
