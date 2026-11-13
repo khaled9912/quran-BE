@@ -651,7 +651,13 @@ public sealed class SeriesTimeChangeHistoryTests(PostgresFixture postgres) : Api
         LessonSeries series;
         if (book)
         {
-            var response = await client.PostAsJsonAsync("/api/student/bookings", new { ruleIds = new[] { home.Id } });
+            // Students no longer book their own weekly times: the academy does
+            // it from the assignment desk, and that is the path that writes the
+            // series and materializes its lessons.
+            var admin = await Factory.LoginAsync("admin");
+            var response = await admin.PostAsJsonAsync(
+                $"/api/admin/students/{student.Id}/weekly-lessons",
+                new { ruleIds = new[] { home.Id } });
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
             series = await Factory.WithDbAsync(db => db.LessonSeries.AsNoTracking()
                 .SingleAsync(x => x.StudentId == student.Id && x.AvailabilityRuleId == home.Id));

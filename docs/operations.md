@@ -154,6 +154,27 @@ is logged; a delivery failure never removes the submission, and the admin inbox
 still shows it. Use an app password, keep these values in environment variables,
 and never commit them.
 
+## Reading the production access log
+
+Hosted IIS gives no metrics endpoint, but the control panel exports access logs as
+CSV. `tools/access-log-report.mjs` turns one or more exports into the traffic,
+error-budget, latency, cold-start and polling view used in the 2026-11-12 audit:
+
+```
+node tools/access-log-report.mjs ~/Downloads/site103604_accesslog_20261112.csv
+node tools/access-log-report.mjs --budget 2 --json a.csv b.csv
+node tools/access-log-report.mjs --redact out/ a.csv      # safe copies to share
+```
+
+It exits `1` when any route serving 20+ requests exceeds the error budget, so a
+scheduled run can be the alert. Known-designed refusals (anonymous `auth/me`
+probes, avatar 404s for users without a photo, `409` on a refused state change)
+stay in the tables but never trigger that exit.
+
+**Those exports hold valid SignalR tickets in query strings, plus every user and
+lesson id.** Generate the `--redact` copy before attaching a log to anything, and
+delete old exports from your machine once analysed.
+
 ## Verifying a running API
 
 The usual loop is a build plus targeted `curl` calls against a session cookie —

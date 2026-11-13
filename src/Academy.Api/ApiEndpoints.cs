@@ -33,6 +33,10 @@ public static class ApiEndpoints
     // words are shown to the admin when they match a student to a teacher.
     public static readonly string[] StudentLevels = new[] { "beginner", "intermediate", "advanced" };
 
+    // The tiers published on /plans. A student recording a wish is not opening a
+    // subscription, but the desk only ever reads one of these numbers.
+    public static readonly int[] StudentPlanDaysPerWeek = new[] { 2, 3, 4, 5 };
+
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
@@ -669,6 +673,29 @@ public static class ApiEndpoints
             if (!string.IsNullOrWhiteSpace(status)) q = q.Where(x => x.Status == status);
             return Results.Ok((await q.OrderByDescending(x => x.CreatedAt).ToListAsync()).Select(ToChangeRequest));
         });
+        // Every active teacher's published week in one call, so the assignment
+        // desk can rank teachers against a student's offered hours without
+        // fetching them one at a time.
+        admin.MapGet("/teachers/availability-rules", async (AcademyDbContext db) =>
+        {
+            var teacherIds = await ActiveTeacherIdsAsync(db);
+            if (teacherIds.Count == 0) return Results.Ok(new List<WeeklyRuleDto>());
+
+            var rules = await db.TeacherAvailabilityRules
+                .Where(x => teacherIds.Contains(x.TeacherId))
+                .OrderBy(x => x.TeacherId).ThenBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
+                .ToListAsync();
+            var bookedRuleIds = (await db.LessonSeries
+                .Where(x => x.IsActive && teacherIds.Contains(x.TeacherId))
+                .Select(x => x.AvailabilityRuleId).ToListAsync()).ToHashSet();
+            var now = DateTimeOffset.UtcNow;
+            return Results.Ok(rules.Select(rule =>
+            {
+                var next = NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 2).FirstOrDefault();
+                return ToRule(rule, bookedRuleIds.Contains(rule.Id) ? "booked" : "available",
+                    next.StartsAt == default ? null : next.StartsAt);
+            }).ToList());
+        });
         admin.MapGet("/teachers/{teacherId:guid}/availability-rules", async (Guid teacherId, AcademyDbContext db) =>
             await db.Users.AnyAsync(x => x.Id == teacherId)
                 ? Results.Ok(await WeeklyRulesAsync(db, teacherId, null))
@@ -711,6 +738,10 @@ public static class ApiEndpoints
                 .ToDictionaryAsync(x => x.StudentId);
             var prefs = await db.StudentWeeklyPreferences.AsNoTracking().Where(x => ids.Contains(x.StudentId))
                 .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
+            // What the student already has, so the desk can say which of the hours
+            // they offered are still waiting for a teacher.
+            var booked = await db.LessonSeries.AsNoTracking().Where(x => x.IsActive && ids.Contains(x.StudentId))
+                .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
 
             var rows = new List<PendingStudentDto>();
             foreach (var student in students)
@@ -723,12 +754,14 @@ public static class ApiEndpoints
                     student.Email ?? "",
                     student.CreatedAt,
                     row is null ? null : new StudentOnboardingDto(
-                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+                        row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId, row.PlanDaysPerWeek,
                         prefs.Where(x => x.StudentId == student.Id)
                             .Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
                         row.CompletedAt, row.UpdatedAt),
                     teacherId is not null,
-                    teacherId is null ? null : teacherNames.GetValueOrDefault(teacherId.Value)));
+                    teacherId is null ? null : teacherNames.GetValueOrDefault(teacherId.Value),
+                    booked.Where(x => x.StudentId == student.Id)
+                        .Select(x => new StudentWeeklyLessonDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList()));
             }
             // Nobody should wait unseen: the longest-waiting student comes first.
             return Results.Ok(rows.OrderBy(x => x.HasTeacher).ThenBy(x => x.RegisteredAt).ToList());
@@ -1057,11 +1090,11 @@ public static class ApiEndpoints
         api.MapGet("/student/onboarding", async (ClaimsPrincipal p, AcademyDbContext db) =>
             Results.Ok(await StudentOnboardingAsync(db, UserId(p))))
             .RequireAuthorization("StudentOnly");
-        api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
         {
             var studentId = UserId(p);
-            var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel" };
-            var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel }
+            var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel", "arabicLevel" };
+            var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel, input.ArabicLevel }
                 .Select(value => (value ?? "").Trim().ToLowerInvariant())
                 .ToArray();
             for (var i = 0; i < levels.Length; i++)
@@ -1076,8 +1109,11 @@ public static class ApiEndpoints
             if (zone.Length == 0 || TimeZoneInfo.TryFindSystemTimeZoneById(zone, out _) is false)
                 zone = "UTC";
 
+            if (input.DaysPerWeek is not null && Array.IndexOf(StudentPlanDaysPerWeek, input.DaysPerWeek.Value) < 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose 2, 3, 4 or 5 days a week."] });
+
             var prefs = new List<StudentWeeklyPreference>();
-            foreach (var slot in (input.WeeklySlots ?? []).Take(21))
+            foreach (var slot in (input.WeeklySlots ?? []).Take(168))
             {
                 if (slot.DayOfWeek < 0 || slot.DayOfWeek > 6)
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose a day of the week."] });
@@ -1099,14 +1135,30 @@ public static class ApiEndpoints
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose at least one weekly time."] });
 
             var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
+            // A plan is a promise about the week, so the hours offered have to be
+            // able to keep it. Mid-wizard the answer may still be missing; a
+            // finished application may not.
+            var planDays = input.DaysPerWeek ?? row?.PlanDaysPerWeek ?? 0;
+            if (input.Completed)
+            {
+                if (planDays == 0)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose how many days a week you want to learn."] });
+                var offeredDays = prefs.Select(x => x.DayOfWeek).Distinct().Count();
+                if (offeredDays < planDays)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = [$"A {planDays}-day plan needs at least {planDays} different days."] });
+            }
+
             if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
+            if (input.DaysPerWeek is not null) row.PlanDaysPerWeek = input.DaysPerWeek.Value;
             row.QuranLevel = levels[0];
             row.TajweedLevel = levels[1];
             row.IslamicStudiesLevel = levels[2];
+            row.ArabicLevel = levels[3];
             row.TimeZoneId = zone;
             row.UpdatedAt = DateTimeOffset.UtcNow;
             // Backing out of the wizard is allowed, but a student who never
             // finishes is nudged back into it rather than left on the waiting page.
+            var firstCompletion = input.Completed && row.CompletedAt is null;
             if (input.Completed) row.CompletedAt ??= DateTimeOffset.UtcNow;
 
             var stale = await db.StudentWeeklyPreferences.Where(x => x.StudentId == studentId).ToListAsync();
@@ -1114,7 +1166,44 @@ public static class ApiEndpoints
             db.StudentWeeklyPreferences.AddRange(prefs);
             await db.SaveChangesAsync();
 
+            // The desk already shows the queue; this is what tells someone to look
+            // at it. A student who already has a teacher is not waiting on anyone,
+            // and one who backs out of the wizard mid-way has not applied yet.
+            if (input.Completed && !await db.Assignments.AnyAsync(x => x.StudentId == studentId && x.IsActive))
+                await AnnounceStudentApplicationAsync(db, realtime, push, studentId, row, prefs, firstCompletion);
+
             await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            return Results.Ok(await StudentOnboardingAsync(db, studentId));
+        }).RequireAuthorization("StudentOnly");
+
+        // What the student asked for on /plans. Nothing is billed from it — the
+        // fee still comes from the lessons that actually took place — but the
+        // assignment desk reads it next to their hours to know how much academy
+        // the family expects.
+        api.MapPatch("/student/plan", async (ChooseStudentPlanRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
+        {
+            if (Array.IndexOf(StudentPlanDaysPerWeek, input.DaysPerWeek) < 0)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = ["Choose one of the plans on the plans page."] });
+
+            var studentId = UserId(p);
+            // A bigger plan is only believable if the week can hold it. Someone
+            // who has not offered any hours yet is still inside setup, where the
+            // wizard is what enforces the match.
+            var offeredDays = await db.StudentWeeklyPreferences.AsNoTracking()
+                .Where(x => x.StudentId == studentId).Select(x => x.DayOfWeek).Distinct().CountAsync();
+            if (offeredDays > 0 && offeredDays < input.DaysPerWeek)
+                return Results.ValidationProblem(new Dictionary<string, string[]> { ["daysPerWeek"] = [$"Your times cover {offeredDays} {(offeredDays == 1 ? "day" : "days")}; that plan needs {input.DaysPerWeek}."] });
+
+            var row = await db.StudentOnboardings.FirstOrDefaultAsync(x => x.StudentId == studentId);
+            if (row is null) db.StudentOnboardings.Add(row = new StudentOnboarding { StudentId = studentId });
+            if (row.PlanDaysPerWeek != input.DaysPerWeek)
+            {
+                row.PlanDaysPerWeek = input.DaysPerWeek;
+                row.UpdatedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync();
+                await realtime.ToStaffAsync(RealtimeScopes.Admin);
+            }
+
             return Results.Ok(await StudentOnboardingAsync(db, studentId));
         }).RequireAuthorization("StudentOnly");
 
@@ -2135,9 +2224,64 @@ public static class ApiEndpoints
             .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime)
             .ToListAsync();
         return new StudentOnboardingDto(
-            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.TimeZoneId,
+            row.StudentId, row.QuranLevel, row.TajweedLevel, row.IslamicStudiesLevel, row.ArabicLevel, row.TimeZoneId, row.PlanDaysPerWeek,
             prefs.Select(x => new StudentWeeklyPreferenceDto(x.Id, x.DayOfWeek, FormatTime(x.StartsAtTime), FormatTime(x.EndsAtTime), x.TimeZoneId)).ToList(),
             row.CompletedAt, row.UpdatedAt);
+    }
+
+    /// <summary>
+    /// An application someone has to act on goes to every admin's bell with the
+    /// answers that decide the placement: the four levels and the first window
+    /// the student is free in. The assignment desk holds the rest. Each save has
+    /// its own dedupe key, so a student updating their application is never
+    /// silently swallowed by the notice their first submission already sent.
+    /// </summary>
+    private static async Task AnnounceStudentApplicationAsync(
+        AcademyDbContext db,
+        RealtimeNotifier realtime,
+        AcademyPushSender push,
+        Guid studentId,
+        StudentOnboarding row,
+        List<StudentWeeklyPreference> prefs,
+        bool firstCompletion)
+    {
+        var adminIds = await LessonOpsMessaging.AdminUserIdsAsync(db);
+        if (adminIds.Count == 0) return;
+
+        var name = DisplayName(await db.Users.AsNoTracking()
+            .Where(x => x.Id == studentId).Select(x => x.FullName).FirstOrDefaultAsync()) ?? "A student";
+        var title = firstCompletion ? "Student waiting for a teacher" : "Student updated their application";
+        var body = firstCompletion
+            ? $"{name} finished their setup: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}"
+            : $"{name} is still waiting for a teacher and updated their application: {ApplicationLevels(row)}. {ApplicationTimes(prefs, row.TimeZoneId)}";
+        const string link = "/people/assign";
+        var stamp = row.UpdatedAt.ToUniversalTime().ToString("yyyyMMddHHmmssfffffff", CultureInfo.InvariantCulture);
+
+        foreach (var adminId in adminIds)
+            db.Notifications.Add(LessonOpsMessaging.Notice(
+                adminId, title, body, "request", link, $"student-waiting:{studentId}:{stamp}:admin:{adminId}"));
+        await db.SaveChangesAsync();
+
+        await realtime.ToUsersAsync(adminIds, RealtimeScopes.Notifications);
+        await LessonOpsMessaging.PushAsync(db, push, adminIds, title, body, link);
+    }
+
+    private static string ApplicationLevels(StudentOnboarding row) =>
+        $"Quran {LevelWord(row.QuranLevel)}, Tajweed {LevelWord(row.TajweedLevel)}, " +
+        $"Studies {LevelWord(row.IslamicStudiesLevel)}, Arabic {LevelWord(row.ArabicLevel)}";
+
+    private static string LevelWord(string value) =>
+        value.Length == 0 ? "not given" : $"{char.ToUpperInvariant(value[0])}{value[1..]}";
+
+    /// <summary>The earliest window they offered, named once, then how many more there are.</summary>
+    private static string ApplicationTimes(List<StudentWeeklyPreference> prefs, string zone)
+    {
+        if (prefs.Count == 0) return "No weekly times given yet.";
+        var first = prefs.OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).First();
+        var at = LessonOpsMessaging.WeeklyAt(first.DayOfWeek, first.StartsAtTime, zone);
+        return prefs.Count == 1
+            ? $"Free {at}."
+            : $"Free {at} and {prefs.Count - 1} more.";
     }
 
     /// <summary>
@@ -2312,15 +2456,17 @@ public static class ApiEndpoints
             .Select(g => new { Id = g.Key, Max = g.Max(x => x.StartsAt) })
             .ToDictionaryAsync(x => x.Id, x => x.Max);
         var now = DateTimeOffset.UtcNow;
+        // Runs whether or not anything needs extending: the shift can be visible
+        // weeks before the rolling window has to grow.
+        var notices = await AddDaylightShiftNoticesAsync(db, series, now);
         var toExtend = series.Where(s => !latest.TryGetValue(s.Id, out var max) || max < now.AddDays(28)).ToList();
-        if (toExtend.Count == 0) return;
-        var notices = new List<AppNotification>();
         foreach (var s in toExtend)
         {
             var skipped = new List<DateTimeOffset>();
             await BuildSeriesLessonsAsync(db, s, now, skipped);
             notices.AddRange(await AddSkippedWeekNoticesAsync(db, s, skipped));
         }
+        if (toExtend.Count == 0 && notices.Count == 0) return;
         try { await db.SaveChangesAsync(); }
         catch (DbUpdateException) { db.ChangeTracker.Clear(); return; }
         foreach (var notice in notices)
@@ -2509,6 +2655,81 @@ public static class ApiEndpoints
             }
         }
         return written;
+    }
+
+    /// <summary>
+    /// A weekly time is pinned to the teacher's clock, so when daylight saving
+    /// moves the student's clock and not the teacher's, the lesson lands on a
+    /// different hour for the student while nothing about the booking changed.
+    /// The materialized lessons are already right; this is only the sentence that
+    /// warns the student before they turn up an hour early. One notice per series
+    /// per shift, because the shift is a date, not a recurring event.
+    /// </summary>
+    private static async Task<List<AppNotification>> AddDaylightShiftNoticesAsync(
+        AcademyDbContext db, List<LessonSeries> series, DateTimeOffset now)
+    {
+        var written = new List<AppNotification>();
+        var studentIds = series.Select(x => x.StudentId).Distinct().ToList();
+        var onboardings = await db.StudentOnboardings
+            .Where(x => studentIds.Contains(x.StudentId))
+            .Select(x => new { x.StudentId, x.TimeZoneId, x.UpdatedAt }).ToListAsync();
+        var studentZones = onboardings.GroupBy(x => x.StudentId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(x => x.UpdatedAt).First().TimeZoneId);
+
+        var shifts = new List<(LessonSeries Series, DateTimeOffset StartsAt, int DeltaMinutes, string StudentZone)>();
+        foreach (var row in series)
+        {
+            if (!studentZones.TryGetValue(row.StudentId, out var studentZone)) continue;
+            studentZone = studentZone.Trim();
+            if (studentZone.Length == 0
+                || studentZone.Equals(row.TimeZoneId, StringComparison.OrdinalIgnoreCase)) continue;
+
+            DateTime? previous = null;
+            foreach (var (start, _) in NextOccurrences(row.DayOfWeek, row.StartsAtTime, row.EndsAtTime, ResolveTimeZone(row.TimeZoneId), now, 8))
+            {
+                var local = TimeZoneInfo.ConvertTime(start, ResolveTimeZone(studentZone)).DateTime;
+                if (previous is { } before && before.TimeOfDay != local.TimeOfDay)
+                {
+                    // Fold into the shortest way round, so a change that crosses
+                    // midnight reads as an hour earlier rather than 23 hours later.
+                    var minutes = (int)(local.TimeOfDay - before.TimeOfDay).TotalMinutes;
+                    minutes = ((minutes % 1440) + 2160) % 1440 - 720;
+                    if (minutes != 0) shifts.Add((row, start, minutes, studentZone));
+                    break;
+                }
+                previous = local;
+            }
+        }
+        if (shifts.Count == 0) return written;
+
+        var keys = shifts.Select(x => $"dst-shift:{x.Series.Id}:{x.StartsAt:u}").ToList();
+        var alreadySent = await db.Notifications
+            .Where(x => x.DedupeKey != null && keys.Contains(x.DedupeKey))
+            .Select(x => x.DedupeKey!).ToListAsync();
+
+        foreach (var (row, start, minutes, studentZone) in shifts)
+        {
+            var key = $"dst-shift:{row.Id}:{start:u}";
+            if (alreadySent.Contains(key)) continue;
+            var teacherName = row.Teacher?.FullName ?? "your teacher";
+            var notice = LessonOpsMessaging.Notice(
+                row.StudentId, "Your class time shifts",
+                $"Clocks change where you live, so your lesson with {teacherName} on " +
+                $"{LessonOpsMessaging.When(start, studentZone)} is {ShiftLength(minutes)} " +
+                $"{(minutes > 0 ? "later" : "earlier")} than the usual one. {teacherName} keeps the same weekly time.",
+                "lesson", "/schedule", key);
+            db.Notifications.Add(notice);
+            written.Add(notice);
+        }
+        return written;
+    }
+
+    private static string ShiftLength(int minutes)
+    {
+        var hours = Math.Abs(minutes) / 60;
+        return Math.Abs(minutes) % 60 == 0
+            ? hours == 1 ? "an hour" : $"{hours} hours"
+            : $"{Math.Abs(minutes)} minutes";
     }
 
     /// <summary>
