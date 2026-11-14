@@ -70,7 +70,12 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
     public DbSet<TeacherPayoutDetail> TeacherPayoutDetails => Set<TeacherPayoutDetail>();
     public DbSet<AcademyBankAccount> AcademyBankAccounts => Set<AcademyBankAccount>();
     public DbSet<MonthlyPaymentClaim> MonthlyPaymentClaims => Set<MonthlyPaymentClaim>();
+    public DbSet<PlanPrice> PlanPrices => Set<PlanPrice>();
+    public DbSet<PaymentInvoice> PaymentInvoices => Set<PaymentInvoice>();
+    public DbSet<PaymentTransaction> PaymentTransactions => Set<PaymentTransaction>();
+    public DbSet<PaymentCallbackEvent> PaymentCallbackEvents => Set<PaymentCallbackEvent>();
     public DbSet<AppNotification> Notifications => Set<AppNotification>();
+    public DbSet<PolicyAcceptance> PolicyAcceptances => Set<PolicyAcceptance>();
     public DbSet<AcademyPolicy> AcademyPolicies => Set<AcademyPolicy>();
     public DbSet<LessonCancellation> LessonCancellations => Set<LessonCancellation>();
     public DbSet<LessonRescheduleRequest> LessonRescheduleRequests => Set<LessonRescheduleRequest>();
@@ -167,6 +172,10 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         // Broadcast notifications are updated by dedupe key across every recipient.
         b.Entity<AppNotification>().HasIndex(x => x.DedupeKey).HasFilter("\"DedupeKey\" IS NOT NULL");
         b.Entity<AppNotification>().HasIndex(x => new { x.UserId, x.ReadAt });
+        b.Entity<PolicyAcceptance>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        // One row per version, so re-accepting a new document keeps the earlier signature.
+        b.Entity<PolicyAcceptance>().HasIndex(x => new { x.UserId, x.PolicyKey, x.PolicyVersion }).IsUnique();
+        b.Entity<PolicyAcceptance>().HasIndex(x => new { x.PolicyKey, x.PolicyVersion });
         b.Entity<UserAvatar>().ToTable("UserAvatars");
         b.Entity<UserAvatar>().HasKey(x => x.UserId);
         b.Entity<UserAvatar>().HasOne(x => x.User).WithOne().HasForeignKey<UserAvatar>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
@@ -214,6 +223,28 @@ public sealed class AcademyDbContext(DbContextOptions<AcademyDbContext> options,
         b.Entity<MonthlyPaymentClaim>().Property(x => x.AmountUsd).HasPrecision(10, 2);
         b.Entity<MonthlyPaymentClaim>().HasIndex(x => new { x.StudentId, x.Month }).IsUnique();
         b.Entity<MonthlyPaymentClaim>().HasIndex(x => x.Status);
+
+        b.Entity<PlanPrice>().HasIndex(x => new { x.DaysPerWeek, x.Currency }).IsUnique();
+        b.Entity<PlanPrice>().Property(x => x.MonthlyAmount).HasPrecision(10, 2);
+
+        b.Entity<PaymentInvoice>().HasOne(x => x.Student).WithMany().HasForeignKey(x => x.StudentId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<PaymentInvoice>().Property(x => x.Amount).HasPrecision(10, 2);
+        // One live invoice per student and month; a voided one frees the slot for a reissue.
+        b.Entity<PaymentInvoice>().HasIndex(x => new { x.StudentId, x.Month }).IsUnique().HasFilter("\"Status\" <> 'voided'");
+        b.Entity<PaymentInvoice>().HasIndex(x => new { x.Status, x.Month });
+
+        b.Entity<PaymentTransaction>().HasOne(x => x.Invoice).WithMany().HasForeignKey(x => x.InvoiceId).OnDelete(DeleteBehavior.Restrict);
+        b.Entity<PaymentTransaction>().HasIndex(x => x.MerchantReference).IsUnique();
+        b.Entity<PaymentTransaction>().HasIndex(x => x.ProviderTransactionId).IsUnique().HasFilter("\"ProviderTransactionId\" IS NOT NULL");
+        // One checkout belongs to one attempt, so a callback can never be matched
+        // to two of them.
+        b.Entity<PaymentTransaction>().HasIndex(x => x.ProviderCheckoutId).IsUnique().HasFilter("\"ProviderCheckoutId\" IS NOT NULL");
+        b.Entity<PaymentTransaction>().HasIndex(x => new { x.InvoiceId, x.CreatedAt });
+        b.Entity<PaymentTransaction>().HasIndex(x => x.Status);
+
+        b.Entity<PaymentCallbackEvent>().HasIndex(x => x.ProviderTransactionId).HasFilter("\"ProviderTransactionId\" IS NOT NULL");
+        b.Entity<PaymentCallbackEvent>().HasIndex(x => x.ReceivedAt);
+        b.Entity<PaymentCallbackEvent>().HasIndex(x => new { x.Outcome, x.ReceivedAt });
 
         b.Entity<AcademyPolicy>().HasKey(x => x.Id);
         b.Entity<LessonCancellation>().HasOne(x => x.Lesson).WithMany().HasForeignKey(x => x.LessonId).OnDelete(DeleteBehavior.Cascade);

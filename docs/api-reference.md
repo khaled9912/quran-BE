@@ -295,11 +295,54 @@ to expire requests or accrue strikes.
 | POST | `/admin/billing/claims/{id}/confirm` | Admin |
 | POST | `/admin/billing/claims/{id}/reject` | Admin |
 
+## Card checkout and pricing
+
+The student is billed the flat plan price for the month. Amounts are always the
+server's: `GET /api/pricing` and invoice issuing read the same `PlanPrices` rows,
+so the figure a visitor sees and the figure a student is charged cannot drift.
+
+| Method | Route | Access |
+|---|---|---|
+| GET | `/pricing[?currency=GBP&country=GB]` | Anonymous; `{ currency, currencies[], plans[{ daysPerWeek, classesPerMonth, monthlyAmount }], cardCheckout }` |
+| GET | `/student/payments/invoice[?month=YYYY-MM&currency=GBP]` | Student; `{ month, daysPerWeek, currency, amount, invoice? }` — the last month that has ended, or its bill. A month still in progress answers `400` |
+| POST | `/student/payments/invoice` | Student; `{ currency? }` — **no amount in the request**. Idempotent per student and month; `409` with no plan chosen or no classes held that month |
+| POST | `/student/payments/invoice/{id}/checkout` | Student; returns `{ invoiceId, transactionId, clientSecret, publishableKey, providerReference, currency, amount }`. `409` while a transfer for the month is pending or confirmed |
+| GET | `/student/payments/attempt/{id}/status` | Student; `{ invoiceId, invoiceStatus, paid, providerStatus, providerReached }` — re-reads the provider on every call |
+| POST | `/api/payments/stripe/webhook` | Anonymous; verified by `Stripe-Signature`, rate-limited by address |
+| GET \| PUT | `/admin/payments/prices` | Admin; GET returns `{ tiers[], currencies[], prices[] }` so the desk can only offer what the server can honour. `PUT` takes one `{ daysPerWeek, currency, monthlyAmount }` and answers with `openInvoicesUsingOldPrice` |
+| GET | `/admin/payments/invoices[?month=&status=]` | Admin; newest 200 with their attempts |
+| POST | `/admin/payments/invoices/{id}/void` | Admin; `{ reason }`. A paid invoice is refunded, never voided away |
+| GET | `/admin/payments/transactions[?status=]` | Admin; newest 200 attempts |
+| POST | `/admin/payments/transactions/{id}/refund` | Admin; `{ amount, reason? }`, `captured` attempts only |
+| GET | `/admin/payments/callbacks[?outcome=]` | Admin; the signed-events log and the outcome each was given |
+
+- `cardCheckout` is false until the host has provider keys and a price set in that
+  currency; a page must not advertise a Pay Now button the host cannot honour.
+- `currency` is a *charge* currency. It is never the currency the academy is paid
+  in — that is the settlement currency on the Stripe account. The presentment
+  currency the cardholder saw is stored on the attempt and deliberately not
+  compared.
+- A currency becomes quotable only when all four tiers (2/3/4/5 days) have a row
+  in it; an incomplete pick falls back to the next candidate, then the default.
+- Invoice status: `open` → `awaiting_payment` → `paid` / `voided`. Attempt status:
+  `pending` → `captured` / `failed` / `voided` / `refunded`.
+- Nothing a browser reports settles an invoice. `paid` is written only after the
+  checkout session is read back from Stripe and its amount and currency match the
+  invoice; a live `pending` attempt is reused rather than opened twice.
+- Webhooks insert the event row (unique provider event id) before acting, so a
+  redelivery collides and changes nothing; an unverifiable signature is logged and
+  refused, never stored. When Stripe cannot be reached the handler answers `503`
+  to ask for a retry.
+- Another student's invoice or attempt answers `404`, shaped like "does not exist".
+
 Exact request/response records for every domain live in
 [`../Contracts.cs`](../src/Academy.Api/Contracts.cs).
 
 Months follow the academy clock (Africa/Cairo). A claim's USD amount is frozen at
 creation; the trial lesson is free to the student but still paid to the teacher.
+`canClaim` on the student view is false for a month whose plan bill was settled by
+card (`cardPaid`), and `POST /student/billing/claims` refuses such a month — one
+month, one rail.
 
 ## Notifications and push
 

@@ -6,8 +6,8 @@ namespace Academy.Api;
 public sealed class AcademyPolicy
 {
     public int Id { get; set; } = 1;
-    public int StudentFreeCancelHours { get; set; } = 24;
-    public int TeacherFreeCancelHours { get; set; } = 24;
+    public int StudentFreeCancelHours { get; set; } = 12;
+    public int TeacherFreeCancelHours { get; set; } = 12;
     public int NoShowGraceMinutes { get; set; } = 10;
     public int RescheduleResponseHours { get; set; } = 12;
     public int StudentGraceCancellationsPerMonth { get; set; } = 1;
@@ -351,7 +351,8 @@ public sealed class LessonCall
     public AcademyUser? Callee { get; set; }
     // teacher | student
     [MaxLength(20)] public string CalleeRole { get; set; } = "student";
-    // room: pressed by a participant | monitor: pressed by staff
+    // room: pressed by a participant | monitor: pressed by staff | auto: fired
+    // by the lesson monitor when someone has not joined after the start
     [MaxLength(20)] public string Origin { get; set; } = "room";
     /// <summary>Attendance status of the callee when the ring was sent.</summary>
     [MaxLength(20)] public string CalleeStatus { get; set; } = "not_joined";

@@ -115,6 +115,13 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
     /// <summary>TestServer always presents the loopback address as the caller.</summary>
     public const string TestRemoteAddress = "127.0.0.1";
 
+    /// <summary>
+    /// Replaces or adds a host service for one test class, e.g. a stand-in for the
+    /// payment provider. Must be set before the first request: it is read when the
+    /// host is built.
+    /// </summary>
+    public Action<IServiceCollection>? TestServices { get; set; }
+
     public HttpClient Client => CreateClient(new WebApplicationFactoryClientOptions
     {
         BaseAddress = new Uri("https://localhost"),
@@ -170,8 +177,11 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
             }));
         // TestServer leaves the connection's remote address unset, so the audit
         // trail's source IP could never be observed without putting one on the request.
-        builder.ConfigureTestServices(services => services.AddSingleton<IStartupFilter>(
-            new RemoteAddressFilter(IPAddress.Parse(TestRemoteAddress))));
+        builder.ConfigureTestServices(services =>
+        {
+            services.AddSingleton<IStartupFilter>(new RemoteAddressFilter(IPAddress.Parse(TestRemoteAddress)));
+            TestServices?.Invoke(services);
+        });
     }
 
     public override async ValueTask DisposeAsync()
@@ -185,7 +195,12 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
 
     private static void Set(string name, string value) => Environment.SetEnvironmentVariable(name, value);
 
-    public async Task<AcademyUser> CreateUserAsync(string role, string? phone = null, bool phoneConfirmed = false)
+    /// <summary>
+    /// Accounts start out signed: the API refuses an unsigned account's first real
+    /// action, and most tests are about what happens after that action. Pass
+    /// <c>signed: false</c> to test the agreement gate itself.
+    /// </summary>
+    public async Task<AcademyUser> CreateUserAsync(string role, string? phone = null, bool phoneConfirmed = false, bool signed = true)
     {
         using var scope = Services.CreateScope();
         var users = scope.ServiceProvider.GetRequiredService<UserManager<AcademyUser>>();
@@ -204,20 +219,45 @@ public sealed class ApiFactory : WebApplicationFactory<Program>
         if (!created.Succeeded)
             throw new InvalidOperationException(string.Join("; ", created.Errors.Select(e => e.Description)));
         await users.AddToRoleAsync(user, role);
+        if (signed) await SignPolicyAsync(user.Id, role);
         return user;
     }
 
-    /// <summary>Signs in through the real endpoint, so the client holds the cookie a browser would.</summary>
-    public async Task<HttpClient> LoginAsync(string role, string? phone = null, bool phoneConfirmed = false)
+    /// <summary>The same signature the /policy screen stores, written straight to the database.</summary>
+    public async Task SignPolicyAsync(Guid userId, string role)
     {
-        var (client, _) = await LoginAsAsync(role, phone, phoneConfirmed);
+        var definition = PolicyCatalog.ForRole(role, await CurrentPolicyAsync());
+        if (definition is null) return;
+        await WithDbAsync(async db =>
+        {
+            db.PolicyAcceptances.Add(new PolicyAcceptance
+            {
+                UserId = userId,
+                PolicyKey = definition.Key,
+                PolicyVersion = definition.Version,
+                ClauseIds = string.Join(",", definition.ClauseIds),
+                IpAddress = TestRemoteAddress,
+                UserAgent = "security-tests",
+            });
+            await db.SaveChangesAsync();
+        });
+    }
+
+    /// <summary>The live rule row, so a test that signs sees the same version the server would render.</summary>
+    public Task<AcademyPolicy> CurrentPolicyAsync() =>
+        WithDbAsync(db => LessonPolicyService.GetPolicyAsync(db));
+
+    /// <summary>Signs in through the real endpoint, so the client holds the cookie a browser would.</summary>
+    public async Task<HttpClient> LoginAsync(string role, string? phone = null, bool phoneConfirmed = false, bool signed = true)
+    {
+        var (client, _) = await LoginAsAsync(role, phone, phoneConfirmed, signed);
         return client;
     }
 
     /// <summary>Same as <see cref="LoginAsync"/> but also hands back the account, so a test can be the owner or the stranger.</summary>
-    public async Task<(HttpClient Client, AcademyUser User)> LoginAsAsync(string role, string? phone = null, bool phoneConfirmed = false)
+    public async Task<(HttpClient Client, AcademyUser User)> LoginAsAsync(string role, string? phone = null, bool phoneConfirmed = false, bool signed = true)
     {
-        var user = await CreateUserAsync(role, phone, phoneConfirmed);
+        var user = await CreateUserAsync(role, phone, phoneConfirmed, signed);
         return (await SignInAsync(user.Email!), user);
     }
 

@@ -37,6 +37,18 @@ public static class ApiEndpoints
     // subscription, but the desk only ever reads one of these numbers.
     public static readonly int[] StudentPlanDaysPerWeek = new[] { 2, 3, 4, 5 };
 
+    // Countries the academy does not open student places in. The web proxy
+    // stamps the visitor's country from the hosting geo header on the register
+    // and OTP routes; the header is absent for traffic that never passed
+    // through it, which is treated as unrestricted.
+    public static readonly string[] RestrictedSignupCountries = new[] { "EG" };
+
+    private static bool SignupRestricted(HttpContext http) =>
+        RestrictedSignupCountries.Contains(http.Request.Headers["x-registration-country"].ToString());
+
+    private static IResult SignupClosed() =>
+        Results.Json(new { message = "Student enrolment is closed in your country. Teaching applications remain open at /teach." }, statusCode: 403);
+
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
@@ -144,13 +156,25 @@ public static class ApiEndpoints
         var api = app.MapGroup("/api");
 
         var auth = api.MapGroup("/auth").AllowAnonymous();
-        auth.MapPost("/register", async (RegisterRequest input, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        auth.MapPost("/register", async (RegisterRequest input, HttpContext http, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
+            if (SignupRestricted(http)) return SignupClosed();
             if (string.IsNullOrWhiteSpace(input.FullName) || string.IsNullOrWhiteSpace(input.Email) || string.IsNullOrWhiteSpace(input.Password) || input.Password.Length < 8)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["registration"] = ["Full name, valid email and a password of at least 8 characters are required."] });
             if (NameContainsContact(input.FullName))
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter the student's name, not an email address."] });
-            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), EmailConfirmed = true };
+            // The number is collected, not verified: the code flow lives at
+            // /auth/otp/*, so this is a contact detail rather than a way in.
+            string? phone = null;
+            if (!string.IsNullOrWhiteSpace(input.Phone))
+            {
+                phone = PhoneNumbers.Normalize(input.Phone);
+                if (phone is null)
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["phone"] = ["Enter a mobile number with its country code, like +1 555 010 0123."] });
+                if (await users.Users.AnyAsync(x => x.PhoneNumber == phone))
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["phone"] = ["That mobile number is already in use."] });
+            }
+            var user = new AcademyUser { Id = Guid.NewGuid(), UserName = input.Email.Trim(), Email = input.Email.Trim(), FullName = input.FullName.Trim(), PhoneNumber = phone, PhoneNumberConfirmed = false, EmailConfirmed = true };
             var result = await users.CreateAsync(user, input.Password);
             if (!result.Succeeded) return Results.ValidationProblem(IdentityErrors(result));
             await users.AddToRoleAsync(user, "student");
@@ -466,7 +490,7 @@ public static class ApiEndpoints
             });
         }).RequireRateLimiting("otp");
 
-        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
+        auth.MapPost("/otp/verify", async (OtpVerifyRequest input, HttpContext http, PhoneOtpStore otp, UserManager<AcademyUser> users, SignInManager<AcademyUser> signIn) =>
         {
             var phone = PhoneNumbers.Normalize(input.Phone);
             if (phone is null || string.IsNullOrWhiteSpace(input.Code))
@@ -482,6 +506,9 @@ public static class ApiEndpoints
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter your full name (2 to 160 characters)."] });
                 if (NameContainsContact(fullName))
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["fullName"] = ["Enter your name, not an email address."] });
+                // The gate closes new places, not sessions: an account that
+                // already exists keeps signing in from anywhere.
+                if (SignupRestricted(http)) return SignupClosed();
                 user = new AcademyUser
                 {
                     Id = Guid.NewGuid(),
@@ -776,21 +803,21 @@ public static class ApiEndpoints
         });
 
         api.MapGet("/teacher-student-assignments", async (AcademyDbContext db) => await AssignmentList(db)).RequireAuthorization("AdminOnly");
-        api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime) =>
+        api.MapPost("/teacher-student-assignments", async (AssignStudentRequest input, AcademyDbContext db, UserManager<AcademyUser> users, RealtimeNotifier realtime, AcademyEmailSender email) =>
         {
             var teacher = await users.FindByIdAsync(input.TeacherId.ToString());
             var student = await users.FindByIdAsync(input.StudentId.ToString());
             if (teacher is null || student is null || !await users.IsInRoleAsync(teacher, "teacher") || !await users.IsInRoleAsync(student, "student")) return Results.BadRequest(new { message = "A valid teacher and student are required." });
-            var activeElsewhere = await db.Assignments.Where(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId).ToListAsync();
+            var activeElsewhere = await db.Assignments.Include(x => x.Teacher).Where(x => x.StudentId == input.StudentId && x.IsActive && x.TeacherId != input.TeacherId).ToListAsync();
             foreach (var previous in activeElsewhere) previous.IsActive = false;
+            var teacherName = DisplayName(teacher.FullName) ?? "your teacher";
+            var studentName = DisplayName(student.FullName) ?? "A student";
             // The student has been waiting on this page, so the assignment itself
             // has to reach them — not just the realtime refresh.
             async Task AnnounceAsync(Guid assignmentId)
             {
                 var key = $"assignment:{assignmentId}";
                 if (await db.Notifications.AnyAsync(x => x.DedupeKey == $"{key}:student")) return;
-                var teacherName = DisplayName(teacher.FullName) ?? "your teacher";
-                var studentName = DisplayName(student.FullName) ?? "A student";
                 db.Notifications.AddRange(
                     new AppNotification
                     {
@@ -812,12 +839,45 @@ public static class ApiEndpoints
                     });
                 await db.SaveChangesAsync();
                 await realtime.ToUsersAsync([input.TeacherId, input.StudentId], RealtimeScopes.Notifications);
+                // The same event, inside the same freshness guard, as a plain-text
+                // email for whoever has an address. Deliberately not RequestAborted:
+                // the notice rows are already committed, so a browser that closes
+                // mid-request must not drop the email with no retry left.
+                await LessonOpsMessaging.EmailAsync(email, student,
+                    "Your teacher is assigned",
+                    $"Hello {studentName},\n\n{teacherName} has been assigned as your teacher by Ana Quran Academy. "
+                    + "You will get another email when your weekly lesson time is booked.\n\n"
+                    + "If this was not expected, contact the academy.");
+                await LessonOpsMessaging.EmailAsync(email, teacher,
+                    "New student assigned",
+                    $"Hello {teacherName},\n\n{studentName} has been assigned to you by Ana Quran Academy. "
+                    + "Open your dashboard and book their weekly time when you are ready.\n\n"
+                    + "If this was not expected, contact the academy.");
+            }
+            // The teacher who just lost the student sits outside the pair's dedupe
+            // key, so their notice is guarded on its own.
+            async Task AnnounceFormerTeachersAsync(Guid assignmentId)
+            {
+                foreach (var previous in activeElsewhere)
+                {
+                    var formerName = DisplayName(previous.Teacher?.FullName) ?? "there";
+                    await AnnounceAndEmailAsync(db, realtime, email, previous.Teacher,
+                        LessonOpsMessaging.Notice(
+                            previous.TeacherId, "Student reassigned",
+                            $"{studentName} is no longer assigned to you. The academy moved them to another teacher.",
+                            "booking", "/teacher/dashboard",
+                            $"assignment:{assignmentId}:former-teacher:{previous.TeacherId}"),
+                        "Student reassigned",
+                        $"Hello {formerName},\n\n{studentName} is no longer assigned to you. The academy moved them to another teacher.\n\n"
+                        + "If this was not expected, contact the academy.");
+                }
             }
             var existing = await db.Assignments.FirstOrDefaultAsync(x => x.TeacherId == input.TeacherId && x.StudentId == input.StudentId);
             if (existing is not null)
             {
                 existing.IsActive = true; await db.SaveChangesAsync();
                 await AnnounceAsync(existing.Id);
+                await AnnounceFormerTeachersAsync(existing.Id);
                 await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
                 await realtime.ToStaffAsync(RealtimeScopes.Directory);
                 return Results.Ok(await AssignmentById(db, existing.Id));
@@ -825,14 +885,37 @@ public static class ApiEndpoints
             var assignment = new TeacherStudentAssignment { TeacherId = input.TeacherId, StudentId = input.StudentId };
             db.Assignments.Add(assignment); await db.SaveChangesAsync();
             await AnnounceAsync(assignment.Id);
+            await AnnounceFormerTeachersAsync(assignment.Id);
             await realtime.ToParticipantsAsync(input.TeacherId, input.StudentId, RealtimeScopes.Directory);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.Created($"/api/teacher-student-assignments/{assignment.Id}", await AssignmentById(db, assignment.Id));
         }).RequireAuthorization("AdminOnly");
-        api.MapDelete("/teacher-student-assignments/{id:guid}", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime) =>
+        api.MapDelete("/teacher-student-assignments/{id:guid}", async (Guid id, AcademyDbContext db, RealtimeNotifier realtime, AcademyEmailSender email) =>
         {
-            var item = await db.Assignments.FindAsync(id); if (item is null) return Results.NotFound();
-            item.IsActive = false; await db.SaveChangesAsync();
+            var item = await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).FirstOrDefaultAsync(x => x.Id == id);
+            if (item is null) return Results.NotFound();
+            if (item.IsActive)
+            {
+                item.IsActive = false; await db.SaveChangesAsync();
+                var teacherName = DisplayName(item.Teacher?.FullName) ?? "your teacher";
+                var studentName = DisplayName(item.Student?.FullName) ?? "A student";
+                await AnnounceAndEmailAsync(db, realtime, email, item.Student,
+                    LessonOpsMessaging.Notice(
+                        item.StudentId, "Your teacher was removed",
+                        $"The academy removed {teacherName} as your teacher. You will get another email when a new teacher is assigned.",
+                        "booking", "/student/dashboard", $"unassignment:{item.Id}:student"),
+                    "Your teacher was removed",
+                    $"Hello {studentName},\n\nThe academy removed {teacherName} as your teacher. You will get another email when a new teacher is assigned.\n\n"
+                    + "If this was not expected, contact the academy.");
+                await AnnounceAndEmailAsync(db, realtime, email, item.Teacher,
+                    LessonOpsMessaging.Notice(
+                        item.TeacherId, "Student removed",
+                        $"{studentName} is no longer assigned to you. The academy removed the assignment.",
+                        "booking", "/teacher/dashboard", $"unassignment:{item.Id}:teacher"),
+                    "Student removed",
+                    $"Hello {teacherName},\n\n{studentName} is no longer assigned to you. The academy removed the assignment.\n\n"
+                    + "If this was not expected, contact the academy.");
+            }
             await realtime.ToParticipantsAsync(item.TeacherId, item.StudentId, RealtimeScopes.Directory);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.NoContent();
@@ -1003,6 +1086,8 @@ public static class ApiEndpoints
         teacher.MapGet("/availability", async (ClaimsPrincipal p, AcademyDbContext db) => Results.Ok(await db.AvailabilitySlots.Where(x => x.TeacherId == UserId(p) && x.StartsAt > DateTimeOffset.UtcNow.AddDays(-1)).OrderBy(x => x.StartsAt).Select(x => new AvailabilityDto(x.Id, x.TeacherId, x.StartsAt, x.EndsAt, x.Status)).ToListAsync()));
         teacher.MapPost("/availability", async (PublishAvailabilityRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
+            var unsigned = await PolicyGuard.PendingAsync(db, p);
+            if (unsigned is not null) return unsigned;
             if (input.StartsAt <= DateTimeOffset.UtcNow || input.EndsAt <= input.StartsAt) return Results.BadRequest(new { message = "Choose a future slot with an end after the start." });
             if (!HasAllowedLessonLength(input.EndsAt - input.StartsAt)) return Results.BadRequest(new { message = LessonLengthMessage });
             var id = UserId(p);
@@ -1031,6 +1116,8 @@ public static class ApiEndpoints
             Results.Ok(await WeeklyRulesAsync(db, UserId(p), null)));
         teacher.MapPost("/availability-rules", async (CreateAvailabilityRulesRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
+            var unsigned = await PolicyGuard.PendingAsync(db, p);
+            if (unsigned is not null) return unsigned;
             var (created, error) = await CreateAvailabilityRulesAsync(UserId(p), input, db);
             if (error is not null) return Results.BadRequest(new { message = error });
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
@@ -1093,6 +1180,13 @@ public static class ApiEndpoints
         api.MapPut("/student/onboarding", async (SaveStudentOnboardingRequest input, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime, AcademyPushSender push) =>
         {
             var studentId = UserId(p);
+            // Submitting the application is the student's first real action, so the
+            // family agreement has to be on file before the academy starts work.
+            if (input.Completed)
+            {
+                var unsigned = await PolicyGuard.PendingAsync(db, p);
+                if (unsigned is not null) return unsigned;
+            }
             var fieldNames = new[] { "quranLevel", "tajweedLevel", "islamicStudiesLevel", "arabicLevel" };
             var levels = new[] { input.QuranLevel, input.TajweedLevel, input.IslamicStudiesLevel, input.ArabicLevel }
                 .Select(value => (value ?? "").Trim().ToLowerInvariant())
@@ -2781,6 +2875,19 @@ public static class ApiEndpoints
         => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.IsActive).OrderBy(x => x.CreatedAt).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).ToListAsync();
     private static async Task<AssignmentDto?> AssignmentById(AcademyDbContext db, Guid id)
         => await db.Assignments.Include(x => x.Teacher).Include(x => x.Student).Where(x => x.Id == id).Select(x => new AssignmentDto(x.Id, x.TeacherId, x.Teacher!.FullName, x.StudentId, x.Student!.FullName, x.CreatedAt, x.IsActive, x.IsActive ? "active" : "inactive")).FirstOrDefaultAsync();
+
+    /// <summary>One feed notice and its email twin, guarded so a retry cannot duplicate either.</summary>
+    private static async Task AnnounceAndEmailAsync(
+        AcademyDbContext db, RealtimeNotifier realtime, AcademyEmailSender email,
+        AcademyUser? recipient, AppNotification notice, string emailSubject, string emailBody)
+    {
+        if (recipient is null) return;
+        if (await db.Notifications.AnyAsync(x => x.DedupeKey == notice.DedupeKey)) return;
+        db.Notifications.Add(notice);
+        await db.SaveChangesAsync();
+        await realtime.ToUserAsync(recipient.Id, RealtimeScopes.Notifications);
+        await LessonOpsMessaging.EmailAsync(email, recipient, emailSubject, emailBody);
+    }
 
     private const long MaxAvatarBytes = 2 * 1024 * 1024;
 

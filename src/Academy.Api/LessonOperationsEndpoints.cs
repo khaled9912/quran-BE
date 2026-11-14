@@ -657,6 +657,15 @@ public static class LessonOperationsEndpoints
             var eventId = (input.EventId ?? "").Trim();
             if (eventId.Length is < 4 or > 80)
                 return Results.ValidationProblem(new Dictionary<string, string[]> { ["eventId"] = ["Supply a unique event id so retries are safe."] });
+            // Joining is what starts a paid lesson, so neither side may do it before
+            // the agreement that covers them is signed. Leaving is never blocked:
+            // an unsigned participant must still be able to close the attendance.
+            if (action == "join")
+            {
+                var unsigned = await PolicyGuard.PendingAsync(db, p,
+                    userId == lesson.TeacherId ? PolicyKeys.Teacher : PolicyKeys.Parent);
+                if (unsigned is not null) return unsigned;
+            }
             if (lesson.Status is "cancelled" or "completed" || DateTimeOffset.UtcNow >= lesson.EndsAt)
                 return Results.Conflict(new { message = "The lesson room is closed." });
 
@@ -924,10 +933,14 @@ public static class LessonOperationsEndpoints
 
             var callerRole = ActorRole(p);
             var origin = staffOnly ? "monitor" : "room";
+            // Auto-rings from the monitor name the other participant as caller
+            // (the row needs a real user), but they are not that person's calls:
+            // they must not trip their cooldown or eat their per-lesson budget.
             if (await db.LessonCalls.AnyAsync(
-                    x => x.LessonId == id && x.CallerId == callerId && x.CreatedAt > now - CallCooldown, ct))
+                    x => x.LessonId == id && x.CallerId == callerId && x.Origin != "auto"
+                        && x.CreatedAt > now - CallCooldown, ct))
                 return Results.Conflict(new { message = "You just called. Wait a moment before calling again." });
-            if (await db.LessonCalls.CountAsync(x => x.LessonId == id && x.CallerId == callerId, ct) >= CallsPerLesson)
+            if (await db.LessonCalls.CountAsync(x => x.LessonId == id && x.CallerId == callerId && x.Origin != "auto", ct) >= CallsPerLesson)
                 return Results.Conflict(new { message = $"You have used the {CallsPerLesson} calls allowed for this lesson." });
 
             var call = new LessonCall
@@ -1394,7 +1407,7 @@ public static class LessonOperationsEndpoints
                 item.ResolutionAction = "excused";
             }
 
-            var body = "The academy approved your excuse. The lesson credit was restored and the related reliability note was cleared.";
+            var body = "The academy approved your excuse. The lesson no longer counts against your record and the related reliability note was cleared.";
             db.Notifications.Add(LessonOpsMessaging.Notice(
                 lesson.StudentId, "Excuse approved", body, "system", $"/lesson/{lesson.Id}", $"excuse-approved:{lesson.Id}"));
             Audit(db, UserId(p), "excuse_approved", "Lesson", lesson.Id, excuse.Explanation);
@@ -1525,8 +1538,8 @@ public static class LessonOperationsEndpoints
 
                 var studentBody = action switch
                 {
-                    "student_no_show" => "The academy recorded a no-show for this lesson. One lesson credit was used.",
-                    "teacher_no_show" => "The academy recorded that the teacher did not attend. Your lesson credit was restored.",
+                    "student_no_show" => "The academy recorded a no-show for this lesson. It counts against your record, and your teacher is paid for the booked time.",
+                    "teacher_no_show" => "The academy recorded that the teacher did not attend. The lesson does not count against you.",
                     "both_absent" => "The academy recorded that neither participant joined this lesson. No compensation was generated.",
                     _ => "The academy resolved the attendance issue.",
                 };
@@ -1780,12 +1793,12 @@ public static class LessonOperationsEndpoints
                 CreatedByRole = "admin",
             };
             db.LessonCreditTransactions.Add(credit);
-            var body = $"The academy adjusted your lesson credits by {input.Amount:+#;-#;0}: {reason}";
+            var body = $"The academy corrected your lesson record by {input.Amount:+#;-#;0}: {reason}";
             db.Notifications.Add(LessonOpsMessaging.Notice(
-                studentId, "Lesson credit adjustment", body, "system", "/schedule", $"credit-adjust:{credit.Id}"));
+                studentId, "Lesson record updated", body, "system", "/schedule", $"credit-adjust:{credit.Id}"));
             Audit(db, UserId(p), "credit_adjusted", "Student", studentId, body);
             await db.SaveChangesAsync(ct);
-            await LessonOpsMessaging.PushAsync(db, push, [studentId], "Lesson credit adjustment", body, "/schedule", ct);
+            await LessonOpsMessaging.PushAsync(db, push, [studentId], "Lesson record updated", body, "/schedule", ct);
             await realtime.ToUserAsync(studentId, RealtimeScopes.Lessons);
             return Results.Ok(ToCredit(credit));
         });
