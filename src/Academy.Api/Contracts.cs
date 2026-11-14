@@ -2,7 +2,7 @@ using System.Text.Json.Serialization;
 
 namespace Academy.Api;
 
-public sealed record RegisterRequest(string FullName, string Email, string Password, string? Country);
+public sealed record RegisterRequest(string FullName, string Email, string Password, string? Country, string? Phone);
 public sealed record LoginRequest(string Email, string Password);
 public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
 public sealed record PasswordResetRequestInput(string Email);
@@ -93,6 +93,13 @@ public sealed record TeacherApplicationDto(Guid Id, string FullName, string Emai
 public sealed record NotificationDto(Guid Id, string Title, string Body, string Kind, string? Link, DateTimeOffset CreatedAt, DateTimeOffset? ReadAt);
 public sealed record NotificationsDto(IReadOnlyList<NotificationDto> Items, int Unread);
 
+public sealed record PolicyClauseDto(string Id, string Title, string Body);
+public sealed record PolicyDocumentDto(string Key, int Version, string Language, string Title, string Summary, IReadOnlyList<PolicyClauseDto> Clauses);
+/// <summary>What the caller still has to sign. Document is null when the role has none.</summary>
+public sealed record PolicyStateDto(bool Required, bool Accepted, PolicyDocumentDto? Document, DateTimeOffset? AcceptedAt);
+public sealed record AcceptPolicyRequest(string PolicyKey, int Version, IReadOnlyList<string> ClauseIds);
+public sealed record PolicyAcceptanceDto(string PolicyKey, int Version, DateTimeOffset AcceptedAt, IReadOnlyList<string> ClauseIds);
+
 public sealed record AcademyBankAccountDto(int Id, string BankName, string AccountHolder, string AccountNumber, string Iban, string Swift, string Notes, DateTimeOffset UpdatedAt);
 public sealed record UpdateAcademyBankAccountRequest(string? BankName, string? AccountHolder, string? AccountNumber, string? Iban, string? Swift, string? Notes);
 public sealed record TeacherBillingRateDto(Guid TeacherId, string TeacherName, string TeacherEmail, decimal StudentPriceUsd, decimal PayoutEgp);
@@ -102,7 +109,7 @@ public sealed record UpdateTeacherPayoutDetailRequest(string? InstaPayAccount, s
 public sealed record BillingLessonDto(Guid Id, Guid TeacherId, string TeacherName, Guid StudentId, string StudentName, DateTimeOffset StartsAt, DateTimeOffset EndsAt, bool IsTrial, decimal Amount);
 public sealed record BillingMonthDto(string Month, int LessonCount, decimal Total);
 public sealed record MonthlyPaymentClaimDto(Guid Id, Guid StudentId, string StudentName, string StudentEmail, string Month, int LessonCount, decimal AmountUsd, string Status, string? StudentNote, string? AdminNote, DateTimeOffset ClaimedAt, DateTimeOffset? ReviewedAt);
-public sealed record StudentBillingDto(string Month, bool MonthClosed, IReadOnlyList<BillingMonthDto> Months, IReadOnlyList<BillingLessonDto> Lessons, decimal TotalUsd, AcademyBankAccountDto? BankAccount, MonthlyPaymentClaimDto? Claim, bool CanClaim);
+public sealed record StudentBillingDto(string Month, bool MonthClosed, IReadOnlyList<BillingMonthDto> Months, IReadOnlyList<BillingLessonDto> Lessons, decimal TotalUsd, AcademyBankAccountDto? BankAccount, MonthlyPaymentClaimDto? Claim, bool CanClaim, bool CardPaid);
 public sealed record TeacherBillingDto(string Month, bool MonthClosed, IReadOnlyList<BillingMonthDto> Months, IReadOnlyList<BillingLessonDto> Lessons, decimal TotalEgp, decimal PayoutPerLessonEgp, TeacherPayoutDetailDto PayoutDetails, bool HasPayoutDetails);
 public sealed record AdminTeacherPayoutDto(Guid TeacherId, string TeacherName, string TeacherEmail, int LessonCount, decimal PayoutPerLessonEgp, decimal TotalEgp, TeacherPayoutDetailDto PayoutDetails);
 public sealed record AdminBillingOverviewDto(AcademyBankAccountDto? BankAccount, IReadOnlyList<TeacherBillingRateDto> Rates, IReadOnlyList<MonthlyPaymentClaimDto> Claims, IReadOnlyList<AdminTeacherPayoutDto> TeacherPayouts, string Month);

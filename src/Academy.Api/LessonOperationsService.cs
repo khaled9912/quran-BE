@@ -217,21 +217,21 @@ public static class LessonPolicyService
             if (hoursBefore >= policy.StudentFreeCancelHours)
                 return Result(
                     "free_cancellation", false, false, 0, 0, "none", null, false,
-                    $"This is more than {policy.StudentFreeCancelHours} hours before the lesson. No lesson credit is deducted and no reliability strike is recorded. Your teacher is not compensated for this slot.");
+                    $"This is more than {policy.StudentFreeCancelHours} hours before the lesson. Nothing is counted against you and no reliability strike is recorded. Your teacher is not paid for this slot.");
 
             if (graceAvailable)
                 return Result(
                     "grace_cancellation", true, true, scheduled,
                     0, "none", "student_grace_cancellation", false,
-                    $"This is inside the {policy.StudentFreeCancelHours}-hour window. This uses your {graceLimit} grace cancellation for this month: no lesson credit is deducted and no strike is recorded. Your teacher is compensated for the scheduled time.");
+                    $"This is inside the {policy.StudentFreeCancelHours}-hour window. This uses your {graceLimit} grace cancellation for this month: nothing is counted against you and no strike is recorded. Your teacher is paid for the booked time.");
 
             return Result(
                 "late_cancellation", true, false, scheduled,
                 lesson.IsTrial ? 0 : -1, lesson.IsTrial ? "none" : "deduct",
                 "student_late_cancellation", false,
                 lesson.IsTrial
-                    ? $"This is inside the {policy.StudentFreeCancelHours}-hour window. Trial lessons do not use a credit, but this late cancellation is recorded as a reliability strike."
-                    : $"This is inside the {policy.StudentFreeCancelHours}-hour window. One lesson credit is deducted, a reliability strike is recorded, and your teacher is compensated for the scheduled time.");
+                    ? $"This is inside the {policy.StudentFreeCancelHours}-hour window. A trial lesson leaves nothing counted against you, but this late cancellation is recorded as a reliability strike."
+                    : $"This is inside the {policy.StudentFreeCancelHours}-hour window. The late cancellation is recorded on your account, a reliability strike is recorded, and your teacher is paid for the booked time.");
         }
 
         if (role == "teacher")
@@ -241,13 +241,13 @@ public static class LessonPolicyService
                     "cancelled_by_teacher", false, false, 0,
                     lesson.IsTrial ? 0 : 1, lesson.IsTrial ? "none" : "restore",
                     "teacher_early_cancellation", false,
-                    $"This is more than {policy.TeacherFreeCancelHours} hours before the lesson. The student is notified, their lesson credit is restored, and no teacher compensation is generated.");
+                    $"This is more than {policy.TeacherFreeCancelHours} hours before the lesson. The student is notified, the class is not counted against them, and no teacher compensation is generated.");
 
             return Result(
                 "late_cancelled_by_teacher", true, false, 0,
                 lesson.IsTrial ? 0 : 1, lesson.IsTrial ? "none" : "restore",
                 "teacher_late_cancellation", true,
-                $"This is inside the {policy.TeacherFreeCancelHours}-hour window. The student is notified and their credit is restored. This late cancellation is recorded for academy review and may affect your reliability record.");
+                $"This is inside the {policy.TeacherFreeCancelHours}-hour window. The student is notified and the class is not counted against them. This late cancellation is recorded for academy review and may affect your reliability record.");
         }
 
         if (role == "admin")
@@ -255,7 +255,7 @@ public static class LessonPolicyService
                 "admin_cancelled", hoursBefore < policy.TeacherFreeCancelHours, false, scheduled,
                 lesson.IsTrial ? 0 : 1, lesson.IsTrial ? "none" : "restore",
                 null, false,
-                "Academy cancellation: the student's lesson credit is restored and the teacher is compensated for the scheduled time.");
+                "Academy cancellation: the class is not counted against the student and the teacher is paid for the booked time.");
 
         return Blocked("You do not have permission to cancel this lesson.");
     }

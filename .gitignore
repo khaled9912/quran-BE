@@ -12,3 +12,9 @@
 *.user
 *.suo
 .DS_Store
+
+# Only the credential-free appsettings.json is committed. Any environment file
+# that carries real keys stays local: appsettings.json is published on every
+# deploy, so a secret typed into it reaches the host.
+appsettings.Development.json
+appsettings.Production.json

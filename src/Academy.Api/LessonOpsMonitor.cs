@@ -13,6 +13,11 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
 {
     private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
 
+    /// <summary>How long after the scheduled start an unjoined participant is
+    /// auto-ringed. The tick is a minute wide, so the ring lands between 3 and
+    /// 4 minutes in — and later than that if the host was asleep.</summary>
+    private static readonly TimeSpan AutoRingDelay = TimeSpan.FromMinutes(3);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(Interval);
@@ -144,6 +149,60 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
             newIncidents.Add((lesson, incident));
         }
 
+        // Auto-ring: once a live lesson is a few minutes old, call whoever has
+        // not joined yet. Same ring the participants send each other by hand —
+        // a LessonCall row, an in-app notice, and an urgent push — but fired by
+        // the monitor and attributed to the academy rather than to the other
+        // participant, who did not press anything. Once per lesson per person,
+        // deduped on the notification key.
+        var autoRingCutoff = now - AutoRingDelay;
+        var autoRingLessons = await db.Lessons
+            .Include(x => x.Teacher).Include(x => x.Student).Include(x => x.Series)
+            .Where(x => x.Status == "scheduled"
+                && x.StartsAt <= autoRingCutoff
+                && x.EndsAt > now)
+            .Take(200).ToListAsync(ct);
+        var autoRings = new List<(Guid CallerId, Guid CalleeId, Guid LessonId, string Title, string Body, string Link)>();
+        foreach (var lesson in autoRingLessons)
+        {
+            var attendances = await db.LessonAttendances.AsNoTracking()
+                .Where(x => x.LessonId == lesson.Id).ToListAsync(ct);
+            var teacherPresent = attendances.Any(x => x.UserId == lesson.TeacherId && x.TotalSeconds > 0);
+            var studentPresent = attendances.Any(x => x.UserId == lesson.StudentId && x.TotalSeconds > 0);
+            if (teacherPresent && studentPresent) continue;
+
+            var when = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
+            var link = LessonOpsMessaging.LessonLink(lesson);
+            foreach (var (calleeId, calleeRole, callerId, callerRole, otherName, calleePresent) in new[]
+            {
+                (lesson.StudentId, "student", lesson.TeacherId, "teacher",
+                    lesson.Teacher?.FullName ?? "your teacher", studentPresent),
+                (lesson.TeacherId, "teacher", lesson.StudentId, "student",
+                    lesson.Student?.FullName ?? "your student", teacherPresent),
+            })
+            {
+                if (calleePresent) continue;
+                var key = $"auto-ring:{lesson.Id}:{calleeId}";
+                if (await db.Notifications.AnyAsync(x => x.UserId == calleeId && x.DedupeKey == key, ct)) continue;
+
+                db.LessonCalls.Add(new LessonCall
+                {
+                    LessonId = lesson.Id,
+                    CallerId = callerId,
+                    CallerRole = callerRole,
+                    CalleeId = calleeId,
+                    CalleeRole = calleeRole,
+                    Origin = "auto",
+                    CalleeStatus = "not_joined",
+                    CreatedAt = now,
+                });
+                var title = "The academy is calling you";
+                var body = $"Your lesson with {otherName} started at {when} and you have not joined yet. Tap to open the room.";
+                db.Notifications.Add(LessonOpsMessaging.Notice(calleeId, title, body, "lesson", link, key));
+                autoRings.Add((callerId, calleeId, lesson.Id, title, body, link));
+            }
+        }
+
         // Upcoming reminders, pushed server-side even when the app is closed.
         var upcoming = await db.Lessons
             .Include(x => x.Teacher).Include(x => x.Student)
@@ -263,6 +322,16 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
 
         foreach (var job in pushJobs)
             await LessonOpsMessaging.PushAsync(db, push, [job.UserId], job.Title, job.Body, job.Link, ct);
+
+        // The auto-ring is delivered like a hand-pressed call: the Calls scope
+        // makes an open app ring within a second, and the urgent push reaches
+        // a closed one on the loud lesson-call channel.
+        foreach (var (callerId, calleeId, lessonId, title, body, link) in autoRings)
+        {
+            await realtime.ToUsersAsync([callerId, calleeId], RealtimeScopes.Calls, lessonId);
+            await realtime.ToUserAsync(calleeId, RealtimeScopes.Notifications);
+            await LessonOpsMessaging.PushAsync(db, push, [calleeId], title, body, link, ct, LessonOpsMessaging.UrgentCall);
+        }
     }
 
     private static Guid? ChangedLessonId(object entity) => entity switch

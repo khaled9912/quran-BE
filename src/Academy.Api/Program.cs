@@ -203,6 +203,27 @@ builder.Services.AddRateLimiter(options =>
     options.AddPolicy("transcripts", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         _ => new FixedWindowRateLimiterOptions { PermitLimit = 120, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
+    // A month is billed once: asking again returns the invoice that already exists,
+    // so a high limit here only helps someone probe the price table.
+    options.AddPolicy("invoice", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
+    // Opening a checkout costs a session at the provider and can strand one, so it
+    // is the tightest of these: a month only needs one attempt at a time.
+    options.AddPolicy("payment-initiate", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 6, Window = TimeSpan.FromMinutes(10), QueueLimit = 0, AutoReplenishment = true }));
+    // The screen polls while a student sits on the checkout page; this is a read of
+    // a provider session, not a mutation, but each poll is an outbound call.
+    options.AddPolicy("payment-status", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+            ?? context.Connection.RemoteIpAddress?.ToString() ?? "anonymous",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 60, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
+    options.AddPolicy("stripe-webhook", context => RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 60, Window = TimeSpan.FromMinutes(1), QueueLimit = 0, AutoReplenishment = true }));
 });
 builder.Services.AddSingleton<PhoneOtpStore>();
 builder.Services.AddSingleton<PasswordResetStore>();
@@ -214,6 +235,16 @@ builder.Services.AddHttpClient("expo", client => client.Timeout = TimeSpan.FromS
 // Browser push services are internet-facing queues; a stalled one must not hold
 // a request open, and the ring it carries is worthless a minute later.
 builder.Services.AddHttpClient("webpush", client => client.Timeout = TimeSpan.FromSeconds(10));
+// A card authorisation is a synchronous round trip the student is watching, so it
+// gets a timeout of its own: long enough for Stripe, short enough that a stalled
+// gateway never parks a request thread.
+builder.Services.AddHttpClient(StripeProvider.HttpClientName, client => client.Timeout = TimeSpan.FromSeconds(20));
+var stripeOptions = StripeOptions.From(builder.Configuration);
+builder.Services.AddSingleton(stripeOptions);
+if (stripeOptions.IsConfigured)
+    builder.Services.AddSingleton<IPaymentProvider, StripeProvider>();
+else
+    builder.Services.AddSingleton<IPaymentProvider, UnconfiguredPaymentProvider>();
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 3 * 1024 * 1024);
 if (string.Equals(builder.Configuration["Otp:Sender"], "textbee", StringComparison.OrdinalIgnoreCase))
     builder.Services.AddSingleton<IOtpSender, TextBeeOtpSender>();
@@ -318,7 +349,10 @@ app.MapTeacherApplications();
 app.MapLessonReviews();
 app.MapTranscriptCapture();
 app.MapPayments();
+app.MapCheckout();
+app.MapAdminPayments();
 app.MapNotifications();
+app.MapPolicies();
 
 // EnsureCreated only builds an empty database from scratch, so the idempotent
 // statements below run even when a deployed environment sets that flag false.
@@ -637,8 +671,8 @@ await using (var scope = app.Services.CreateAsyncScope())
 
         CREATE TABLE IF NOT EXISTS "AcademyPolicies" (
             "Id" integer NOT NULL,
-            "StudentFreeCancelHours" integer NOT NULL DEFAULT 24,
-            "TeacherFreeCancelHours" integer NOT NULL DEFAULT 24,
+            "StudentFreeCancelHours" integer NOT NULL DEFAULT 12,
+            "TeacherFreeCancelHours" integer NOT NULL DEFAULT 12,
             "NoShowGraceMinutes" integer NOT NULL DEFAULT 10,
             "RescheduleResponseHours" integer NOT NULL DEFAULT 12,
             "StudentGraceCancellationsPerMonth" integer NOT NULL DEFAULT 1,
@@ -660,7 +694,7 @@ await using (var scope = app.Services.CreateAsyncScope())
             "TeacherAdminReviewStrikeThreshold", "TrialNoShowThreshold",
             "PayScheduledDurationWhenAttended", "UpdatedAt"
         )
-        VALUES (1, 24, 24, 10, 12, 1, 3, 4, 2, 2, TRUE, now())
+        VALUES (1, 12, 12, 10, 12, 1, 3, 4, 2, 2, TRUE, now())
         ON CONFLICT ("Id") DO NOTHING;
 
         ALTER TABLE "Lessons" ADD COLUMN IF NOT EXISTS "CancellationOutcome" character varying(40);
@@ -1031,6 +1065,121 @@ await using (var scope = app.Services.CreateAsyncScope())
         );
         CREATE INDEX IF NOT EXISTS "IX_LessonCalls_LessonId_CreatedAt" ON "LessonCalls" ("LessonId", "CreatedAt");
         CREATE INDEX IF NOT EXISTS "IX_LessonCalls_CalleeId_CreatedAt" ON "LessonCalls" ("CalleeId", "CreatedAt");
+
+        CREATE TABLE IF NOT EXISTS "PlanPrices" (
+            "Id" uuid NOT NULL,
+            "DaysPerWeek" integer NOT NULL,
+            "Currency" character varying(3) NOT NULL,
+            "MonthlyAmount" numeric(10,2) NOT NULL DEFAULT 0,
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            "UpdatedBy" uuid,
+            CONSTRAINT "PK_PlanPrices" PRIMARY KEY ("Id")
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PlanPrices_DaysPerWeek_Currency" ON "PlanPrices" ("DaysPerWeek", "Currency");
+
+        -- The USD package figures move from the plans page bundle to the server so an
+        -- invoice has an amount the callback can be checked against. GBP is left
+        -- unseeded: no price exists for it yet and inventing one would be a business
+        -- decision made by a migration.
+        INSERT INTO "PlanPrices" ("Id", "DaysPerWeek", "Currency", "MonthlyAmount", "UpdatedAt")
+        SELECT gen_random_uuid(), v.d, 'USD', v.amount, now()
+        FROM (VALUES (2, 38.00), (3, 44.00), (4, 50.00), (5, 56.00)) AS v (d, amount)
+        ON CONFLICT ("DaysPerWeek", "Currency") DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS "PaymentInvoices" (
+            "Id" uuid NOT NULL,
+            "StudentId" uuid NOT NULL,
+            "Month" character varying(7) NOT NULL,
+            "DaysPerWeek" integer NOT NULL DEFAULT 0,
+            "Currency" character varying(3) NOT NULL DEFAULT 'USD',
+            "Amount" numeric(10,2) NOT NULL DEFAULT 0,
+            "Status" character varying(20) NOT NULL DEFAULT 'open',
+            "Note" character varying(500),
+            "IssuedAt" timestamp with time zone NOT NULL,
+            "PaidAt" timestamp with time zone,
+            "VoidedBy" uuid,
+            "VoidedAt" timestamp with time zone,
+            "VoidReason" character varying(500),
+            "UpdatedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_PaymentInvoices" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_PaymentInvoices_AspNetUsers_StudentId" FOREIGN KEY ("StudentId") REFERENCES "AspNetUsers" ("Id") ON DELETE RESTRICT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PaymentInvoices_StudentId_Month" ON "PaymentInvoices" ("StudentId", "Month") WHERE "Status" <> 'voided';
+        CREATE INDEX IF NOT EXISTS "IX_PaymentInvoices_Status_Month" ON "PaymentInvoices" ("Status", "Month");
+
+        CREATE TABLE IF NOT EXISTS "PaymentTransactions" (
+            "Id" uuid NOT NULL,
+            "InvoiceId" uuid NOT NULL,
+            "Provider" character varying(20) NOT NULL DEFAULT 'stripe',
+            "MerchantReference" character varying(64) NOT NULL,
+            "ProviderCheckoutId" character varying(64),
+            "ProviderTransactionId" character varying(64),
+            "AmountCents" integer NOT NULL DEFAULT 0,
+            "Currency" character varying(3) NOT NULL DEFAULT 'USD',
+            "PresentmentAmountCents" integer,
+            "PresentmentCurrency" character varying(3),
+            "Status" character varying(20) NOT NULL DEFAULT 'pending',
+            "PaymentBrand" character varying(40),
+            "PaymentMethodType" character varying(20),
+            "FailureReason" character varying(300),
+            "RefundedAmountCents" integer NOT NULL DEFAULT 0,
+            "CreatedAt" timestamp with time zone NOT NULL,
+            "ConfirmedAt" timestamp with time zone,
+            CONSTRAINT "PK_PaymentTransactions" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_PaymentTransactions_PaymentInvoices_InvoiceId" FOREIGN KEY ("InvoiceId") REFERENCES "PaymentInvoices" ("Id") ON DELETE RESTRICT
+        );
+        ALTER TABLE "PaymentTransactions" ADD COLUMN IF NOT EXISTS "ProviderCheckoutId" character varying(64);
+        ALTER TABLE "PaymentTransactions" ADD COLUMN IF NOT EXISTS "PresentmentAmountCents" integer;
+        ALTER TABLE "PaymentTransactions" ADD COLUMN IF NOT EXISTS "PresentmentCurrency" character varying(3);
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PaymentTransactions_MerchantReference" ON "PaymentTransactions" ("MerchantReference");
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PaymentTransactions_ProviderTransactionId" ON "PaymentTransactions" ("ProviderTransactionId") WHERE "ProviderTransactionId" IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PaymentTransactions_ProviderCheckoutId" ON "PaymentTransactions" ("ProviderCheckoutId") WHERE "ProviderCheckoutId" IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS "IX_PaymentTransactions_InvoiceId_CreatedAt" ON "PaymentTransactions" ("InvoiceId", "CreatedAt");
+        CREATE INDEX IF NOT EXISTS "IX_PaymentTransactions_Status" ON "PaymentTransactions" ("Status");
+
+        CREATE TABLE IF NOT EXISTS "PaymentCallbackEvents" (
+            "Id" uuid NOT NULL,
+            "Provider" character varying(20) NOT NULL DEFAULT 'stripe',
+            "ProviderEventId" character varying(64),
+            "ProviderTransactionId" character varying(64),
+            "ProviderCheckoutId" character varying(64),
+            "MerchantReference" character varying(64),
+            "Outcome" character varying(30) NOT NULL,
+            "EventType" character varying(60) NOT NULL DEFAULT '',
+            "AmountCents" integer NOT NULL DEFAULT 0,
+            "Currency" character varying(3) NOT NULL DEFAULT '',
+            "Detail" character varying(300),
+            "ReceivedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_PaymentCallbackEvents" PRIMARY KEY ("Id")
+        );
+        ALTER TABLE "PaymentCallbackEvents" ADD COLUMN IF NOT EXISTS "ProviderEventId" character varying(64);
+        ALTER TABLE "PaymentCallbackEvents" ADD COLUMN IF NOT EXISTS "EventType" character varying(60) NOT NULL DEFAULT '';
+        ALTER TABLE "PaymentCallbackEvents" ADD COLUMN IF NOT EXISTS "ProviderCheckoutId" character varying(64);
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PaymentCallbackEvents_ProviderEventId" ON "PaymentCallbackEvents" ("ProviderEventId") WHERE "ProviderEventId" IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS "IX_PaymentCallbackEvents_ProviderTransactionId" ON "PaymentCallbackEvents" ("ProviderTransactionId") WHERE "ProviderTransactionId" IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS "IX_PaymentCallbackEvents_ReceivedAt" ON "PaymentCallbackEvents" ("ReceivedAt");
+        CREATE INDEX IF NOT EXISTS "IX_PaymentCallbackEvents_Outcome_ReceivedAt" ON "PaymentCallbackEvents" ("Outcome", "ReceivedAt");
+
+        -- These tables were first created hours before the Stripe switch, when their
+        -- shape described a different provider's callback. The ADD COLUMN lines above
+        -- run before the indexes that need the new columns, so a database that already
+        -- has the earlier shape converges without losing any row. The provider-specific
+        -- columns left behind are nullable and stay unused.
+
+        CREATE TABLE IF NOT EXISTS "PolicyAcceptances" (
+            "Id" uuid NOT NULL,
+            "UserId" uuid NOT NULL,
+            "PolicyKey" character varying(30) NOT NULL,
+            "PolicyVersion" integer NOT NULL,
+            "ClauseIds" character varying(500) NOT NULL,
+            "IpAddress" character varying(60) NOT NULL,
+            "UserAgent" character varying(300) NOT NULL,
+            "AcceptedAt" timestamp with time zone NOT NULL,
+            CONSTRAINT "PK_PolicyAcceptances" PRIMARY KEY ("Id"),
+            CONSTRAINT "FK_PolicyAcceptances_AspNetUsers_UserId" FOREIGN KEY ("UserId") REFERENCES "AspNetUsers" ("Id") ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_PolicyAcceptances_UserId_PolicyKey_PolicyVersion" ON "PolicyAcceptances" ("UserId", "PolicyKey", "PolicyVersion");
+        CREATE INDEX IF NOT EXISTS "IX_PolicyAcceptances_PolicyKey_PolicyVersion" ON "PolicyAcceptances" ("PolicyKey", "PolicyVersion");
 
         CREATE TABLE IF NOT EXISTS "DataProtectionKeys" (
             "Id" integer GENERATED BY DEFAULT AS IDENTITY,

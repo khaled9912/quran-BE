@@ -388,6 +388,114 @@ public sealed class MonthlyPaymentClaim
 }
 
 /// <summary>
+/// What one package costs for a month, in one currency. These figures used to
+/// exist only inside the public plans page bundle, which meant the amount a
+/// student paid had nothing to be checked against. An invoice is priced from
+/// here, on the server.
+/// </summary>
+public sealed class PlanPrice
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    /// <summary>Package size in lessons per week: 2, 3, 4 or 5.</summary>
+    public int DaysPerWeek { get; set; }
+    /// <summary>ISO code, upper case: USD, GBP. One row per package and currency.</summary>
+    [MaxLength(3)] public string Currency { get; set; } = "USD";
+    public decimal MonthlyAmount { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public Guid? UpdatedBy { get; set; }
+}
+
+/// <summary>
+/// A bill for one academy month. The amount is fixed when the invoice is issued,
+/// so a callback can be compared against what the academy actually asked for.
+/// </summary>
+public sealed class PaymentInvoice
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid StudentId { get; set; }
+    public AcademyUser? Student { get; set; }
+    /// <summary>Academy-time month key, e.g. 2026-11 — same convention as claims.</summary>
+    [MaxLength(7)] public string Month { get; set; } = "";
+    /// <summary>Package size the invoice was priced against, kept so a later price change cannot rewrite history.</summary>
+    public int DaysPerWeek { get; set; }
+    [MaxLength(3)] public string Currency { get; set; } = "USD";
+    public decimal Amount { get; set; }
+    // open | awaiting_payment | paid | voided
+    [MaxLength(20)] public string Status { get; set; } = "open";
+    [MaxLength(500)] public string? Note { get; set; }
+    public DateTimeOffset IssuedAt { get; set; } = DateTimeOffset.UtcNow;
+    /// <summary>Set only by a verified provider transaction, never by a browser redirect.</summary>
+    public DateTimeOffset? PaidAt { get; set; }
+    public Guid? VoidedBy { get; set; }
+    public DateTimeOffset? VoidedAt { get; set; }
+    [MaxLength(500)] public string? VoidReason { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// One checkout attempt against an invoice. A paid invoice has exactly one
+/// captured transaction; the row exists even when the payment failed, so the
+/// academy can see how many attempts a month took.
+/// </summary>
+public sealed class PaymentTransaction
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid InvoiceId { get; set; }
+    public PaymentInvoice? Invoice { get; set; }
+    [MaxLength(20)] public string Provider { get; set; } = "stripe";
+    /// <summary>Our own reference, sent to the provider and echoed back on every callback.</summary>
+    [MaxLength(64)] public string MerchantReference { get; set; } = "";
+    /// <summary>The provider's checkout object, e.g. a Stripe session id.</summary>
+    [MaxLength(64)] public string? ProviderCheckoutId { get; set; }
+    /// <summary>Filled when a verified callback names the transaction; unique, so a retry cannot apply twice.</summary>
+    [MaxLength(64)] public string? ProviderTransactionId { get; set; }
+    public int AmountCents { get; set; }
+    [MaxLength(3)] public string Currency { get; set; } = "USD";
+    /// <summary>
+    /// What the cardholder was actually asked to pay, kept alongside the academy's
+    /// own figure because the two can differ once a local currency is involved.
+    /// This is history, not a check: verification always runs against the amount
+    /// and currency above.
+    /// </summary>
+    public int? PresentmentAmountCents { get; set; }
+    [MaxLength(3)] public string? PresentmentCurrency { get; set; }
+    // pending | captured | failed | refunded | voided
+    [MaxLength(20)] public string Status { get; set; } = "pending";
+    /// <summary>Card brand and type only. The PAN, expiry and CVV are never stored.</summary>
+    [MaxLength(40)] public string? PaymentBrand { get; set; }
+    [MaxLength(20)] public string? PaymentMethodType { get; set; }
+    [MaxLength(300)] public string? FailureReason { get; set; }
+    public int RefundedAmountCents { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? ConfirmedAt { get; set; }
+}
+
+/// <summary>
+/// What the provider told us, recorded before it is acted on. This is what makes
+/// a duplicate delivery provable rather than merely unlikely, and what the
+/// academy reads when a student disputes a charge.
+/// </summary>
+public sealed class PaymentCallbackEvent
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    [MaxLength(20)] public string Provider { get; set; } = "stripe";
+    /// <summary>The provider's own event id. Unique, so a redelivery is provably a duplicate.</summary>
+    [MaxLength(64)] public string? ProviderEventId { get; set; }
+    [MaxLength(64)] public string? ProviderTransactionId { get; set; }
+    [MaxLength(64)] public string? ProviderCheckoutId { get; set; }
+    [MaxLength(64)] public string? MerchantReference { get; set; }
+    // applied | duplicate | unmatched | ignored | deferred | rejected_amount | rejected_currency
+    [MaxLength(30)] public string Outcome { get; set; } = "";
+    /// <summary>The provider's event type, kept because outcomes are only readable against it.</summary>
+    [MaxLength(60)] public string EventType { get; set; } = "";
+    public int AmountCents { get; set; }
+    [MaxLength(3)] public string Currency { get; set; } = "";
+    /// <summary>Safe summary only: no payload text, no card data.</summary>
+    [MaxLength(300)] public string? Detail { get; set; }
+    public DateTimeOffset ReceivedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
 /// An in-app notification for one account. Events are written as they happen
 /// (bookings, confirmations) and lesson-time reminders are materialized when the
 /// account polls, so the bell is accurate even if the app was closed at the time.
@@ -407,6 +515,26 @@ public sealed class AppNotification
     [MaxLength(160)] public string? DedupeKey { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? ReadAt { get; set; }
+}
+
+/// <summary>
+/// One account's signature on one version of a <see cref="PolicyCatalog"/>
+/// document. The ticked clause ids are kept so a later question about what a
+/// specific account agreed to can be answered from the row, not the build.
+/// </summary>
+public sealed class PolicyAcceptance
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public AcademyUser? User { get; set; }
+    // teacher | parent
+    [MaxLength(30)] public string PolicyKey { get; set; } = "";
+    public int PolicyVersion { get; set; }
+    /// <summary>Comma-separated clause ids from the catalog.</summary>
+    [MaxLength(500)] public string ClauseIds { get; set; } = "";
+    [MaxLength(60)] public string IpAddress { get; set; } = "";
+    [MaxLength(300)] public string UserAgent { get; set; } = "";
+    public DateTimeOffset AcceptedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 public sealed class ContactSubmission

@@ -13,7 +13,7 @@ namespace Academy.Api;
 public static class PaymentEndpoints
 {
     private const int BankAccountId = 1;
-    private const string MonthFormat = "yyyy-MM";
+    internal const string MonthFormat = "yyyy-MM";
     private static readonly TimeZoneInfo AcademyTimeZone = ResolveAcademyTimeZone();
 
     public static void MapPayments(this WebApplication app)
@@ -81,8 +81,16 @@ public static class PaymentEndpoints
             .Include(x => x.Student)
             .FirstOrDefaultAsync(x => x.StudentId == studentId && x.Month == key);
 
+        // A month settled by card is settled. The transfer rail must not offer a
+        // second way to pay the same bill, so this decides canClaim as much as the
+        // claim's own status does.
+        var cardPaid = await db.PaymentInvoices
+            .AsNoTracking()
+            .AnyAsync(x => x.StudentId == studentId && x.Month == key && x.Status == "paid");
+
         var canClaim = closed
             && total > 0
+            && !cardPaid
             && (claim is null || claim.Status == "rejected");
 
         return Results.Ok(new StudentBillingDto(
@@ -93,7 +101,8 @@ public static class PaymentEndpoints
             total,
             bank is null ? null : ToBank(bank),
             claim is null ? null : ToClaim(claim, claim.Student),
-            canClaim));
+            canClaim,
+            cardPaid));
     }
 
     private static async Task<IResult> CreateClaimAsync(
@@ -125,6 +134,13 @@ public static class PaymentEndpoints
             return Results.ValidationProblem(new Dictionary<string, string[]>() { ["month"] = ["There is nothing to pay for that month."] });
 
         var key = MonthKey(month);
+
+        // Whichever rail settles a month first owns it. A card payment already
+        // confirmed here cannot be claimed as a transfer as well.
+        if (await db.PaymentInvoices.AsNoTracking()
+                .AnyAsync(x => x.StudentId == studentId && x.Month == key && x.Status == "paid"))
+            return Results.Conflict(new { message = "This month is already paid by card." });
+
         var claim = await db.MonthlyPaymentClaims
             .Include(x => x.Student)
             .FirstOrDefaultAsync(x => x.StudentId == studentId && x.Month == key);
@@ -575,7 +591,7 @@ public static class PaymentEndpoints
         return (month, MonthKey(month));
     }
 
-    private static bool TryParseMonth(string? value, out DateOnly month)
+    internal static bool TryParseMonth(string? value, out DateOnly month)
     {
         month = default;
         return !string.IsNullOrWhiteSpace(value)
@@ -587,19 +603,29 @@ public static class PaymentEndpoints
                 out month);
     }
 
-    private static string MonthKey(DateOnly month) =>
+    internal static string MonthKey(DateOnly month) =>
         month.ToString(MonthFormat, CultureInfo.InvariantCulture);
 
-    private static string MonthKey(DateTimeOffset value) =>
+    internal static string MonthKey(DateTimeOffset value) =>
         MonthKey(DateOnly.FromDateTime(ToAcademy(value)));
 
-    private static DateOnly CurrentMonth() =>
-        DateOnly.FromDateTime(ToAcademy(DateTimeOffset.UtcNow));
+    internal static DateOnly CurrentMonth()
+    {
+        var now = DateOnly.FromDateTime(ToAcademy(DateTimeOffset.UtcNow));
+        return new DateOnly(now.Year, now.Month, 1);
+    }
+
+    /// <summary>
+    /// The month a bill is for: the last one that has ended in Cairo time. A plan
+    /// is paid after the month it covers, so the ongoing month is never on a bill
+    /// and a student never pays for classes that have not happened.
+    /// </summary>
+    internal static DateOnly LastClosedMonth() => CurrentMonth().AddMonths(-1);
 
     private static DateTime ToAcademy(DateTimeOffset value) =>
         TimeZoneInfo.ConvertTime(value, AcademyTimeZone).DateTime;
 
-    private static (DateTimeOffset Start, DateTimeOffset End) MonthBounds(DateOnly month)
+    internal static (DateTimeOffset Start, DateTimeOffset End) MonthBounds(DateOnly month)
     {
         var start = new DateTime(month.Year, month.Month, 1, 0, 0, 0, DateTimeKind.Unspecified);
         return (ToOffset(start), ToOffset(start.AddMonths(1)));

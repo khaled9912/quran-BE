@@ -62,6 +62,9 @@ public sealed class WebPushSender(IConfiguration configuration, IHttpClientFacto
             // second call replaces the first ring instead of stacking banners.
             tag = options?.Tag,
             urgent = options?.Priority == "high",
+            // The worker hands this to navigator.setAppBadge, so an installed
+            // PWA shows the reader's unread count with no tab open.
+            badge = options?.Badge,
         });
 
         using var client = new WebPushClient(factory.CreateClient("webpush"));
