@@ -65,7 +65,7 @@ public static class PolicyEndpoints
             if (existing is not null)
                 return Results.Ok(new PolicyAcceptanceDto(def.Key, def.Version, existing.AcceptedAt, Split(existing.ClauseIds)));
 
-            var now = DateTimeOffset.UtcNow;
+            var now = TrimToMicroseconds(DateTimeOffset.UtcNow);
             db.PolicyAcceptances.Add(new PolicyAcceptance
             {
                 UserId = userId,
@@ -89,6 +89,12 @@ public static class PolicyEndpoints
 
     private static IReadOnlyList<string> Split(string clauseIds) =>
         clauseIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static DateTimeOffset TrimToMicroseconds(DateTimeOffset value)
+    {
+        var ticks = value.UtcDateTime.Ticks - (value.UtcDateTime.Ticks % TimeSpan.TicksPerMicrosecond);
+        return new DateTimeOffset(ticks, TimeSpan.Zero);
+    }
 
     private static string Truncate(string value, int max) => value.Length <= max ? value : value[..max];
 }
