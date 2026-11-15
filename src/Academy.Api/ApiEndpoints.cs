@@ -1215,7 +1215,7 @@ public static class ApiEndpoints
                     || !TimeOnly.TryParse(slot.EndsAtTime, CultureInfo.InvariantCulture, DateTimeStyles.None, out var end)
                     || end <= start)
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Each time needs a start and a later end."] });
-                if ((end - start) != TimeSpan.FromMinutes(30))
+                if (input.Completed && (end - start) != TimeSpan.FromMinutes(30))
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose 30-minute lesson windows only."] });
                 if (prefs.Any(x => x.DayOfWeek == slot.DayOfWeek && x.StartsAtTime == start && x.EndsAtTime == end)) continue;
                 prefs.Add(new StudentWeeklyPreference
