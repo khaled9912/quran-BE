@@ -1215,6 +1215,8 @@ public static class ApiEndpoints
                     || !TimeOnly.TryParse(slot.EndsAtTime, CultureInfo.InvariantCulture, DateTimeStyles.None, out var end)
                     || end <= start)
                     return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Each time needs a start and a later end."] });
+                if (input.Completed && (end - start) != TimeSpan.FromMinutes(30))
+                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["weeklySlots"] = ["Choose 30-minute lesson windows only."] });
                 if (prefs.Any(x => x.DayOfWeek == slot.DayOfWeek && x.StartsAtTime == start && x.EndsAtTime == end)) continue;
                 prefs.Add(new StudentWeeklyPreference
                 {
@@ -2115,8 +2117,8 @@ public static class ApiEndpoints
     private static OpenStudentOfferDto ToOpenOffer(OpenStudentOffer offer, string studentName, string? claimedByTeacherName)
         => new(offer.Id, offer.StudentId, studentName, offer.StartsAt, offer.EndsAt, offer.Status, offer.ClaimedByTeacherId, claimedByTeacherName, offer.LessonId, offer.CreatedAt, offer.ClaimedAt);
     // Lessons are standardized so billing, reminders, and reports stay predictable.
-    private static readonly TimeSpan[] AllowedLessonLengths = [TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(45), TimeSpan.FromHours(1)];
-    private const string LessonLengthMessage = "A lesson can last 30, 45, or 60 minutes.";
+    private static readonly TimeSpan[] AllowedLessonLengths = [TimeSpan.FromMinutes(30)];
+    private const string LessonLengthMessage = "A lesson can last 30 minutes.";
     private static bool HasAllowedLessonLength(TimeSpan duration) => AllowedLessonLengths.Contains(duration);
     private static async Task<List<Guid>> ActiveTeacherIdsAsync(AcademyDbContext db, CancellationToken ct = default)
     {

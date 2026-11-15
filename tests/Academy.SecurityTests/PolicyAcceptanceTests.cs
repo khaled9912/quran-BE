@@ -93,6 +93,44 @@ public sealed class PolicyAcceptanceTests(PostgresFixture postgres) : ApiTestBas
     }
 
     [Fact]
+    public async Task TeacherWeeklyAvailabilityRejects45MinuteSlots()
+    {
+        var (teacher, _) = await Factory.LoginAsAsync("teacher");
+        using var _ = teacher;
+
+        var response = await teacher.PostAsJsonAsync("/api/teacher/availability-rules",
+            new { daysOfWeek = new[] { 1 }, startsAtTime = "17:00", endsAtTime = "17:45", timeZoneId = "UTC" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task StudentOnboardingRejects45MinuteSlots()
+    {
+        var (student, _) = await Factory.LoginAsAsync("student", signed: true);
+        using var _ = student;
+
+        var response = await student.PutAsJsonAsync("/api/student/onboarding",
+            new
+            {
+                quranLevel = "beginner",
+                tajweedLevel = "beginner",
+                islamicStudiesLevel = "beginner",
+                arabicLevel = "beginner",
+                timeZoneId = "Europe/London",
+                daysPerWeek = 2,
+                weeklySlots = new[]
+                {
+                    new { dayOfWeek = 1, startsAtTime = "19:00", endsAtTime = "19:45" },
+                    new { dayOfWeek = 3, startsAtTime = "19:00", endsAtTime = "19:45" },
+                },
+                completed = true,
+            });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
     public async Task AnUnsignedStudentCanAnswerTheWizardButNotSubmitIt()
     {
         using var student = await Factory.LoginAsync("student", signed: false);

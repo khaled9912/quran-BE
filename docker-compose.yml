@@ -51,6 +51,9 @@ services:
       WebPush__PublicKey: ${WEBPUSH_PUBLIC_KEY:-}
       WebPush__PrivateKey: ${WEBPUSH_PRIVATE_KEY:-}
       WebPush__Subject: ${WEBPUSH_SUBJECT:-mailto:support@anaquran.com}
+      # Hub origin handed to browsers; set it to the API tunnel during
+      # real-device sessions so phones can open the socket from anywhere.
+      Realtime__PublicUrl: ${REALTIME_PUBLIC_URL:-}
       # Card payments: no checkout opens until all three credentials are here.
       Stripe__SecretKey: ${STRIPE_SECRET_KEY:-}
       Stripe__PublishableKey: ${STRIPE_PUBLISHABLE_KEY:-}
