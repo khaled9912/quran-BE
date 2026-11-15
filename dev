@@ -33,7 +33,12 @@ compose() {
 
 require_docker() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed or not on PATH."
-  docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop."
+
+  if docker context inspect desktop-linux >/dev/null 2>&1; then
+    docker context use desktop-linux >/dev/null 2>&1 || true
+  fi
+
+  docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop, then run: docker context use desktop-linux"
 }
 
 # The container currently publishing a host port, whatever project it came from.

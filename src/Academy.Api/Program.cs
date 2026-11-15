@@ -72,6 +72,7 @@ if (!string.IsNullOrWhiteSpace(otlpEndpoint))
 var connectionString = DatabaseConnection.Resolve(builder.Configuration);
 var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000")
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+var isLocalDevelopment = builder.Environment.IsDevelopment();
 
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddDbContext<AcademyDbContext>(options => options.UseNpgsql(connectionString));
@@ -156,8 +157,22 @@ builder.Services.AddAuthorization(options =>
     // accounts, applications, or schedules.
     options.AddPolicy("ReviewerOnly", p => p.RequireRole("admin", "super_admin", "support"));
 });
-builder.Services.AddCors(options => options.AddPolicy("Frontend", policy => policy
-    .WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
+builder.Services.AddCors(options => options.AddPolicy("Frontend", policy =>
+{
+    if (isLocalDevelopment)
+    {
+        policy.SetIsOriginAllowed(_ => true)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
+        return;
+    }
+
+    policy.WithOrigins(allowedOrigins)
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        .AllowCredentials();
+}));
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -310,6 +325,11 @@ app.Use(async (context, next) =>
     var method = context.Request.Method;
     var isMutation = HttpMethods.IsPost(method) || HttpMethods.IsPut(method) || HttpMethods.IsPatch(method) || HttpMethods.IsDelete(method);
     var origin = context.Request.Headers.Origin.FirstOrDefault();
+    if (isLocalDevelopment)
+    {
+        await next();
+        return;
+    }
     if (isMutation && !string.IsNullOrWhiteSpace(origin) && !allowedOrigins.Contains(origin, StringComparer.OrdinalIgnoreCase))
     {
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
