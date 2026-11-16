@@ -67,7 +67,8 @@ public sealed record CheckoutTicketDto(
     string PublishableKey,
     string ProviderReference,
     string Currency,
-    decimal Amount);
+    decimal Amount,
+    DateTimeOffset? ExpiresAt);
 
 public sealed record PaymentStatusDto(
     Guid InvoiceId,
@@ -331,7 +332,7 @@ public static class CheckoutEndpoints
             {
                 return Results.Ok(new CheckoutTicketDto(
                     invoice.Id, live.Id, state.ClientSecret!, provider.PublicKey ?? "", live.ProviderCheckoutId!,
-                    live.Currency, invoice.Amount));
+                    live.Currency, invoice.Amount, state.ExpiresAt));
             }
         }
 
@@ -377,7 +378,7 @@ public static class CheckoutEndpoints
 
         return Results.Ok(new CheckoutTicketDto(
             invoice.Id, attempt.Id, ticket.ClientSecret ?? "", ticket.PublicKey ?? "",
-            ticket.ProviderReference, invoice.Currency, invoice.Amount));
+            ticket.ProviderReference, invoice.Currency, invoice.Amount, ticket.ExpiresAt));
     }
 
     /// <summary>

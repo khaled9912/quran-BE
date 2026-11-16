@@ -27,7 +27,15 @@ public sealed record CheckoutTicket(
     string? ClientSecret,
     string? PublicKey,
     string ProviderReference,
-    string? Error);
+    string? Error)
+{
+    /// <summary>
+    /// When the session stops accepting a confirmation. The screen swaps in a
+    /// fresh checkout before this moment, so a student who left the form open
+    /// never meets the provider's "no longer active" refusal.
+    /// </summary>
+    public DateTimeOffset? ExpiresAt { get; init; }
+}
 
 /// <summary>
 /// The provider's own account of one checkout, read back from its API.
@@ -57,6 +65,9 @@ public sealed record ProviderCheckoutState(
     /// is still open must be handed back rather than abandoned.
     /// </summary>
     public string? ClientSecret { get; init; }
+
+    /// <summary>The session's own expiry, so a re-opened checkout can be scheduled for renewal.</summary>
+    public DateTimeOffset? ExpiresAt { get; init; }
 
     public static ProviderCheckoutState Unavailable(string error) =>
         new(false, "unknown", false, null, 0, "", null, null, null, null, error);

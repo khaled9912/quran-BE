@@ -160,7 +160,10 @@ public sealed class StripeProvider(
             return new CheckoutTicket(false, null, null, "", "The payment provider did not return a usable checkout.");
         }
 
-        return new CheckoutTicket(true, clientSecret, options.PublishableKey, id, null);
+        return new CheckoutTicket(true, clientSecret, options.PublishableKey, id, null)
+        {
+            ExpiresAt = payload!.RootElement.TryGetUnixTime("expires_at"),
+        };
     }
 
     public async Task<ProviderCheckoutState> QueryCheckoutAsync(string providerReference, CancellationToken cancellationToken)
@@ -208,6 +211,7 @@ public sealed class StripeProvider(
             Error: null)
         {
             ClientSecret = root.TryGetString("client_secret"),
+            ExpiresAt = root.TryGetUnixTime("expires_at"),
         };
     }
 
@@ -453,6 +457,12 @@ internal static class JsonReading
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
         && value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var parsed)
             ? parsed
+            : null;
+
+    /// <summary>Stripe timestamps are unix seconds; an absent or odd value reads as no expiry.</summary>
+    public static DateTimeOffset? TryGetUnixTime(this JsonElement element, string name) =>
+        element.TryGetInt(name) is int seconds && seconds > 0
+            ? DateTimeOffset.FromUnixTimeSeconds(seconds)
             : null;
 
     /// <summary>An absent or non-boolean value reads as false, which is the safe answer.</summary>
