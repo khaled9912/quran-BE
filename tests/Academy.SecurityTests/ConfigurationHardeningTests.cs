@@ -1,5 +1,7 @@
+using System.Net;
 using Academy.Api;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -86,6 +88,24 @@ public sealed class ForwardingTests
 /// The pooled Neon URL is rewritten before Npgsql sees it, so a missing setting
 /// here is the difference between a warm connection and a handshake per request.
 /// </summary>
+public sealed class RealtimeUrlTests
+{
+    [Fact]
+    public void TunnelRequestsUseThePublicApiOriginForTheHub()
+    {
+        var http = new DefaultHttpContext();
+        http.Connection.RemoteIpAddress = IPAddress.Loopback;
+        http.Request.Scheme = "https";
+        http.Request.Host = new HostString("example-frontend.ngrok-free.dev");
+        http.Request.Headers["X-Forwarded-Proto"] = "https";
+        http.Request.Headers["X-Forwarded-Host"] = "api.example.com";
+
+        var url = RealtimeEndpoints.ResolvePublicHubUrl(http.Request, new ConfigurationBuilder().Build());
+
+        Assert.Equal("https://api.example.com/api/realtime/hub", url);
+    }
+}
+
 public sealed class DatabaseConnectionTests
 {
     [Fact]

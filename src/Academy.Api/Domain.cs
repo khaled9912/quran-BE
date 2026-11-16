@@ -444,11 +444,11 @@ public sealed class PaymentTransaction
     public PaymentInvoice? Invoice { get; set; }
     [MaxLength(20)] public string Provider { get; set; } = "stripe";
     /// <summary>Our own reference, sent to the provider and echoed back on every callback.</summary>
-    [MaxLength(64)] public string MerchantReference { get; set; } = "";
+    [MaxLength(128)] public string MerchantReference { get; set; } = "";
     /// <summary>The provider's checkout object, e.g. a Stripe session id.</summary>
-    [MaxLength(64)] public string? ProviderCheckoutId { get; set; }
+    [MaxLength(128)] public string? ProviderCheckoutId { get; set; }
     /// <summary>Filled when a verified callback names the transaction; unique, so a retry cannot apply twice.</summary>
-    [MaxLength(64)] public string? ProviderTransactionId { get; set; }
+    [MaxLength(128)] public string? ProviderTransactionId { get; set; }
     public int AmountCents { get; set; }
     [MaxLength(3)] public string Currency { get; set; } = "USD";
     /// <summary>
@@ -480,10 +480,10 @@ public sealed class PaymentCallbackEvent
     public Guid Id { get; set; } = Guid.NewGuid();
     [MaxLength(20)] public string Provider { get; set; } = "stripe";
     /// <summary>The provider's own event id. Unique, so a redelivery is provably a duplicate.</summary>
-    [MaxLength(64)] public string? ProviderEventId { get; set; }
-    [MaxLength(64)] public string? ProviderTransactionId { get; set; }
-    [MaxLength(64)] public string? ProviderCheckoutId { get; set; }
-    [MaxLength(64)] public string? MerchantReference { get; set; }
+    [MaxLength(128)] public string? ProviderEventId { get; set; }
+    [MaxLength(128)] public string? ProviderTransactionId { get; set; }
+    [MaxLength(128)] public string? ProviderCheckoutId { get; set; }
+    [MaxLength(128)] public string? MerchantReference { get; set; }
     // applied | duplicate | unmatched | ignored | deferred | rejected_amount | rejected_currency
     [MaxLength(30)] public string Outcome { get; set; } = "";
     /// <summary>The provider's event type, kept because outcomes are only readable against it.</summary>

@@ -129,10 +129,7 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
             .Take(200).ToListAsync(ct);
         foreach (var lesson in live)
         {
-            var attendances = await db.LessonAttendances.AsNoTracking()
-                .Where(x => x.LessonId == lesson.Id).ToListAsync(ct);
-            var teacherPresent = attendances.Any(x => x.UserId == lesson.TeacherId && x.TotalSeconds > 0);
-            var studentPresent = attendances.Any(x => x.UserId == lesson.StudentId && x.TotalSeconds > 0);
+            var (teacherPresent, studentPresent) = await PresenceAsync(db, lesson, now, ct);
             if (teacherPresent == studentPresent) continue;
 
             var type = teacherPresent ? "potential_student_no_show" : "potential_teacher_no_show";
@@ -165,10 +162,7 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
         var autoRings = new List<(Guid CallerId, Guid CalleeId, Guid LessonId, string Title, string Body, string Link)>();
         foreach (var lesson in autoRingLessons)
         {
-            var attendances = await db.LessonAttendances.AsNoTracking()
-                .Where(x => x.LessonId == lesson.Id).ToListAsync(ct);
-            var teacherPresent = attendances.Any(x => x.UserId == lesson.TeacherId && x.TotalSeconds > 0);
-            var studentPresent = attendances.Any(x => x.UserId == lesson.StudentId && x.TotalSeconds > 0);
+            var (teacherPresent, studentPresent) = await PresenceAsync(db, lesson, now, ct);
             if (teacherPresent && studentPresent) continue;
 
             var when = LessonOpsMessaging.When(lesson.StartsAt, lesson.Series?.TimeZoneId);
@@ -332,6 +326,21 @@ public sealed class LessonOpsMonitor(IServiceScopeFactory scopes, ILogger<Lesson
             await realtime.ToUserAsync(calleeId, RealtimeScopes.Notifications);
             await LessonOpsMessaging.PushAsync(db, push, [calleeId], title, body, link, ct, LessonOpsMessaging.UrgentCall);
         }
+    }
+
+    /// <summary>Presence read from the intervals, not the stored TotalSeconds:
+    /// that figure is a snapshot from the last join/leave, so a participant who
+    /// joined before the scheduled start and is still in the room reads as 0
+    /// there — and would be rung as if they had never joined.</summary>
+    private static async Task<(bool Teacher, bool Student)> PresenceAsync(
+        AcademyDbContext db, Lesson lesson, DateTimeOffset now, CancellationToken ct)
+    {
+        var intervals = await db.LessonAttendanceIntervals.AsNoTracking()
+            .Where(x => x.LessonId == lesson.Id).ToListAsync(ct);
+        bool Present(Guid userId) => intervals.Any(x => x.UserId == userId
+            && (x.LeftAt is null
+                || LessonPolicyService.OverlapSeconds(x.JoinedAt, x.LeftAt, lesson.StartsAt, lesson.EndsAt, now) > 0));
+        return (Present(lesson.TeacherId), Present(lesson.StudentId));
     }
 
     private static Guid? ChangedLessonId(object entity) => entity switch

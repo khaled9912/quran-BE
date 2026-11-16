@@ -338,6 +338,9 @@ app.Use(async (context, next) =>
     }
     await next();
 });
+// Without this middleware the server cannot accept WebSocket upgrades, so
+// every SignalR handshake fails while REST keeps working.
+app.UseWebSockets();
 app.UseAuthentication();
 app.UseRateLimiter();
 app.UseAuthorization();
