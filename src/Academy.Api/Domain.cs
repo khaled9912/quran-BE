@@ -8,6 +8,8 @@ public sealed class AcademyUser : IdentityUser<Guid>
     [MaxLength(160)] public string FullName { get; set; } = "";
     [MaxLength(20)] public string? Grade { get; set; }
     public bool IsActive { get; set; } = true;
+    /// <summary>Set when an admin deletes the account; bookings are released then.</summary>
+    public DateTimeOffset? DeletedAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -568,6 +570,15 @@ public sealed class TeacherApplication
     public DateTimeOffset? ReviewedAt { get; set; }
     public Guid? TeacherId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    // Onboarding meeting: admin-proposed UTC instants (JSON), the picked slot,
+    // and the single-use hashed token behind the public picker link.
+    public string? MeetingSlotsJson { get; set; }
+    public DateTimeOffset? MeetingStartsAt { get; set; }
+    public DateTimeOffset? MeetingEndsAt { get; set; }
+    [MaxLength(120)] public string? MeetingRoom { get; set; }
+    [MaxLength(64)] public string? OnboardingTokenHash { get; set; }
+    public DateTimeOffset? OnboardingTokenExpiresAt { get; set; }
+    public DateTimeOffset? OnboardedAt { get; set; }
     public TeacherApplicationCv? Cv { get; set; }
     public TeacherApplicationIntro? Intro { get; set; }
     public TeacherApplicationQuranRecording? QuranRecording { get; set; }

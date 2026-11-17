@@ -64,6 +64,9 @@ services:
       Stripe__CheckoutLifetimeMinutes: ${STRIPE_CHECKOUT_LIFETIME_MINUTES:-30}
       LessonRoom__Transcription: ${LessonRoom__Transcription:-false}
       LessonRoom__ReportConcern: ${LessonRoom__ReportConcern:-false}
+      # Video-room host used in onboarding meeting emails; must match the FE's
+      # NEXT_PUBLIC_JITSI_DOMAIN so both sides land in the same room.
+      Jitsi__Domain: ${JITSI_DOMAIN:-meet.jit.si}
       Transcripts__LightCaptureSince: ${Transcripts__LightCaptureSince:-}
       # Observability: both are inert unless set (Sentry is also production-only).
       SENTRY_DSN: ${SENTRY_DSN:-}

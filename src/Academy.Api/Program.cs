@@ -369,6 +369,7 @@ app.MapRealtime();
 app.MapAcademyApi();
 app.MapLessonOperations();
 app.MapTeacherApplications();
+app.MapTeacherOnboarding();
 app.MapLessonReviews();
 app.MapTranscriptCapture();
 app.MapPayments();
@@ -455,6 +456,14 @@ await using (var scope = app.Services.CreateAsyncScope())
         CREATE INDEX IF NOT EXISTS "IX_TeacherApplications_Status_CreatedAt" ON "TeacherApplications" ("Status", "CreatedAt");
         CREATE UNIQUE INDEX IF NOT EXISTS "IX_TeacherApplications_Email" ON "TeacherApplications" ("Email") WHERE "Status" = 'pending';
         ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "EnglishLevel" character varying(20) NOT NULL DEFAULT '';
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "MeetingSlotsJson" text;
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "MeetingStartsAt" timestamp with time zone;
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "MeetingEndsAt" timestamp with time zone;
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "MeetingRoom" character varying(120);
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "OnboardingTokenHash" character varying(64);
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "OnboardingTokenExpiresAt" timestamp with time zone;
+        ALTER TABLE "TeacherApplications" ADD COLUMN IF NOT EXISTS "OnboardedAt" timestamp with time zone;
+        CREATE INDEX IF NOT EXISTS "IX_TeacherApplications_OnboardingTokenHash" ON "TeacherApplications" ("OnboardingTokenHash") WHERE "OnboardingTokenHash" IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS "TeacherApplicationCvs" (
             "ApplicationId" uuid NOT NULL,
@@ -731,6 +740,7 @@ await using (var scope = app.Services.CreateAsyncScope())
         DROP INDEX IF EXISTS "IX_Lessons_SeriesId_StartsAt";
         CREATE INDEX IF NOT EXISTS "IX_Lessons_OriginalLessonId" ON "Lessons" ("OriginalLessonId");
         ALTER TABLE "AspNetUsers" ADD COLUMN IF NOT EXISTS "Grade" character varying(20);
+        ALTER TABLE "AspNetUsers" ADD COLUMN IF NOT EXISTS "DeletedAt" timestamp with time zone;
 
         CREATE TABLE IF NOT EXISTS "LessonCancellations" (
             "Id" uuid NOT NULL,

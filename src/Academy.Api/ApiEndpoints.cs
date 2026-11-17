@@ -52,7 +52,7 @@ public static class ApiEndpoints
     private static UserDto ToUser(AcademyUser u, string role)
     {
         var name = DisplayName(u.FullName);
-        return new(u.Id, name, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, name, u.IsActive, name, u.PhoneNumber, $"/api/users/{u.Id}/avatar", u.Grade);
+        return new(u.Id, name, u.Email ?? "", role.ToLowerInvariant(), u.IsActive, name, u.IsActive, name, u.PhoneNumber, $"/api/users/{u.Id}/avatar", u.Grade, u.DeletedAt);
     }
 
     // What the other side of a lesson is allowed to see: who they are, never how
@@ -589,6 +589,9 @@ public static class ApiEndpoints
             }
             if (name is not null) user.FullName = name;
             if (input.IsActive is not null) user.IsActive = input.IsActive.Value;
+            // Reactivating also undoes a delete marker; the released bookings
+            // stay released, but the account itself comes back.
+            if (input.IsActive == true) user.DeletedAt = null;
             var updated = await users.UpdateAsync(user);
             if (!updated.Succeeded) return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
             if (input.Password is not null)
@@ -603,13 +606,14 @@ public static class ApiEndpoints
             }
             if (input.IsActive == false)
             {
+                // Deactivation is a pause: sign-in stops, but lessons, weekly
+                // series and assignments stay booked. Only DELETE releases them.
                 // Switching the stamp invalidates every cookie already issued to this
                 // account; IsActive alone would not, because the session cookie is only
                 // re-checked against the database when the stamp is validated.
                 // UpdateSecurityStampAsync changes the value on the user, UpdateAsync writes it.
                 await users.UpdateSecurityStampAsync(user);
                 await users.UpdateAsync(user);
-                await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
             }
             var changedFields = string.Join(",", new[] { email is not null ? "email" : null, name is not null ? "name" : null, input.IsActive is not null ? "isActive" : null, input.Password is not null ? "password" : null }.Where(x => x is not null));
             Audit(db, UserId(principal), "admin_user_updated", "User", id, $"fields={changedFields}");
@@ -619,32 +623,94 @@ public static class ApiEndpoints
             return Results.Ok(ToUser(user, role));
         });
         // Deletes are soft: lessons keep their historical teacher/student owners.
-        admin.MapDelete("/users/{id:guid}", async (Guid id, ClaimsPrincipal principal, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime) =>
+        // Booked lessons are released, the teacher's weekly times free up (rule
+        // status derives from active series), and students return to the
+        // assignment desk with their offered hours intact.
+        admin.MapDelete("/users/{id:guid}", async (Guid id, ClaimsPrincipal principal, UserManager<AcademyUser> users, AcademyDbContext db, RealtimeNotifier realtime, AcademyEmailSender email) =>
         {
             var user = await users.FindByIdAsync(id.ToString());
             if (user is null) return Results.NotFound();
             var role = await RoleOf(users, user);
-            if (role is not ("teacher" or "student" or "support")) return Results.BadRequest(new { message = "Only teacher, student and support accounts can be deactivated here." });
+            if (role is not ("teacher" or "student" or "support")) return Results.BadRequest(new { message = "Only teacher, student and support accounts can be deleted here." });
             var now = DateTimeOffset.UtcNow;
-            var upcoming = await db.Lessons.AnyAsync(x => x.Status != "cancelled" && x.EndsAt > now && (x.TeacherId == id || x.StudentId == id));
-            if (upcoming) return Results.Conflict(new { message = "This account still has lessons scheduled. Cancel those lessons before deactivating the account." });
+            var actorId = UserId(principal);
+            var removedName = DisplayName(user.FullName) ?? (role == "teacher" ? "The teacher" : "The student");
+            var cancelReason = role == "teacher"
+                ? "The academy removed the teacher's account."
+                : "The academy removed the student's account.";
+
+            var series = await db.LessonSeries
+                .Where(x => x.IsActive && (x.TeacherId == id || x.StudentId == id)).ToListAsync();
+            foreach (var item in series) item.IsActive = false;
+
+            var futureLessons = await db.Lessons
+                .Where(x => x.Status == "scheduled" && x.StartsAt > now && (x.TeacherId == id || x.StudentId == id))
+                .ToListAsync();
+            foreach (var lesson in futureLessons)
+            {
+                lesson.Status = "cancelled";
+                lesson.CancellationOutcome = lesson.SeriesId is null ? "admin_cancelled" : "series_ended";
+                lesson.CancelReason = cancelReason;
+                lesson.CancelledById = actorId;
+                lesson.CancelledAt = now;
+            }
+            var futureIds = futureLessons.Select(x => x.Id).ToList();
+            await db.LessonRescheduleRequests.Where(x => futureIds.Contains(x.LessonId) && x.Status == "pending")
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, "cancelled")
+                    .SetProperty(x => x.RespondedAt, now)
+                    .SetProperty(x => x.ResponseNote, "The account was removed by the academy."));
+
             var pending = await db.LessonRequests.Include(x => x.AvailabilitySlot).Include(x => x.StudentAvailability)
                 .Where(x => (x.TeacherId == id || x.StudentId == id) && (x.Status == "pending_teacher" || x.Status == "pending_student" || x.Status == "pending_admin")).ToListAsync();
             foreach (var request in pending)
             {
                 request.Status = "rejected";
-                request.RejectionReason = "The account was deactivated by an administrator.";
+                request.RejectionReason = "The account was deleted by an administrator.";
                 if (request.AvailabilitySlot is not null) request.AvailabilitySlot.Status = "available";
                 if (request.StudentAvailability is not null) request.StudentAvailability.Status = "available";
             }
+
+            // The other sides of the released bookings, gathered before the
+            // assignments go inactive.
+            var activeAssignments = await db.Assignments
+                .Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ToListAsync();
+            var otherIds = series.Select(x => role == "teacher" ? x.StudentId : x.TeacherId)
+                .Concat(activeAssignments.Select(x => role == "teacher" ? x.StudentId : x.TeacherId))
+                .Concat(futureLessons.Select(x => role == "teacher" ? x.StudentId : x.TeacherId))
+                .Where(x => x != id).Distinct().ToList();
+            foreach (var assignment in activeAssignments) assignment.IsActive = false;
+
             user.IsActive = false;
+            user.DeletedAt = now;
             await users.UpdateSecurityStampAsync(user);
             var updated = await users.UpdateAsync(user);
             if (!updated.Succeeded) return Results.ValidationProblem(updated.Errors.GroupBy(e => e.Code).ToDictionary(g => g.Key, g => g.Select(e => e.Description).ToArray()));
-            Audit(db, UserId(principal), "admin_user_deactivated", "User", id, $"role={role}; pendingRequestsRejected={pending.Count}");
+            Audit(db, actorId, "admin_user_deleted", "User", id,
+                $"role={role}; seriesEnded={series.Count}; lessonsCancelled={futureLessons.Count}; pendingRequestsRejected={pending.Count}");
             await db.SaveChangesAsync();
-            await db.Assignments.Where(x => (x.TeacherId == id || x.StudentId == id) && x.IsActive).ExecuteUpdateAsync(s => s.SetProperty(x => x.IsActive, false));
             await db.AvailabilitySlots.Where(x => x.TeacherId == id && x.Status == "available" && x.StartsAt > now).ExecuteDeleteAsync();
+
+            var others = await db.Users.Where(x => otherIds.Contains(x.Id)).ToListAsync();
+            foreach (var other in others)
+            {
+                if (role == "teacher")
+                    await AnnounceAndEmailAsync(db, realtime, email, other,
+                        LessonOpsMessaging.Notice(
+                            other.Id, "Your teacher was removed",
+                            $"The academy removed {removedName} as your teacher. Your booked lessons were released and the academy will assign a new teacher.",
+                            "booking", "/student/dashboard", $"account-deleted:{id}:{other.Id}"),
+                        "Your teacher was removed",
+                        $"Hello {DisplayName(other.FullName) ?? "there"},\n\nThe academy removed {removedName} as your teacher. Your booked lessons were released and you will get another email when a new teacher is assigned.\n\nIf this was not expected, contact the academy.");
+                else
+                    await AnnounceAndEmailAsync(db, realtime, email, other,
+                        LessonOpsMessaging.Notice(
+                            other.Id, "Student removed",
+                            $"The academy removed {removedName}'s account. Their booked lessons with you were released and your weekly times are open again.",
+                            "booking", "/teacher/dashboard", $"account-deleted:{id}:{other.Id}"),
+                        "Student removed",
+                        $"Hello {DisplayName(other.FullName) ?? "there"},\n\nThe academy removed {removedName}'s account. Their booked lessons with you were released and your weekly times are open again.\n\nIf this was not expected, contact the academy.");
+            }
+
             await realtime.ToUserAsync(id, RealtimeScopes.Self);
             await realtime.ToStaffAsync(RealtimeScopes.Directory);
             return Results.NoContent();
