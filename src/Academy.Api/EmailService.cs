@@ -71,8 +71,9 @@ public sealed class AcademyEmailSender(IConfiguration configuration, ILogger<Aca
         return await SendAsync(
             email,
             "Welcome to Ana Quran — set your teacher password",
-            $"Hello {fullName},\n\nYour teacher application was approved. Use this code to set your password: {code}\n\n"
+            $"Hello {fullName},\n\nWelcome aboard — your intro meeting with the academy team is done and your teacher account is ready. Use this code to set your password: {code}\n\n"
                 + $"It expires in {validMinutes} minutes. Open the sign-in page, choose \"Forgot password\", and enter this code.\n\n"
+                + "After signing in, sign the academy agreement from your dashboard to start teaching.\n\n"
                 + "If you were not expecting this email, you can ignore it.",
             null,
             cancellationToken);

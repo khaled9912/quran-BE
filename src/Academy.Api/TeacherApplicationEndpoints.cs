@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
@@ -11,8 +12,8 @@ namespace Academy.Api;
 /// <summary>
 /// Public teacher applications: anonymous submission with a CV, an optional
 /// self-introduction recording, and a required Quran recitation, plus an admin
-/// queue that can approve (create the teacher account and send a set-password
-/// code) or reject with a reason.
+/// queue that can approve or reject with a reason. Approval alone creates no
+/// account — that happens in TeacherOnboardingEndpoints after the intro meeting.
 /// </summary>
 public static class TeacherApplicationEndpoints
 {
@@ -295,6 +296,10 @@ public static class TeacherApplicationEndpoints
                 CvFileName = x.Cv == null ? null : x.Cv.FileName,
                 IntroFileName = x.Intro == null ? null : x.Intro.FileName,
                 QuranRecordingFileName = x.QuranRecording == null ? null : x.QuranRecording.FileName,
+                x.MeetingSlotsJson,
+                x.MeetingStartsAt,
+                x.MeetingEndsAt,
+                x.OnboardedAt,
             })
             .ToListAsync();
 
@@ -302,8 +307,14 @@ public static class TeacherApplicationEndpoints
             x.Id, x.FullName, x.Email, x.PhoneNumber,
             x.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
             x.EnglishLevel, x.ExperienceYears, x.Bio, x.AvailabilityNote, x.Status, x.RejectionReason,
-            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName, x.QuranRecordingFileName)).ToList());
+            x.CreatedAt, x.ReviewedAt, x.TeacherId, x.CvFileName, x.IntroFileName, x.QuranRecordingFileName,
+            ParseSlots(x.MeetingSlotsJson), x.MeetingStartsAt, x.MeetingEndsAt, x.OnboardedAt)).ToList());
     }
+
+    internal static IReadOnlyList<DateTimeOffset> ParseSlots(string? json) =>
+        string.IsNullOrWhiteSpace(json)
+            ? []
+            : JsonSerializer.Deserialize<List<DateTimeOffset>>(json) ?? [];
 
     private static async Task<IResult> DownloadCvAsync(
         Guid id, ClaimsPrincipal principal, HttpContext http, [FromServices] AcademyDbContext db)
@@ -353,9 +364,7 @@ public static class TeacherApplicationEndpoints
         ClaimsPrincipal principal,
         HttpContext http,
         [FromServices] AcademyDbContext db,
-        [FromServices] UserManager<AcademyUser> users,
-        [FromServices] PasswordResetStore resets,
-        [FromServices] AcademyEmailSender email)
+        [FromServices] UserManager<AcademyUser> users)
     {
         var next = (input.Status ?? "").Trim().ToLowerInvariant();
         if (next is not ("approved" or "rejected"))
@@ -369,42 +378,14 @@ public static class TeacherApplicationEndpoints
 
         var application = await db.TeacherApplications.FirstOrDefaultAsync(x => x.Id == id, http.RequestAborted);
         if (application is null) return Results.NotFound();
-        if (application.Status != "pending")
+        // An approved application can still be rejected right up until the
+        // account exists — the intro meeting may not go well.
+        if (application.Status == "rejected" || application.TeacherId is not null ||
+            (application.Status == "approved" && next == "approved"))
             return Results.Conflict(new { message = "This application was already reviewed." });
 
-        string? inviteCode = null;
-
-        await using var transaction = await db.Database.BeginTransactionAsync(http.RequestAborted);
-
-        if (next == "approved")
-        {
-            if (await users.FindByEmailAsync(application.Email) is not null)
-                return Results.Conflict(new { message = "An account with this email already exists. Review or link it manually." });
-
-            var teacher = new AcademyUser
-            {
-                Id = Guid.NewGuid(),
-                UserName = application.Email,
-                Email = application.Email,
-                FullName = application.FullName,
-                PhoneNumber = application.PhoneNumber,
-                PhoneNumberConfirmed = true,
-                EmailConfirmed = true,
-            };
-            var created = await users.CreateAsync(teacher, GenerateTemporaryPassword());
-            if (!created.Succeeded)
-                return Results.ValidationProblem(ApiEndpoints.IdentityErrors(created));
-
-            var roleAdded = await users.AddToRoleAsync(teacher, "teacher");
-            if (!roleAdded.Succeeded)
-            {
-                await users.DeleteAsync(teacher);
-                return Results.Problem("Could not assign the teacher role. Please try again.", statusCode: StatusCodes.Status500InternalServerError);
-            }
-
-            application.TeacherId = teacher.Id;
-            inviteCode = resets.TryIssue(application.Email.ToLowerInvariant());
-        }
+        if (next == "approved" && await users.FindByEmailAsync(application.Email) is not null)
+            return Results.Conflict(new { message = "An account with this email already exists. Review or link it manually." });
 
         application.Status = next;
         application.ReviewedBy = ApiEndpoints.UserId(principal);
@@ -414,26 +395,17 @@ public static class TeacherApplicationEndpoints
         Audit(db, ApiEndpoints.UserId(principal), http,
             next == "approved" ? "teacher_application_approved" : "teacher_application_rejected",
             application.Id, next == "approved"
-                ? $"Teacher account {application.TeacherId} created."
+                ? "Approved; the account is created when onboarding is finished."
                 : reason ?? "");
 
-        try
-        {
-            await db.SaveChangesAsync(http.RequestAborted);
-            await transaction.CommitAsync(http.RequestAborted);
-        }
-        catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
-        {
-            await transaction.RollbackAsync(http.RequestAborted);
-            return Results.Conflict(new { message = "An account with this email already exists. Review or link it manually." });
-        }
+        await db.SaveChangesAsync(http.RequestAborted);
 
-        // Email delivery happens after the commit so a slow SMTP server never
-        // holds the database transaction open.
-        var inviteEmailed = false;
-        if (inviteCode is not null)
-            inviteEmailed = await email.SendTeacherInviteCodeAsync(application.Email, application.FullName, inviteCode, 15, http.RequestAborted);
+        return Results.Ok(new { application = await ToDtoAsync(db, application, http.RequestAborted) });
+    }
 
+    private static async Task<TeacherApplicationDto> ToDtoAsync(
+        AcademyDbContext db, TeacherApplication application, CancellationToken ct)
+    {
         var files = await db.TeacherApplications.AsNoTracking()
             .Where(x => x.Id == application.Id)
             .Select(x => new
@@ -442,24 +414,18 @@ public static class TeacherApplicationEndpoints
                 IntroFileName = x.Intro == null ? null : x.Intro.FileName,
                 QuranRecordingFileName = x.QuranRecording == null ? null : x.QuranRecording.FileName,
             })
-            .FirstAsync(http.RequestAborted);
-        var dto = new TeacherApplicationDto(
+            .FirstAsync(ct);
+        return new TeacherApplicationDto(
             application.Id, application.FullName, application.Email, application.PhoneNumber,
             application.Subjects.Split(',', StringSplitOptions.RemoveEmptyEntries),
             application.EnglishLevel, application.ExperienceYears, application.Bio, application.AvailabilityNote,
             application.Status, application.RejectionReason, application.CreatedAt,
             application.ReviewedAt, application.TeacherId, files.CvFileName, files.IntroFileName,
-            files.QuranRecordingFileName);
-
-        return Results.Ok(new
-        {
-            application = dto,
-            inviteEmailed,
-            inviteCode = inviteEmailed ? null : inviteCode,
-        });
+            files.QuranRecordingFileName, ParseSlots(application.MeetingSlotsJson),
+            application.MeetingStartsAt, application.MeetingEndsAt, application.OnboardedAt);
     }
 
-    private static string GenerateTemporaryPassword()
+    internal static string GenerateTemporaryPassword()
     {
         // Satisfies the Identity policy (lowercase + digit, at least 8 chars).
         // The teacher never receives it; they set their own via the invite code.
