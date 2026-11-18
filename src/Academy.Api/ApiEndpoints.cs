@@ -1417,7 +1417,17 @@ public static class ApiEndpoints
             var list = await db.LessonSeries.Include(x => x.Teacher).Include(x => x.Student)
                 .Where(x => x.StudentId == studentId && x.IsActive)
                 .OrderBy(x => x.DayOfWeek).ThenBy(x => x.StartsAtTime).ToListAsync();
-            return Results.Ok(list.Select(ToSeries));
+            var ids = list.Select(x => x.Id).ToList();
+            var now = DateTimeOffset.UtcNow;
+            // The change-time screen locks the move while the next class is inside
+            // the notice window, so it needs the same instant the API checks.
+            var nextBySeries = await db.Lessons
+                .Where(x => x.SeriesId != null && ids.Contains(x.SeriesId.Value)
+                    && x.Status == "scheduled" && x.EndsAt > now)
+                .GroupBy(x => x.SeriesId!.Value)
+                .Select(g => new { SeriesId = g.Key, StartsAt = g.Min(x => x.StartsAt) })
+                .ToDictionaryAsync(x => x.SeriesId, x => (DateTimeOffset?)x.StartsAt);
+            return Results.Ok(list.Select(s => ToSeries(s, nextBySeries.GetValueOrDefault(s.Id))));
         }).RequireAuthorization("StudentOnly");
         api.MapDelete("/student/series/{id:guid}", async (Guid id, ClaimsPrincipal p, AcademyDbContext db, RealtimeNotifier realtime) =>
         {
@@ -2194,7 +2204,7 @@ public static class ApiEndpoints
             .Join(db.Users.Where(u => u.IsActive), x => x.UserId, u => u.Id, (x, u) => u.Id)
             .Distinct().ToListAsync(ct);
     }
-    private static LessonSeriesDto ToSeries(LessonSeries s) => new(s.Id, s.TeacherId, DisplayName(s.Teacher?.FullName) ?? "Teacher", s.StudentId, DisplayName(s.Student?.FullName) ?? "Student", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt);
+    private static LessonSeriesDto ToSeries(LessonSeries s, DateTimeOffset? nextLessonStartsAt = null) => new(s.Id, s.TeacherId, DisplayName(s.Teacher?.FullName) ?? "Teacher", s.StudentId, DisplayName(s.Student?.FullName) ?? "Student", s.DayOfWeek, FormatTime(s.StartsAtTime), FormatTime(s.EndsAtTime), s.TimeZoneId, s.IsActive, s.CreatedAt, nextLessonStartsAt);
     private static LessonChangeRequestDto ToChangeRequest(LessonChangeRequest r) => new(
         r.Id, r.SeriesId, r.TeacherId, DisplayName(r.Teacher?.FullName) ?? "Teacher", r.StudentId, DisplayName(r.Student?.FullName) ?? "Student",
         r.Series?.DayOfWeek ?? 0, FormatTime(r.Series?.StartsAtTime ?? TimeOnly.MinValue), FormatTime(r.Series?.EndsAtTime ?? TimeOnly.MinValue),
@@ -2255,7 +2265,7 @@ public static class ApiEndpoints
         var reviews = await db.TeacherReviews.AsNoTracking().Include(x => x.Lesson).Include(x => x.Teacher).Include(x => x.Student)
             .Where(x => x.TeacherId == teacher.Id).OrderByDescending(x => x.CreatedAt).Take(5).ToListAsync();
         var hasLessons = await db.Lessons.AnyAsync(x => x.StudentId == studentId);
-        return new WeeklyAvailabilityDto(ToPerson(teacher, "teacher"), rules, series.Select(ToSeries).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons, TimeChangeLeadMinutes(config));
+        return new WeeklyAvailabilityDto(ToPerson(teacher, "teacher"), rules, series.Select(s => ToSeries(s)).ToList(), rating.Average, rating.Count, reviews.Select(ToReview).ToList(), hasLessons, TimeChangeLeadMinutes(config));
     }
 
     private static async Task<(List<TeacherAvailabilityRule>? Created, string? Error)> CreateAvailabilityRulesAsync(
@@ -2564,7 +2574,7 @@ public static class ApiEndpoints
         await realtime.ToStaffAsync(RealtimeScopes.Admin);
         await realtime.ToStaffAsync(RealtimeScopes.Directory);
 
-        return Results.Created("/api/student/series", new { series = savedSeries.Select(ToSeries).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
+        return Results.Created("/api/student/series", new { series = savedSeries.Select(s => ToSeries(s)).ToList(), lessons = savedLessons.Select(ToLesson).ToList() });
     }
 
     private static async Task<List<Lesson>> BuildSeriesLessonsAsync(
@@ -2639,9 +2649,10 @@ public static class ApiEndpoints
     }
 
     /// <summary>
-    /// How much notice the academy requires before a student may move onto a
-    /// weekly time. A move that lands on a class starting in minutes leaves the
-    /// teacher no way to prepare, so those times are not offered at all.
+    /// How much notice the academy requires around a weekly-time move. A class
+    /// starting in minutes cannot be moved onto (the teacher could not prepare)
+    /// nor moved away from (it would vanish with no pay or strike), so both
+    /// sides of the move honor the same window.
     /// </summary>
     private static int TimeChangeLeadMinutes(IConfiguration config) =>
         Math.Max(0, config.GetValue("Scheduling:TimeChangeLeadMinutes", 60));
@@ -2657,6 +2668,18 @@ public static class ApiEndpoints
         if (!series.IsActive) return "This booking is no longer active.";
         if (leadMinutes > 0)
         {
+            // The window protects the lesson being left, not just the one moved
+            // onto: a switch minutes before class would cancel it with no pay or
+            // strike, so inside the window the student must attend or cancel it
+            // through the normal policy flow first.
+            var imminent = await db.Lessons
+                .Where(x => x.SeriesId == series.Id && x.Status == "scheduled"
+                    && x.EndsAt > now && x.StartsAt < now.AddMinutes(leadMinutes))
+                .OrderBy(x => x.StartsAt).FirstOrDefaultAsync();
+            if (imminent is not null)
+                return imminent.StartsAt <= now
+                    ? "Your class is in session right now. Once it ends you can move your weekly time."
+                    : $"Your next class starts in under {leadMinutes} minutes. Attend it or cancel it from your schedule first, then move your weekly time.";
             var next = NextOccurrences(rule.DayOfWeek, rule.StartsAtTime, rule.EndsAtTime, ResolveTimeZone(rule.TimeZoneId), now, 2).FirstOrDefault();
             if (next.StartsAt != default && next.StartsAt < now.AddMinutes(leadMinutes))
                 return $"That class starts in under {leadMinutes} minutes. Choose a time at least {leadMinutes} minutes away so your teacher has notice.";

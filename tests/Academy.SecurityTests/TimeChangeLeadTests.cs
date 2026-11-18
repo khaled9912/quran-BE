@@ -61,6 +61,85 @@ public sealed class TimeChangeLeadTests(PostgresFixture postgres) : ApiTestBase(
         Assert.Equal(scenario.FarRuleId, await BookedRuleAsync(scenario.SeriesId));
     }
 
+    [Fact]
+    public async Task MovingAwayFromAClassInsideTheNoticeWindowIsRefused()
+    {
+        var (client, scenario) = await SeedAsync();
+        var startsAt = DateTimeOffset.UtcNow.AddMinutes(30);
+        await AddLessonAsync(scenario, startsAt, startsAt.AddMinutes(30));
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/student/series/{scenario.SeriesId}/change-requests",
+            new { requestedRuleId = scenario.FarRuleId, note = (string?)null });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("cancel it from your schedule", await ReadMessageAsync(response));
+        Assert.Equal(scenario.HomeRuleId, await BookedRuleAsync(scenario.SeriesId));
+    }
+
+    [Fact]
+    public async Task MovingAwayWhileAClassIsInSessionIsRefused()
+    {
+        var (client, scenario) = await SeedAsync();
+        var startsAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await AddLessonAsync(scenario, startsAt, startsAt.AddMinutes(30));
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/student/series/{scenario.SeriesId}/change-requests",
+            new { requestedRuleId = scenario.FarRuleId, note = (string?)null });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("in session", await ReadMessageAsync(response));
+        Assert.Equal(scenario.HomeRuleId, await BookedRuleAsync(scenario.SeriesId));
+    }
+
+    [Fact]
+    public async Task AnEndedLessonAwaitingItsReportDoesNotBlockTheMove()
+    {
+        var (client, scenario) = await SeedAsync();
+        var startsAt = DateTimeOffset.UtcNow.AddHours(-2);
+        await AddLessonAsync(scenario, startsAt, startsAt.AddMinutes(30));
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/student/series/{scenario.SeriesId}/change-requests",
+            new { requestedRuleId = scenario.FarRuleId, note = (string?)null });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        Assert.Equal(scenario.FarRuleId, await BookedRuleAsync(scenario.SeriesId));
+    }
+
+    [Fact]
+    public async Task TheSeriesListCarriesTheNextLessonStartForTheClientLock()
+    {
+        var (client, scenario) = await SeedAsync();
+        var startsAt = DateTimeOffset.UtcNow.AddMinutes(30);
+        await AddLessonAsync(scenario, startsAt, startsAt.AddMinutes(30));
+
+        var response = await client.GetAsync("/api/student/series");
+        response.EnsureSuccessStatusCode();
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var series = body.RootElement.EnumerateArray()
+            .Single(x => Guid.Parse(x.GetProperty("id").GetString()!) == scenario.SeriesId);
+        var next = series.GetProperty("nextLessonStartsAt").GetDateTimeOffset();
+        Assert.True(Math.Abs((next - startsAt).TotalSeconds) < 1);
+    }
+
+    private Task AddLessonAsync(Scenario scenario, DateTimeOffset startsAt, DateTimeOffset endsAt) =>
+        Factory.WithDbAsync(async db =>
+        {
+            var series = await db.LessonSeries.SingleAsync(x => x.Id == scenario.SeriesId);
+            db.Lessons.Add(new Lesson
+            {
+                SeriesId = series.Id,
+                TeacherId = series.TeacherId,
+                StudentId = series.StudentId,
+                StartsAt = startsAt,
+                EndsAt = endsAt,
+                Status = "scheduled",
+            });
+            await db.SaveChangesAsync();
+        });
+
     /// <summary>A student whose current weekly time is <paramref name="home"/> and a teacher who publishes it.</summary>
     private async Task<(HttpClient Client, Scenario Data)> SeedAsync()
     {
